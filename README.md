@@ -12,7 +12,7 @@ Three source shapes, one graph engine:
 |--------|-----------|--------|
 | **Database** (SQLite, PostgreSQL) | tables, columns, enums, FKs, indexes, comments | "which tables hold login events, and how do I join them?" |
 | **API spec** (OpenAPI 3.x, Swagger 2.0) | endpoints, schemas, `$ref` relationships, auth | "what's the full request to create an order?" |
-| **Codebase** (Go, TypeScript, Python, Rust) | functions, types, call graph, doc comments, docs | "how does extraction work?" / "what breaks if I change this signature?" |
+| **Codebase** (Go, TS/TSX, JS/JSX, Python, Rust) | functions, types, call graph, HTTP routes, ORM models, docs, git co-change | "what breaks if I change this signature?" / "which routes touch this model?" / "which docs went stale?" |
 
 ## Architecture
 
@@ -47,7 +47,7 @@ Edges: `HAS_SCHEMA`, `HAS_PROPERTY`, `HAS_ENDPOINT`, `REFERS_TO` (property→sch
 Each endpoint carries what a request actually needs: the **full URL** (server base — 3.x `servers` with variables substituted, or 2.0 `host`+`basePath` — joined to the path) and the **auth scheme** (`Bearer`, `Basic`, `apiKey header X-API-Key`, resolved from the operation's `security` or the global default, `OAuth2`/public overrides included). So an agent gets a copy-pasteable curl skeleton — method, URL, auth header, and the typed request body with its enums — from one `sql_context` call instead of loading a multi-megabyte spec.
 
 **Codebase** — tree-sitter parses Go, TypeScript/TSX, JavaScript/JSX, Python, and Rust (plus Markdown docs). Nodes: `project`, `file`, `function` (with signature, `file:line` range, doc comment, body for short functions), `definition` (types and their methods — plus, for JS/TS/JSX, module-scope `const`/exported bindings like config objects and lookup tables, so `queueDefinitions`-style entities are queryable and doc-drift-checkable too), `component`, `feature`, `doc`, `comment` (a substantive floating comment not attached to any declaration), and — JS/TS/JSX only — `route` (an Express-style HTTP route registration) and `state` (a tracked property on a cross-file singleton, e.g. `config.session`). `model` nodes capture ORM models across languages — Sequelize `Model.init`/`sequelize.define` (JS/TS), TypeORM `@Entity`/`@Column` decorators, Go structs with `gorm:`/`db:`/`bun:`/`xorm:` tags, Django/SQLAlchemy classes — with the DB table, the field→column renames a SQL grep can't see, and associations: explicit (`A.hasMany(B)`, resolved even when declared in a central `setupAssociations` file) plus `*_id`/`…Id`/`…ID` foreign-key-name inference in any language (`inferred=true` on the edge). Unknown ORMs: declare base classes in `.gatt/models.json` (`{"base_classes": [...]}`) or tag a type via `annotate model_table=<table>`; `gatt models` lists them all. Two cross-layer edges close the full-stack chain: `USES_MODEL` (route → every model its handler chain touches, via resolved CALLS + file imports — graph-level, so language-agnostic) and `CALLS_ENDPOINT` (frontend call site → route: axios-style `x.get('/path')`, `fetch(...)`, and template paths `` `/x/${id}` `` normalized to `:param`, matched by method + path tail with ambiguous matches skipped). `gatt routes` shows both per route (`models:` / `called from:`); `blast` on a model lists the API surface it backs; `search`/`describe` on a frontend function shows `Calls backend routes: …`.
-Edges: `CALLS` (resolved local calls — the call graph), `HAS_METHOD`, `BELONGS_TO`, `IMPORTS`, `CO_CHANGED` (git history), `MENTIONS` (doc → code it references), and — JS/TS/JSX only — `HANDLED_BY`/`USES_MIDDLEWARE` (route → function) and `READS`/`WRITES` (function → state). Generated code (`.pb.go`, `_gen.go`, `.min.js`, …) is excluded from context packs but still findable via search.
+Edges: `CALLS` (resolved local calls — the call graph), `HAS_METHOD`, `BELONGS_TO`, `IMPORTS` (relative specifiers **and** tsconfig path aliases resolve to local file nodes), `GENERATES` (declared generation pipelines), `CO_CHANGED` (git history), `MENTIONS` (doc → code it references), `REFERENCES` (model → model associations), `USES_MODEL` (route → model), `CALLS_ENDPOINT` (frontend call site → route), and — JS/TS/JSX only — `HANDLED_BY`/`USES_MIDDLEWARE` (route → function) and `READS`/`WRITES` (function → state). Generated code (`.pb.go`, `_gen.go`, `.min.js`, …) is excluded from context packs but still findable via search. Graphs record an absolute repo root, so every command works from any cwd via `--graph`; a legacy relative-root graph refuses to refresh from the wrong cwd instead of silently re-pointing at the wrong tree.
 
 ## Quickstart
 
@@ -86,8 +86,13 @@ gatt grep "TODO(#42)" --regex             # exhaustive literal/regex scan of eve
                                           # a zero-result answer proves absence; search
                                           # above is semantic/top-N and is NOT exhaustive
 gatt tree internal/engine --depth 2       # directory tree annotated with each file's doc
-gatt routes                               # HTTP routes found in code (Express JS/TS/JSX):
-                                          # method, path, handler, middleware
+gatt routes                               # HTTP routes found in code: method, path, handler,
+                                          # middleware, models touched, frontend call sites
+gatt models                               # ORM models found in code: DB table, field→column
+                                          # renames, associations (explicit + FK-name inferred)
+gatt doc-drift                            # docs whose code references broke (deleted/renamed
+                                          # symbols, moved files) or went stale (code changed
+                                          # after the doc's last commit)
 gatt diff HEAD~5                          # structural diff vs a git ref: added/removed/
                                           # changed/renamed/moved functions & types
 gatt path clients conversation_messages   # FK join path with exact columns
@@ -99,17 +104,19 @@ gatt overview                             # all tables (or files/components), co
 
 `gatt extract codebase <dir>` parses the repo with tree-sitter and builds the call graph. When `<dir>` is a git checkout, extraction (and `gatt grep`) additionally respects the repo's own `.gitignore`/`.git/info/exclude` via `git ls-files` — not just a fixed list of common build-output names (`dist`, `build`, `node_modules`, …) — so a project-specific output directory is excluded too, instead of a compiled/minified copy of every function competing with its real source definition as an ambiguous same-named node. Falls back to the fixed skip list alone when `<dir>` isn't a git checkout.
 
-Two commands are built for agent workflows:
+The agent-workflow commands:
 
 - **`gatt code-query "<question>"`** — the code analogue of `query`: the most relevant functions (signature, exact `file:line`, resolved callers/callees, doc comment, body when short), types with their methods, and matching docs, in one compact pack. An agent reads only the line ranges the pack points at instead of whole files.
 - **`gatt impact <function>`** — walks `CALLS` edges backwards, transitively (`--depth`, default 3): every caller that breaks if the signature or behavior changes. Run it before refactors; `[test]` tags show which tests cover the blast radius.
 - **`gatt blast <file-or-function>`** — blast radius of modifying *any* node, including JSON/YAML/SQL/CSS data files (indexed with a content hash): transitive callers **plus** file importers (relative imports and tsconfig path aliases resolve to local file nodes), regenerated outputs via `GENERATES` edges (declared as `"generates": [{"from": …, "to": …}]` in `.gatt/relations.json`), a warning when the target is itself generated, same-basename copies flagged `[identical]`/`[diverged]` by hash, and **git co-change companions** — files with no static edge that historically ship in the same commits (a component's stylesheet, the doc page of a service, the e2e test of a controller, i18n bundles). For a function target, both `impact` and `blast` also list a `shares mutable state:` section — the *other* functions reading/writing the same tracked singleton property (e.g. `config.session`), a data-flow signal `CALLS` alone can't see (heuristic, JS/TS/JSX only, one hop). Run it before editing shared schema/config files.
 - **`gatt grep <pattern>`** — exhaustive literal (or `--regex`) scan of every file under the root, using the same skip rules as extraction. Independent of the indexed extension set and independent of ranking: a zero-result answer is a reliable proof of absence, unlike `search`/`find_entities`, which is semantic/top-N.
 - **`gatt tree [path]`** — a directory tree synthesized from file nodes (the graph has no directory nodes), each file annotated with its doc summary: a leading file/package comment, a markdown doc's title, or its earliest function's doc.
-- **`gatt routes`** — every HTTP route detected in code: method, path, resolved handler, and middleware chain. Detects Express-style `router.get/post/put/delete/patch/all/use(path, ...)` registrations in JS/TS/JSX — v1 scope, no Go/Python route frameworks yet.
+- **`gatt routes`** — every HTTP route detected in code: method, path, resolved handler (identifier, inline arrow, or `controller.method` reference), middleware chain, **the ORM models the handler chain touches** (`models:`), and **the frontend call sites that hit it** (`called from:`). Detects Express-style `router.get/post/put/delete/patch/all/use(path, ...)` registrations in JS/TS/JSX — no Go/Python route frameworks yet; tag those handlers via `annotate route_method=… route_path=…`.
+- **`gatt models`** — every ORM model detected in code, grouped by file: DB table, field count, the field→column renames a SQL grep can't see, and associations in both directions. Detection is layered and language-agnostic: Sequelize `Model.init`/`sequelize.define` + explicit associations, TypeORM decorators, Go DB struct tags, Django/SQLAlchemy classes, `*_id`-style FK-name inference, `.gatt/models.json` overlay, `annotate model_table=…` fallback.
+- **`gatt doc-drift`** — which documentation lies: markdown docs whose inline-code references no longer resolve (a symbol deleted/renamed, a cited file moved) or point at code whose last git commit postdates the doc's. Run it after refactors to get the list of docs needing an update, and before trusting a doc.
 - **`gatt diff [ref]`** — structural diff of the working tree against a git ref (default `HEAD`): added/removed/changed/renamed/moved functions and types, detected by matching signatures across two extractions (not a textual diff), plus the current callers of anything that changed. Reuses git's own rename detection (`git diff -M`) for whole-file renames; function-level renames/moves are a same-file (then cross-file) signature-match heuristic.
 
-**Never stale:** both commands (and the MCP server) check file mtimes before answering (~60ms), re-parse only the files that changed since the last extract, evict deleted entities, and re-embed just the changed nodes. Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exception: `CO_CHANGED` edges are mined from git history at full extract only — incremental refresh preserves them but new commits are folded in on the next re-extract.)
+**Never stale:** every query command (and the MCP server) checks file mtimes before answering (~60ms), re-parses only the files that changed since the last extract, evicts deleted entities, re-wires cross-file edges (calls, imports, mentions, associations, route models), and re-embeds just the changed nodes. Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exceptions that refresh only on full re-extract: `CO_CHANGED` edges — git history has no incremental delta worth mining — and `CALLS_ENDPOINT` edges from files that didn't themselves change.)
 
 ### Semantic overlay (`.gatt/`)
 
@@ -182,7 +189,9 @@ gatt index                             # re-embed only the nodes whose text chan
 | `blast` | Blast radius of any node — file (incl. data files), function, or type: callers + importers + regenerated outputs + diverged copies. Run before editing shared config/schema files. |
 | `grep` | Exhaustive literal/regex search across every file — a zero-result answer is proof of absence, unlike the semantic/top-N `find_entities`. |
 | `tree` | Directory tree synthesized from file nodes, each annotated with its doc summary. |
-| `routes` | Every HTTP route detected in code (Express-style JS/TS/JSX): method, path, handler, middleware chain. |
+| `routes` | Every HTTP route detected in code: method, path, handler (incl. `controller.method` refs), middleware chain, models touched, frontend call sites. The full-stack intersection in one call. |
+| `models` | Every ORM model detected in code: DB table, field→column renames, associations (explicit + FK-name inferred). Language-agnostic layered detection; `.gatt/models.json` + `annotate model_table` for unknown ORMs. |
+| `doc_drift` | Docs whose code references broke (deleted/renamed symbols, moved files) or went stale (referenced code committed after the doc). Run after refactors, and before trusting a doc. |
 | `code_diff` | Structural diff vs a git ref (default `HEAD`): added/removed/changed/renamed/moved functions & types, plus current callers of anything changed. |
 
 **Maintain** — the agent curates and refreshes the graph itself:
@@ -236,17 +245,24 @@ Emit nodes/edges with the model in `internal/graph/model.go`, wire into `cmd/gat
 - [x] Exhaustive literal/regex search (`gatt grep`) as a proof-of-absence complement to semantic `search`
 - [x] Annotated directory tree (`gatt tree`) and floating "why" comments as queryable `comment` nodes
 - [x] Structural diff against a git ref (`gatt diff`): rename/move-aware function/type changes + current callers
+- [x] Blast radius for any node (`gatt blast`): callers + importers (tsconfig aliases resolved) + generated copies + same-basename duplicates by content hash
+- [x] Git co-change mining (`CO_CHANGED`): stylesheets/docs/e2e-tests/i18n that ship together with no static edge
+- [x] Doc drift (`gatt doc-drift`): MENTIONS edges doc→code, broken/stale reference report
+- [x] Language-agnostic ORM models (`gatt models`): Sequelize/TypeORM/gorm/Django/SQLAlchemy + FK-name inference + `.gatt/models.json` overlay
+- [x] Full-stack intersection: `USES_MODEL` (route → models its handler touches) + `CALLS_ENDPOINT` (frontend call site → route)
+- [x] Absolute graph roots + wrong-cwd refresh guard (legacy relative-source graphs refuse instead of corrupting)
 - [ ] Sample values for low-cardinality string columns (`status`, `type`, ...) that carry no declared enum — see `TODO(#2)` in `internal/connector/postgres/postgres.go`
 - [ ] Cross-source graphs (DB + API spec merged: which endpoint touches which table)
 - [ ] Query-log mining: add edges from JOINs observed in real queries (relationships not declared as FKs)
 - [ ] Route detection for Go (net/http, gin, chi) and Python (Flask/FastAPI) — `gatt routes` is JS/TS/JSX only today
+- [ ] Client-call detection for method-as-string wrappers (`apiRequest("post", "/x")`) — only member calls + fetch today
 
 ## Layout
 
 ```
 cmd/gatt/                 CLI: init | extract | enrich | index | query | code-query | impact |
-                          blast | search | grep | tree | routes | diff | path | explain |
-                          annotate | overview | mcp | install
+                          blast | doc-drift | search | grep | tree | routes | models | diff |
+                          path | explain | annotate | overview | mcp | install
 internal/engine/          query operations shared by CLI and MCP
 internal/graph/           graph model, traversal, persistence (JSON + SQLite/FTS5)
 internal/connector/       Connector interface + sqlite/, postgres/, openapi/, codebase/

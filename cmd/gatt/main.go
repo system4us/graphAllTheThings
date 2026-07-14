@@ -116,7 +116,7 @@ func usage() {
 
 build the graph:
   gatt init                        scaffold an agent-native .gatt/ config for codebase contextualization
-  gatt extract codebase <dir>      build graph from .gatt/ json configurations
+  gatt extract codebase <dir>      parse a repo (tree-sitter) into a code graph; merges the .gatt/ overlay if present
   gatt extract sqlite <db-file> [--out gatt-out/graph.json] [--check]
   gatt extract postgres "postgres://user:pass@host:port/db?sslmode=disable" [--out PATH] [--check]
   gatt extract openapi <spec.json|spec.yaml|http://host:8000/openapi.json> [--out PATH] [--check] [--code REPO_ROOT]
@@ -137,8 +137,10 @@ query it (graphify-style):
                                       staleness is by commit date, not working-tree mtime)
   gatt grep <pattern>              exhaustive literal search across every file — a proof of absence, not top-N [--regex] [--limit N]
   gatt tree [path]                 directory tree annotated with each file's doc summary [--depth N]
-  gatt routes [--file substr]      HTTP routes detected in code (Express-style JS/TS): method, path, handler, middleware
-  gatt models [--file substr]      ORM models detected in code (Sequelize JS/TS): table, field→column renames, associations
+  gatt routes [--file substr]      HTTP routes detected in code (Express-style JS/TS): method, path, handler,
+                                      middleware, ORM models the handler touches, frontend call sites hitting it
+  gatt models [--file substr]      ORM models detected in code (Sequelize/TypeORM/gorm/Django/SQLAlchemy +
+                                      .gatt/models.json overlay): table, field→column renames, associations
   gatt diff [ref]                  structural diff vs a git ref (default HEAD): added/removed/changed/renamed/moved functions & types, plus current callers [--limit N]
   gatt path <tableA> <tableB>      cheapest FK join path with exact columns
   gatt explain <table|column>      one node in full: attrs + relationships
