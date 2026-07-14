@@ -24,12 +24,16 @@ type entry struct {
 }
 
 type file struct {
+	Model   string  `json:"model"` // embedding model used at index time
 	Dim     int     `json:"dim"`
 	Entries []entry `json:"entries"`
 }
 
 type Store struct {
-	Path    string // e.g. gatt-out/vectors.json
+	Path string // e.g. gatt-out/vectors.json
+	// Model is the embedding model recorded at Upsert time; queries must
+	// use the same one or vectors won't be comparable.
+	Model   string
 	entries []entry
 	loaded  bool
 }
@@ -52,7 +56,7 @@ func normalize(v []float32) {
 }
 
 func (s *Store) Upsert(_ context.Context, points []store.Point) error {
-	f := file{}
+	f := file{Model: s.Model}
 	for _, p := range points {
 		normalize(p.Vector)
 		f.Entries = append(f.Entries, entry{NodeID: p.NodeID, Type: p.Type, Name: p.Name, Vector: p.Vector})
@@ -86,8 +90,16 @@ func (s *Store) load() error {
 		return err
 	}
 	s.entries = f.Entries
+	s.Model = f.Model
 	s.loaded = true
 	return nil
+}
+
+// StoredModel returns the embedding model recorded at index time, or ""
+// when no index exists yet.
+func (s *Store) StoredModel() string {
+	_ = s.load()
+	return s.Model
 }
 
 func (s *Store) Search(_ context.Context, vector []float32, limit int, nodeType string) ([]store.Hit, error) {

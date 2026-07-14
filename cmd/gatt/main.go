@@ -132,8 +132,23 @@ func indexFlags(fs *flag.FlagSet) (graphPath, qdURL, coll, embURL, embModel *str
 	qdURL = fs.String("qdrant", "", "qdrant url (opt-in; default is the in-process vector index)")
 	coll = fs.String("collection", "gatt", "qdrant collection")
 	embURL = fs.String("embed-url", embed.DefaultURL, "embedding server url (ollama)")
-	embModel = fs.String("embed-model", embed.DefaultModel, "embedding model")
+	embModel = fs.String("embed-model", "", "embedding model (default: model recorded in the index, else "+embed.DefaultModel+")")
 	return
+}
+
+// resolveModel picks the embedding model: explicit flag > model recorded in
+// the local index > default. Prevents silent dimension mismatches between
+// index time and query time.
+func resolveModel(flagModel string, vs store.VectorStore) string {
+	if flagModel != "" {
+		return flagModel
+	}
+	if ls, ok := vs.(*local.Store); ok {
+		if m := ls.StoredModel(); m != "" {
+			return m
+		}
+	}
+	return embed.DefaultModel
 }
 
 // openStore picks the vector backend: Qdrant when --qdrant was given,
@@ -152,7 +167,7 @@ func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine
 		return nil, err
 	}
 	vs := openStore(graphPath, qdURL, coll)
-	return engine.New(g, vs, embed.New(embURL, embModel)), nil
+	return engine.New(g, vs, embed.New(embURL, resolveModel(embModel, vs))), nil
 }
 
 func cmdIndex(ctx context.Context, args []string) error {
@@ -165,8 +180,15 @@ func cmdIndex(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	emb := embed.New(*embURL, *embModel)
+	model := *embModel
+	if model == "" {
+		model = embed.DefaultModel
+	}
+	emb := embed.New(*embURL, model)
 	vs := openStore(*graphPath, *qdURL, *coll)
+	if ls, ok := vs.(*local.Store); ok {
+		ls.Model = model
+	}
 
 	var ids, texts []string
 	for id, n := range g.Nodes {
@@ -176,7 +198,7 @@ func cmdIndex(ctx context.Context, args []string) error {
 		ids = append(ids, id)
 		texts = append(texts, g.NodeText(id))
 	}
-	fmt.Printf("embedding %d nodes with %s...\n", len(ids), *embModel)
+	fmt.Printf("embedding %d nodes with %s...\n", len(ids), model)
 	batch := 64
 	var points []store.Point
 	for i := 0; i < len(ids); i += batch {
@@ -239,7 +261,6 @@ func cmdQuery(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
 	limit := fs.Int("limit", 4, "max tables in context")
-	asJSON := fs.Bool("json", false, "raw JSON output")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -247,44 +268,11 @@ func cmdQuery(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	cx, err := e.QuestionContext(ctx, question, *limit)
+	out, err := e.ContextPack(ctx, question, *limit)
 	if err != nil {
 		return err
 	}
-	if *asJSON {
-		return json.NewEncoder(os.Stdout).Encode(cx)
-	}
-	for _, t := range cx.Tables {
-		fmt.Printf("## %s", t.Name)
-		if c := t.Attrs["comment"]; c != "" {
-			fmt.Printf(" — %s", c)
-		}
-		fmt.Println()
-		for _, ed := range t.Edges {
-			switch {
-			case ed.Type == graph.EdgeHasColumn && ed.Dir == "out":
-				col := strings.TrimPrefix(ed.Other, "column:")
-				line := "  " + col
-				if dt := ed.Attrs["data_type"]; dt != "" {
-					line += "  " + dt
-				}
-				if ed.Attrs["primary_key"] == "true" {
-					line += "  PK"
-				}
-				if ev := ed.Attrs["enum_values"]; ev != "" {
-					line += "  [" + ev + "]"
-				}
-				if c := ed.Attrs["comment"]; c != "" {
-					line += "  -- " + c
-				}
-				fmt.Println(line)
-			case ed.Type == graph.EdgeReferences && ed.Dir == "out":
-				fmt.Printf("  → references %s (%s → %s)\n",
-					strings.TrimPrefix(ed.Other, "table:"), ed.Attrs["from_column"], ed.Attrs["to_column"])
-			}
-		}
-		fmt.Println()
-	}
+	fmt.Print(out)
 	return nil
 }
 
@@ -400,7 +388,7 @@ func cmdMCP(ctx context.Context, args []string) error {
 			}
 		}
 		if vs != nil {
-			emb = embed.New(*embURL, *embModel)
+			emb = embed.New(*embURL, resolveModel(*embModel, vs))
 		}
 	}
 	return mcpserver.New(engine.New(g, vs, emb)).Run(ctx)

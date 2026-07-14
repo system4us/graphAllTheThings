@@ -1,7 +1,8 @@
 // Package mcpserver exposes the semantic graph to agents over MCP (stdio).
 // Tools answer schema questions from the pre-built graph so the agent never
-// has to introspect the live source at question time. All logic lives in
-// internal/engine; this is protocol plumbing only.
+// has to introspect the live source at question time. Responses are compact
+// annotated text, not structured JSON — same information, far fewer tokens.
+// All logic lives in internal/engine; this is protocol plumbing only.
 package mcpserver
 
 import (
@@ -28,6 +29,10 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.server.Run(ctx, &mcp.StdioTransport{})
 }
 
+func text(t string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: t}}}
+}
+
 type emptyIn struct{}
 
 type findIn struct {
@@ -37,7 +42,7 @@ type findIn struct {
 }
 
 type describeIn struct {
-	ID string `json:"id" jsonschema:"node id or bare name, e.g. table:users, users, users.email"`
+	ID string `json:"id" jsonschema:"table/column name or node id, e.g. users, sales.status, table:public.users"`
 }
 
 type joinIn struct {
@@ -52,40 +57,49 @@ type contextIn struct {
 
 func (s *Server) register() {
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name:        "graph_overview",
-		Description: "Summary of the metadata graph: source, node counts, all tables with column counts and references. Call this first to orient yourself.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, engine.Overview, error) {
-		return nil, s.e.Overview(), nil
+		Name:        "sql_context",
+		Description: "PREFERRED FIRST CALL for any data question. One compact block with the relevant tables (columns, types, enums, FKs, soft-delete flags) AND the join conditions between them. Usually the only call you need before writing SQL.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, any, error) {
+		out, err := s.e.ContextPack(ctx, in.Question, in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "find_entities",
-		Description: "Find tables/columns/views semantically related to a natural-language query (e.g. 'user login timestamps'). Use before writing SQL to locate the right entities.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in findIn) (*mcp.CallToolResult, engine.FindResult, error) {
-		out, err := s.e.Find(ctx, in.Query, in.Type, in.Limit)
-		return nil, out, err
+		Description: "Semantic search over tables/columns/views when sql_context missed something specific. One line per hit.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in findIn) (*mcp.CallToolResult, any, error) {
+		res, err := s.e.Find(ctx, in.Query, in.Type, in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(s.e.RenderFind(res)), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "describe_entity",
-		Description: "Full detail of one node: attributes (types, enums, row counts, comments, DDL) and all relationships (columns, foreign keys, indexes).",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in describeIn) (*mcp.CallToolResult, engine.Description, error) {
-		out, err := s.e.Describe(in.ID)
-		return nil, out, err
+		Description: "One table/view in full compact form: columns, types, enums, FKs in and out. Use when sql_context didn't include a table you need.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in describeIn) (*mcp.CallToolResult, any, error) {
+		out, err := s.e.RenderTable(in.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "join_path",
-		Description: "Cheapest foreign-key join path between two tables, with the exact columns to join on. Avoids hub tables (tenant-style FKs) that produce semantically wrong joins. Use to build multi-table SQL without guessing.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in joinIn) (*mcp.CallToolResult, engine.JoinPath, error) {
-		return nil, s.e.Join(in.From, in.To), nil
+		Description: "Foreign-key join chain between two tables as a ready JOIN clause. Only needed when the tables were not both in sql_context output (its ## joins section already covers those).",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in joinIn) (*mcp.CallToolResult, any, error) {
+		return text(s.e.RenderJoin(s.e.Join(in.From, in.To))), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name:        "sql_context",
-		Description: "One-shot context pack for answering a data question: the most relevant tables fully described (columns, types, enums, FKs). Feed this straight into SQL generation.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, engine.Context, error) {
-		out, err := s.e.QuestionContext(ctx, in.Question, in.Limit)
-		return nil, out, err
+		Name:        "graph_overview",
+		Description: "Every table with column count and references, one per line. Only for exploring the whole schema; for a specific question use sql_context.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
+		return text(s.e.RenderOverview()), nil, nil
 	})
 }

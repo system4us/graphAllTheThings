@@ -78,11 +78,6 @@ type JoinPath struct {
 	Hint  string     `json:"hint,omitempty"`
 }
 
-type Context struct {
-	Tables []Description `json:"tables"`
-	Hint   string        `json:"hint"`
-}
-
 func (e *Engine) Overview() Overview {
 	out := Overview{Source: e.G.Source, NodeCounts: map[string]int{}}
 	for _, n := range e.G.Nodes {
@@ -249,33 +244,4 @@ func (e *Engine) Join(fromName, toName string) JoinPath {
 	}
 	out.Hint = strings.Join(joins, " ")
 	return out
-}
-
-// QuestionContext builds the context pack for a data question: the most
-// relevant tables fully described, with column detail inlined.
-func (e *Engine) QuestionContext(ctx context.Context, question string, limit int) (Context, error) {
-	if limit <= 0 {
-		limit = 4
-	}
-	found, err := e.Find(ctx, question, graph.NodeTable, limit)
-	if err != nil {
-		return Context{}, err
-	}
-	out := Context{Hint: "Tables most relevant to the question, fully described. Join columns are in the REFERENCES edges (from_column/to_column)."}
-	for _, h := range found.Hits {
-		d, err := e.Describe(h.ID)
-		if err != nil {
-			continue
-		}
-		// inline column detail so the caller gets everything in one call
-		for i, ed := range d.Edges {
-			if ed.Type == graph.EdgeHasColumn && ed.Dir == "out" {
-				if col := e.G.Nodes[ed.Other]; col != nil {
-					d.Edges[i].Attrs = col.Attrs
-				}
-			}
-		}
-		out.Tables = append(out.Tables, d)
-	}
-	return out, nil
 }
