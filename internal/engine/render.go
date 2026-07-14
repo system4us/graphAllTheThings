@@ -529,3 +529,234 @@ func (e *Engine) RenderOverview() string {
 	}
 	return b.String()
 }
+
+// ---------------------------------------------------------------------------
+// Codebase renderers
+// ---------------------------------------------------------------------------
+
+// IsCodebase reports whether this graph was extracted from source code
+// (as opposed to a database or API spec).
+func (e *Engine) IsCodebase() bool {
+	return strings.HasPrefix(e.G.Source, "codebase:")
+}
+
+// RenderFunction renders a function/method node compactly: signature, file
+// location with line numbers, and its call graph (callers + callees).
+func (e *Engine) RenderFunction(id string) (string, error) {
+	d, err := e.Describe(id)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	sig := d.Attrs["signature"]
+	if sig == "" {
+		sig = d.Name
+	}
+	fmt.Fprintf(&b, "## func %s\n", sig)
+	if f := d.Attrs["file"]; f != "" {
+		loc := f
+		if ls := d.Attrs["line_start"]; ls != "" {
+			loc += ":" + ls
+			if le := d.Attrs["line_end"]; le != "" && le != ls {
+				loc += "-" + le
+			}
+		}
+		fmt.Fprintf(&b, "location: %s\n", loc)
+	}
+	if c := d.Attrs["doc"]; c != "" {
+		fmt.Fprintf(&b, "doc: %s\n", c)
+	}
+
+	var calls, callers []string
+	for _, ed := range d.Edges {
+		if on := e.G.Nodes[ed.Other]; on != nil {
+			label := on.Name
+			if loc := on.Attrs["file"]; loc != "" {
+				if ls := on.Attrs["line_start"]; ls != "" {
+					label += " (" + loc + ":" + ls + ")"
+				} else {
+					label += " (" + loc + ")"
+				}
+			}
+			switch {
+			case ed.Type == "CALLS" && ed.Dir == "out" && on.Attrs["external"] != "true":
+				calls = append(calls, label)
+			case ed.Type == "CALLS" && ed.Dir == "in":
+				callers = append(callers, label)
+			}
+		}
+	}
+	if len(callers) > 0 {
+		sort.Strings(callers)
+		b.WriteString("called by: " + joinCapped(callers, 12) + "\n")
+	}
+	if len(calls) > 0 {
+		sort.Strings(calls)
+		b.WriteString("calls: " + joinCapped(calls, 12) + "\n")
+	}
+	return b.String(), nil
+}
+
+// joinCapped joins up to max items, summarizing the overflow. Keeps renders
+// of hub nodes (a function with 3000 callers) bounded.
+func joinCapped(items []string, max int) string {
+	if len(items) <= max {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:max], ", ") + fmt.Sprintf(" … +%d more", len(items)-max)
+}
+
+// RenderDefinition renders a type/struct/class with its methods.
+func (e *Engine) RenderDefinition(id string) (string, error) {
+	d, err := e.Describe(id)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "## type %s\n", d.Name)
+	if f := d.Attrs["file"]; f != "" {
+		loc := f
+		if ls := d.Attrs["line_start"]; ls != "" {
+			loc += ":" + ls
+		}
+		fmt.Fprintf(&b, "location: %s\n", loc)
+	}
+	if c := d.Attrs["doc"]; c != "" {
+		fmt.Fprintf(&b, "doc: %s\n", c)
+	}
+
+	var methods []string
+	for _, ed := range d.Edges {
+		if ed.Type == "HAS_METHOD" && ed.Dir == "out" {
+			if fn := e.G.Nodes[ed.Other]; fn != nil {
+				entry := fn.Name
+				if sig := fn.Attrs["signature"]; sig != "" {
+					entry = sig
+				}
+				if ls := fn.Attrs["line_start"]; ls != "" {
+					entry += " :" + ls
+				}
+				methods = append(methods, entry)
+			}
+		}
+	}
+	if len(methods) > 0 {
+		sort.Strings(methods)
+		b.WriteString("methods:\n")
+		shown := methods
+		if len(shown) > 30 {
+			shown = shown[:30]
+		}
+		for _, m := range shown {
+			fmt.Fprintf(&b, "  %s\n", m)
+		}
+		if extra := len(methods) - len(shown); extra > 0 {
+			fmt.Fprintf(&b, "  … +%d more methods\n", extra)
+		}
+	}
+	return b.String(), nil
+}
+
+// CodeContextPack is the codebase analogue of sql_context: it finds the most
+// relevant functions, types, and files for a natural-language question, renders
+// them compactly, and gives a complete orientation in one tool call instead of
+// many round-trips through the graph.
+func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 6
+	}
+	var b strings.Builder
+	if fr := e.G.Freshness(time.Now()); fr != "" {
+		fmt.Fprintf(&b, "# source: %s\n\n", fr)
+	}
+
+	funcHits, err := e.Find(ctx, question, graph.NodeFunction, limit)
+	if err != nil {
+		return "", err
+	}
+	defHits, err := e.Find(ctx, question, graph.NodeDefinition, limit/2+1)
+	if err != nil {
+		return "", err
+	}
+	fileHits, err := e.Find(ctx, question, graph.NodeFile, limit/2)
+	if err != nil {
+		return "", err
+	}
+
+	seen := map[string]bool{}
+	rendered := 0
+	const budget = 16 * 1024 // hard cap: keep the pack one cheap tool call
+
+	// 1. Type definitions (orientation layer).
+	for _, h := range defHits.Hits {
+		if seen[h.ID] || b.Len() > budget {
+			continue
+		}
+		seen[h.ID] = true
+		s, err := e.RenderDefinition(h.ID)
+		if err != nil {
+			continue
+		}
+		b.WriteString(s + "\n")
+		rendered++
+	}
+
+	// 2. Relevant functions.
+	for _, h := range funcHits.Hits {
+		if seen[h.ID] || b.Len() > budget {
+			continue
+		}
+		if n := e.G.Nodes[h.ID]; n != nil && n.Attrs["external"] == "true" {
+			continue
+		}
+		seen[h.ID] = true
+		s, err := e.RenderFunction(h.ID)
+		if err != nil {
+			continue
+		}
+		b.WriteString(s + "\n")
+		rendered++
+	}
+
+	// 3. Files (docs / README / plain source files).
+	for _, h := range fileHits.Hits {
+		if seen[h.ID] || rendered >= limit*2 || b.Len() > budget {
+			break
+		}
+		n := e.G.Nodes[h.ID]
+		if n == nil {
+			continue
+		}
+		seen[h.ID] = true
+		if body := n.Attrs["doc_body"]; body != "" {
+			if len(body) > 200 {
+				body = body[:200] + "…"
+			}
+			fmt.Fprintf(&b, "## doc: %s\n%s\n\n", n.Name, body)
+		} else {
+			var fileFuncs []string
+			for _, ed := range e.G.EdgesOf(h.ID) {
+				if ed.Type == "BELONGS_TO" && ed.To == h.ID {
+					if fn := e.G.Nodes[ed.From]; fn != nil && fn.Type == graph.NodeFunction {
+						sig := fn.Attrs["signature"]
+						if sig == "" {
+							sig = fn.Name
+						}
+						fileFuncs = append(fileFuncs, sig)
+					}
+				}
+			}
+			sort.Strings(fileFuncs)
+			if len(fileFuncs) > 0 {
+				fmt.Fprintf(&b, "## file: %s\nfunctions: %s\n\n", n.Name, strings.Join(fileFuncs, ", "))
+			}
+		}
+		rendered++
+	}
+
+	if rendered == 0 {
+		return "no code entities matched the question; try find_entities with different wording", nil
+	}
+	return b.String(), nil
+}
+

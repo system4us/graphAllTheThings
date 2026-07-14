@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"graphallthethings/internal/connector"
+	"graphallthethings/internal/connector/codebase"
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/engine"
 	"graphallthethings/internal/enrich"
@@ -26,7 +27,18 @@ import (
 	"graphallthethings/internal/store/qdrant"
 )
 
-const defaultGraph = "gatt-out/graph.json"
+// defaultGraph prefers an existing SQLite graph (created via
+// `extract --out gatt-out/graph.db`) over the JSON default: the format is
+// chosen at first extract and stays sticky for every later command.
+var defaultGraph = "gatt-out/graph.json"
+
+func init() {
+	if _, err := os.Stat(defaultGraph); err != nil {
+		if _, err := os.Stat("gatt-out/graph.db"); err == nil {
+			defaultGraph = "gatt-out/graph.db"
+		}
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -46,6 +58,8 @@ func main() {
 		err = cmdSearch(ctx, os.Args[2:])
 	case "query":
 		err = cmdQuery(ctx, os.Args[2:])
+	case "code-query", "codequery":
+		err = cmdCodeQuery(ctx, os.Args[2:])
 	case "path":
 		err = cmdPath(ctx, os.Args[2:])
 	case "explain":
@@ -58,6 +72,8 @@ func main() {
 		err = cmdMCP(ctx, os.Args[2:])
 	case "install":
 		err = cmdInstall(ctx, os.Args[2:])
+	case "init":
+		err = cmdInit(ctx, os.Args[2:])
 	case "help", "--help", "-h":
 		usage()
 	default:
@@ -74,6 +90,8 @@ func usage() {
 	fmt.Fprint(os.Stderr, `gatt — turn any source's metadata into a semantic graph for AI agents
 
 build the graph:
+  gatt init                        scaffold an agent-native .gatt/ config for codebase contextualization
+  gatt extract codebase <dir>      build graph from .gatt/ json configurations
   gatt extract sqlite <db-file> [--out gatt-out/graph.json] [--check]
   gatt extract postgres "postgres://user:pass@host:port/db?sslmode=disable" [--out PATH] [--check]
   gatt extract openapi <spec.json|spec.yaml|http://host:8000/openapi.json> [--out PATH] [--check] [--code REPO_ROOT]
@@ -86,6 +104,7 @@ build the graph:
 
 query it (graphify-style):
   gatt query "<question>"          context pack: relevant tables, columns, joins
+  gatt code-query "<question>"     context pack for code: functions, types, docs, call graph
   gatt search "<text>"             semantic search over all nodes [--type table|column|...]
   gatt path <tableA> <tableB>      cheapest FK join path with exact columns
   gatt explain <table|column>      one node in full: attrs + relationships
@@ -98,8 +117,8 @@ curate it (business knowledge the schema can't express):
 serve it:
   gatt mcp     [--graph PATH] [--no-semantic] [--qdrant URL] [--source-kind KIND --source SRC]
       --source-kind/--source wire the live source into the check_drift + refresh_graph MCP tools
-  gatt install [--graph PATH] [--scope project|user] [--source-kind KIND --source SRC]
-      register MCP server in Claude Code (a passed source is stored in the MCP config)
+  gatt install [--graph PATH] [--scope project|user|agy] [--source-kind KIND --source SRC]
+      register MCP server in Claude Code or Antigravity (a passed source is stored in the MCP config)
 
 all query/serve commands take --graph (default gatt-out/graph.json).
 vectors live in-process (vectors.json next to the graph); --qdrant URL opts into Qdrant.
@@ -108,15 +127,46 @@ vectors live in-process (vectors.json next to the graph); --qdrant URL opts into
 
 func cmdExtract(ctx context.Context, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: gatt extract sqlite|postgres|openapi <source> [--out PATH] [--check]")
+		return fmt.Errorf("usage: gatt extract sqlite|postgres|openapi|codebase <source> [--out PATH] [--check]")
 	}
 	kind, source := args[0], args[1]
 	fs := flag.NewFlagSet("extract", flag.ExitOnError)
 	out := fs.String("out", defaultGraph, "output graph path")
 	check := fs.Bool("check", false, "re-extract and report drift vs the existing graph without writing it")
 	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source (swaggo)")
+	update := fs.Bool("update", false, "codebase only: incremental — re-parse only files changed since last extract")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
+	}
+	if *update {
+		if kind != "codebase" {
+			return fmt.Errorf("--update only supports the codebase connector")
+		}
+		_, mts, err := graph.LoadCodebaseState(*out)
+		if err != nil {
+			return fmt.Errorf("--update needs an existing graph at %s — run a full extract first", *out)
+		}
+		if !codebase.New(source).HasDrift(mts) {
+			fmt.Println("no drift; graph unchanged")
+			return nil
+		}
+		raw, err := graph.LoadRaw(*out)
+		if err != nil {
+			return err
+		}
+		ng, summary, err := codebase.New(source).Update(ctx, raw)
+		if err != nil {
+			return err
+		}
+		if summary == "" {
+			fmt.Println("no drift; graph unchanged")
+			return nil
+		}
+		if err := ng.Save(*out); err != nil {
+			return err
+		}
+		fmt.Printf("%s → %s\n", summary, *out)
+		return nil
 	}
 	conn, err := connector.Open(kind, source)
 	if err != nil {
@@ -270,6 +320,34 @@ func openStore(graphPath, qdURL, coll string) store.VectorStore {
 }
 
 // openEngine loads the graph and wires the vector store + embedder.
+// autoRefreshCodebase incrementally re-parses changed files of a codebase
+// graph before answering, so line numbers and call edges never go stale
+// mid-session. No-op for non-codebase graphs or when nothing changed.
+func autoRefreshCodebase(ctx context.Context, graphPath string) {
+	// Cheap precheck first (stat walk + light metadata read): the common
+	// no-drift case never materializes the graph.
+	source, mts, err := graph.LoadCodebaseState(graphPath)
+	if err != nil || !strings.HasPrefix(source, "codebase:") {
+		return
+	}
+	conn := codebase.New(strings.TrimPrefix(source, "codebase:"))
+	if !conn.HasDrift(mts) {
+		return
+	}
+	raw, err := graph.LoadRaw(graphPath)
+	if err != nil {
+		return
+	}
+	ng, summary, err := conn.Update(ctx, raw)
+	if err != nil || summary == "" {
+		return
+	}
+	if err := ng.Save(graphPath); err != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "graph auto-refreshed: %s\n", summary)
+}
+
 func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine, error) {
 	g, err := graph.Load(graphPath)
 	if err != nil {
@@ -584,12 +662,12 @@ func cmdMCP(ctx context.Context, args []string) error {
 	return srv.Run(ctx)
 }
 
-// cmdInstall registers gatt as an MCP server for Claude Code: via the
-// `claude` CLI when available, otherwise by merging into ./.mcp.json.
+// cmdInstall registers gatt as an MCP server for Claude Code (or Antigravity): via the
+// `claude` CLI when available, otherwise by merging into ./.mcp.json or mcp_config.json.
 func cmdInstall(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	graphPath := fs.String("graph", defaultGraph, "graph file the server will use")
-	scope := fs.String("scope", "project", "project (this repo's .mcp.json) or user (all projects)")
+	scope := fs.String("scope", "project", "project (this repo's .mcp.json), user (all projects), or agy (Antigravity CLI)")
 	name := fs.String("name", "gatt", "MCP server name")
 	srcKind := fs.String("source-kind", "", "source connector to wire in for the check_drift/refresh_graph tools ("+connector.Kinds+")")
 	src := fs.String("source", "", "source the connector reads (file/DSN/URL); note a DB DSN is stored in the MCP config")
@@ -606,7 +684,7 @@ func cmdInstall(ctx context.Context, args []string) error {
 		return err
 	}
 	if _, err := os.Stat(absGraph); err != nil {
-		return fmt.Errorf("graph %s not found — run `gatt extract` first", absGraph)
+		fmt.Printf("warning: graph %s not found. The agent will need to run refresh_graph to create it.\n", absGraph)
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -631,6 +709,15 @@ func cmdInstall(ctx context.Context, args []string) error {
 		mcpArgs = append(mcpArgs, "--code", absCode)
 	}
 
+	if *scope == "agy" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("could not find home dir: %w", err)
+		}
+		configPath := filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json")
+		return updateMCPConfig(configPath, *name, exe, mcpArgs)
+	}
+
 	if claude, err := exec.LookPath("claude"); err == nil {
 		cmd := exec.CommandContext(ctx, claude, append([]string{"mcp", "add", "--scope", *scope, *name, "--", exe}, mcpArgs...)...)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -643,27 +730,108 @@ func cmdInstall(ctx context.Context, args []string) error {
 
 	// no claude CLI: merge into ./.mcp.json
 	if *scope != "project" {
-		return fmt.Errorf("claude CLI not found; only --scope project supported (writes ./.mcp.json)")
+		return fmt.Errorf("claude CLI not found; only --scope project or agy supported")
 	}
+	return updateMCPConfig(".mcp.json", *name, exe, mcpArgs)
+}
+
+func updateMCPConfig(configPath, name, exe string, mcpArgs []string) error {
 	cfg := map[string]any{}
-	if data, err := os.ReadFile(".mcp.json"); err == nil {
+	if data, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			return fmt.Errorf(".mcp.json exists but is invalid JSON: %w", err)
+			return fmt.Errorf("%s exists but is invalid JSON: %w", configPath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	} else if dir := filepath.Dir(configPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
 		}
 	}
 	servers, _ := cfg["mcpServers"].(map[string]any)
 	if servers == nil {
 		servers = map[string]any{}
 	}
-	servers[*name] = map[string]any{"command": exe, "args": mcpArgs}
+	servers[name] = map[string]any{"command": exe, "args": mcpArgs}
 	cfg["mcpServers"] = servers
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(".mcp.json", data, 0o644); err != nil {
+	if err := os.WriteFile(configPath, data, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("wrote .mcp.json: server %q → %s %s\n", *name, exe, strings.Join(mcpArgs, " "))
+	fmt.Printf("wrote %s: server %q → %s %s\n", filepath.Base(configPath), name, exe, strings.Join(mcpArgs, " "))
 	return nil
 }
+
+func cmdInit(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := ".gatt"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	files := map[string]string{
+		"gatt.spec.json": "{\n  \"version\": \"1.0\",\n  \"project\": \"\",\n  \"namespaces\": [],\n  \"manifests\": {\n    \"definitions\": \"./definitions.json\",\n    \"relations\": \"./relations.json\",\n    \"contracts\": \"./contracts.json\"\n  }\n}",
+		"definitions.json": "{\n  \"entities\": {}\n}",
+		"relations.json": "{\n  \"features\": []\n}",
+		"contracts.json": "{\n  \"api\": {},\n  \"database\": {}\n}",
+		"prompt.md": `# GATT Initialization Directive
+
+You have been invoked to initialize the .gatt/ semantic graph for this repository. 
+Your goal is to populate gatt.spec.json, definitions.json, and relations.json with the core architectural domains of this codebase.
+
+**CRITICAL RULES FOR THIS INSPECTION:**
+1. **DO NOT rely solely on documentation.** Documentation (like ARCHITECTURE.md) is often obsolete. You MUST inspect the ACTUAL source code, directory structures, and core interfaces to discover the real domains.
+2. **This is a Long-Run Inspection.** Take your time. Traverse the main entry points, understand the data flow, and identify the isolated subprojects. You are looking at a forest with many trees; find how the branches intersect.
+3. **Map the Semantic Domains:** In definitions.json, define the high-level business domains and document their *critical rules* based on how the code actually behaves.
+4. **Map the Relations:** In relations.json, link these semantic domains to their physical entry points and declare their dependencies.
+5. **Execute:** Run a deep exploration of the codebase now. When finished, write the final JSONs.
+`,
+	}
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				return err
+			}
+			fmt.Printf("created %s\n", path)
+		} else {
+			fmt.Printf("skipped %s (already exists)\n", path)
+		}
+	}
+	fmt.Println("\nInitialized .gatt/ workspace.")
+	fmt.Println("👉 Pass .gatt/prompt.md to your AI agent to begin the semantic extraction.")
+	return nil
+}
+
+// cmdCodeQuery is the codebase analogue of cmdQuery: it renders the most
+// relevant functions, types, and docs for a natural-language question against
+// a codebase graph.
+func cmdCodeQuery(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf(`usage: gatt code-query "<question>" [flags]`)
+	}
+	question := args[0]
+	fs := flag.NewFlagSet("code-query", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	limit := fs.Int("limit", 6, "max entities in context")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.CodeContextPack(ctx, question, *limit)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+

@@ -19,6 +19,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"graphallthethings/internal/connector"
+	"graphallthethings/internal/connector/codebase"
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/engine"
 	"graphallthethings/internal/enrich"
@@ -72,7 +73,8 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) build() (*engine.Engine, error) {
 	g, err := graph.Load(s.cfg.GraphPath)
 	if err != nil {
-		return nil, err
+		// Start with a nil engine; agent must call refresh_graph first.
+		return nil, nil
 	}
 	var vs store.VectorStore
 	if s.cfg.OpenStore != nil {
@@ -81,10 +83,13 @@ func (s *Server) build() (*engine.Engine, error) {
 	return engine.New(g, vs, s.cfg.Embedder), nil
 }
 
-func (s *Server) engine() *engine.Engine {
+func (s *Server) requireEngine() (*engine.Engine, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.e
+	if s.e == nil {
+		return nil, fmt.Errorf("graph not extracted yet; use refresh_graph to extract it from the live source")
+	}
+	return s.e, nil
 }
 
 func (s *Server) setEngine(e *engine.Engine) {
@@ -98,6 +103,11 @@ func text(t string) *mcp.CallToolResult {
 }
 
 type emptyIn struct{}
+
+type sourceIn struct {
+	SourceKind string `json:"source_kind,omitempty" jsonschema:"optional: connector kind (sqlite, postgres, openapi). Required if the server wasn't started with one."`
+	Source     string `json:"source,omitempty" jsonschema:"optional: file path, DSN, or URL. Required if the server wasn't started with one."`
+}
 
 type findIn struct {
 	Query string `json:"query" jsonschema:"natural-language description of what to find"`
@@ -131,7 +141,11 @@ func (s *Server) register() {
 		Name:        "sql_context",
 		Description: "PREFERRED FIRST CALL for any data question. One compact block with the SQL dialect, the relevant tables (columns, types, enums, FKs, soft-delete flags, and curated business notes / default filters) AND the join conditions between them. For an API-spec graph it returns the relevant schemas and endpoints with their $ref relationships instead. Trust the default filter and note lines: they define what the entity means, so apply them instead of guessing or asking. Usually the only call you need before writing SQL.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, any, error) {
-		out, err := s.engine().ContextPack(ctx, in.Question, in.Limit)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.ContextPack(ctx, in.Question, in.Limit)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -139,21 +153,45 @@ func (s *Server) register() {
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name:        "find_entities",
-		Description: "Semantic search over the graph (tables/columns/views, or API schemas/properties/endpoints) when sql_context missed something specific. One line per hit.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in findIn) (*mcp.CallToolResult, any, error) {
-		res, err := s.engine().Find(ctx, in.Query, in.Type, in.Limit)
+		Name:        "code_context",
+		Description: "PREFERRED FIRST CALL for any code question on a codebase graph. Returns the most relevant functions (with signatures, file:line locations, callers, and callees), types/structs (with all their methods), and relevant docs/files — all in one compact block. Use this before reading source files directly; it tells you exactly what exists and where so you can navigate with precision. Works with find_entities and describe_entity for follow-up detail.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
 		if err != nil {
 			return nil, nil, err
 		}
-		return text(s.engine().RenderFind(res)), nil, nil
+		out, err := e.CodeContextPack(ctx, in.Question, in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "find_entities",
+		Description: "Semantic search over the graph (tables/columns/views, or API schemas/properties/endpoints) when sql_context missed something specific. One line per hit.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in findIn) (*mcp.CallToolResult, any, error) {
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		res, err := e.Find(ctx, in.Query, in.Type, in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(e.RenderFind(res)), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "describe_entity",
 		Description: "One entity in full compact form: for a database, a table/view with columns, types, enums, FKs; for an API spec, a schema (properties, $ref targets) or an endpoint (params, request/response bodies). Use when sql_context didn't include something you need.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in describeIn) (*mcp.CallToolResult, any, error) {
-		out, err := s.engine().Render(in.ID)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Render(in.ID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -164,7 +202,10 @@ func (s *Server) register() {
 		Name:        "join_path",
 		Description: "Foreign-key join chain between two tables as a ready JOIN clause (or, for an API spec, the $ref chain between two schemas). Only needed when the entities were not both in sql_context output (its joins section already covers those).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in joinIn) (*mcp.CallToolResult, any, error) {
-		e := s.engine()
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
 		return text(e.RenderJoin(e.Join(in.From, in.To))), nil, nil
 	})
 
@@ -172,7 +213,11 @@ func (s *Server) register() {
 		Name:        "graph_overview",
 		Description: "Every table (or API schema) with member count and references, plus API endpoints, one per line. Only for exploring the whole graph; for a specific question use sql_context.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
-		return text(s.engine().RenderOverview()), nil, nil
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(e.RenderOverview()), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -193,35 +238,36 @@ func (s *Server) register() {
 		return text(out), nil, nil
 	})
 
-	// Drift/refresh need the live source; only offered when one is configured.
-	if s.cfg.SourceKind != "" {
-		mcp.AddTool(s.server, &mcp.Tool{
-			Name:        "check_drift",
-			Description: "Re-read the live source and report how the current graph has drifted from it (added/removed/changed tables & columns, FK deltas) WITHOUT modifying anything. Use to judge whether the snapshot is stale before trusting it, or to decide if refresh_graph is warranted.",
-		}, func(ctx context.Context, req *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
-			out, err := s.checkDrift(ctx)
-			if err != nil {
-				return nil, nil, err
-			}
-			return text(out), nil, nil
-		})
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "check_drift",
+		Description: "Re-read the live source and report how the current graph has drifted from it (added/removed/changed tables & columns, FK deltas) WITHOUT modifying anything. Use to judge whether the snapshot is stale before trusting it, or to decide if refresh_graph is warranted.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in sourceIn) (*mcp.CallToolResult, any, error) {
+		out, err := s.checkDrift(ctx, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
+	})
 
-		mcp.AddTool(s.server, &mcp.Tool{
-			Name:        "refresh_graph",
-			Description: "Re-extract the graph from the live source, re-embed the changed nodes, and reload — bringing the snapshot up to date. WRITES to disk. Reports what changed. Use after check_drift shows meaningful drift.",
-		}, func(ctx context.Context, req *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
-			out, err := s.refresh(ctx)
-			if err != nil {
-				return nil, nil, err
-			}
-			return text(out), nil, nil
-		})
-	}
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "refresh_graph",
+		Description: "Re-extract the graph from the live source, re-embed the changed nodes, and reload — bringing the snapshot up to date. WRITES to disk. Reports what changed. Use after check_drift shows meaningful drift, or to create the initial graph.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in sourceIn) (*mcp.CallToolResult, any, error) {
+		out, err := s.refresh(ctx, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
+	})
 }
 
 func (s *Server) annotate(in annotateIn) (*mcp.CallToolResult, any, error) {
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
 	// Resolve a bare name ("contacts") to the canonical node id the merge keys on.
-	d, err := s.engine().Describe(in.Node)
+	d, err := e.Describe(in.Node)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -255,6 +301,40 @@ func (s *Server) annotate(in annotateIn) (*mcp.CallToolResult, any, error) {
 	return text(b.String()), nil, nil
 }
 
+// autoRefreshCodebase incrementally re-parses files that changed since the
+// last extract, saves the graph, and reloads the engine, so code_context never
+// answers from a stale graph (wrong line numbers are worse than no graph).
+// Returns a one-line note for the tool output, or "" when nothing changed.
+func (s *Server) autoRefreshCodebase(ctx context.Context) string {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	// Cheap precheck first (stat walk + light metadata read): the common
+	// no-drift case never materializes the graph.
+	source, mts, err := graph.LoadCodebaseState(s.cfg.GraphPath)
+	if err != nil || !strings.HasPrefix(source, "codebase:") {
+		return ""
+	}
+	conn := codebase.New(strings.TrimPrefix(source, "codebase:"))
+	if !conn.HasDrift(mts) {
+		return ""
+	}
+	raw, err := graph.LoadRaw(s.cfg.GraphPath)
+	if err != nil {
+		return ""
+	}
+	ng, summary, err := conn.Update(ctx, raw)
+	if err != nil || summary == "" {
+		return ""
+	}
+	if err := ng.Save(s.cfg.GraphPath); err != nil {
+		return ""
+	}
+	if ne, err := s.build(); err == nil {
+		s.setEngine(ne)
+	}
+	return "note: graph auto-refreshed (" + summary + ")\n\n"
+}
+
 func (s *Server) reload() (string, error) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -266,8 +346,18 @@ func (s *Server) reload() (string, error) {
 	return "reloaded\n" + statusLine(ne), nil
 }
 
-func (s *Server) checkDrift(ctx context.Context) (string, error) {
-	conn, err := connector.Open(s.cfg.SourceKind, s.cfg.Source)
+func (s *Server) checkDrift(ctx context.Context, in sourceIn) (string, error) {
+	kind, src := in.SourceKind, in.Source
+	if kind == "" {
+		kind = s.cfg.SourceKind
+	}
+	if src == "" {
+		src = s.cfg.Source
+	}
+	if kind == "" || src == "" {
+		return "", fmt.Errorf("source_kind and source are required (either via tool args or server config)")
+	}
+	conn, err := connector.Open(kind, src)
 	if err != nil {
 		return "", err
 	}
@@ -296,10 +386,20 @@ func (s *Server) checkDrift(ctx context.Context) (string, error) {
 	return d.Text(), nil
 }
 
-func (s *Server) refresh(ctx context.Context) (string, error) {
+func (s *Server) refresh(ctx context.Context, in sourceIn) (string, error) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
-	conn, err := connector.Open(s.cfg.SourceKind, s.cfg.Source)
+	kind, src := in.SourceKind, in.Source
+	if kind == "" {
+		kind = s.cfg.SourceKind
+	}
+	if src == "" {
+		src = s.cfg.Source
+	}
+	if kind == "" || src == "" {
+		return "", fmt.Errorf("source_kind and source are required (either via tool args or server config)")
+	}
+	conn, err := connector.Open(kind, src)
 	if err != nil {
 		return "", err
 	}
@@ -322,7 +422,7 @@ func (s *Server) refresh(ctx context.Context) (string, error) {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "refreshed %s → %s\n", s.cfg.Source, s.cfg.GraphPath)
+	fmt.Fprintf(&b, "refreshed %s → %s\n", src, s.cfg.GraphPath)
 	if s.cfg.CodeRoot != "" {
 		fmt.Fprintf(&b, "linked source: %d endpoints, %d schemas\n", linked.Endpoints, linked.Schemas)
 	}

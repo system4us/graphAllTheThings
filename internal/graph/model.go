@@ -29,10 +29,23 @@ const (
 	NodeSchema   = "schema"   // a component schema / model (analogous to table)
 	NodeProperty = "property" // a schema property (analogous to column)
 	NodeEndpoint = "endpoint" // an HTTP operation, e.g. "GET /users/{id}"
+
+	NodeDefinition = "definition"
+	NodeFeature    = "feature"
+	NodeComponent  = "component"
+	NodeProject    = "project"
+	NodeFile       = "file"
+	NodeFunction   = "function"
 )
 
 // Edge types.
 const (
+	EdgeDependsOn  = "DEPENDS_ON"
+	EdgeBelongsTo  = "BELONGS_TO"
+	EdgeCalls      = "CALLS"
+	EdgeImports    = "IMPORTS"
+	EdgeHasMethod  = "HAS_METHOD" // definition -> function (type owns method)
+
 	EdgeHasTable   = "HAS_TABLE"
 	EdgeHasColumn  = "HAS_COLUMN"
 	EdgeHasIndex   = "HAS_INDEX"
@@ -72,6 +85,22 @@ type Graph struct {
 	Edges       []Edge           `json:"edges"`
 
 	adj map[string][]int // node id -> edge indexes (both directions), built lazily
+
+	journal *journal // non-nil while tracking mutations for delta saves
+}
+
+// journal records mutations since StartJournal so a SQLite save can write
+// only the delta instead of rewriting every row. JSON saves ignore it.
+type journal struct {
+	removedNodes map[string]bool
+	addedNodes   map[string]bool
+	addedEdges   []Edge
+}
+
+// StartJournal begins mutation tracking. Call it right after loading a graph
+// that will be incrementally updated and saved to SQLite.
+func (g *Graph) StartJournal() {
+	g.journal = &journal{removedNodes: map[string]bool{}, addedNodes: map[string]bool{}}
 }
 
 func New(source string) *Graph {
@@ -131,11 +160,49 @@ func (g *Graph) AddNode(n *Node) {
 	}
 	g.Nodes[n.ID] = n
 	g.adj = nil
+	if g.journal != nil {
+		g.journal.addedNodes[n.ID] = true
+	}
 }
 
 func (g *Graph) AddEdge(from, to, typ string, attrs map[string]string) {
-	g.Edges = append(g.Edges, Edge{From: from, To: to, Type: typ, Attrs: attrs})
+	e := Edge{From: from, To: to, Type: typ, Attrs: attrs}
+	g.Edges = append(g.Edges, e)
 	g.adj = nil
+	if g.journal != nil {
+		g.journal.addedEdges = append(g.journal.addedEdges, e)
+	}
+}
+
+// RemoveNodesWhere deletes every node matching pred plus all edges touching a
+// removed node, returning how many nodes were removed. Used by incremental
+// refresh to evict entities of changed/deleted files before re-parsing.
+func (g *Graph) RemoveNodesWhere(pred func(*Node) bool) int {
+	removed := map[string]bool{}
+	for id, n := range g.Nodes {
+		if pred(n) {
+			removed[id] = true
+			delete(g.Nodes, id)
+		}
+	}
+	if len(removed) == 0 {
+		return 0
+	}
+	if g.journal != nil {
+		for id := range removed {
+			g.journal.removedNodes[id] = true
+			delete(g.journal.addedNodes, id)
+		}
+	}
+	kept := g.Edges[:0]
+	for _, e := range g.Edges {
+		if !removed[e.From] && !removed[e.To] {
+			kept = append(kept, e)
+		}
+	}
+	g.Edges = kept
+	g.adj = nil
+	return len(removed)
 }
 
 func (g *Graph) buildAdj() {
@@ -302,7 +369,24 @@ func (g *Graph) NodeText(id string) string {
 	if dt := n.Attrs["data_type"]; dt != "" {
 		fmt.Fprintf(&b, " Type %s.", dt)
 	}
-	var cols, refs, refBy, accepts, returns, usedBy []string
+	// Codebase-specific enrichment: signature, file location, doc content.
+	if sig := n.Attrs["signature"]; sig != "" {
+		fmt.Fprintf(&b, " Signature: %s.", sig)
+	}
+	if f := n.Attrs["file"]; f != "" {
+		fmt.Fprintf(&b, " In file %s.", f)
+	}
+	if doc := n.Attrs["doc"]; doc != "" {
+		fmt.Fprintf(&b, " %s", doc)
+	}
+	if body := n.Attrs["doc_body"]; body != "" {
+		// Include up to 300 chars of markdown body for semantic indexing.
+		if len(body) > 300 {
+			body = body[:300]
+		}
+		fmt.Fprintf(&b, " %s", body)
+	}
+	var cols, refs, refBy, accepts, returns, usedBy, methods, calledBy []string
 	for _, e := range g.EdgesOf(id) {
 		other := e.To
 		if other == id {
@@ -325,6 +409,10 @@ func (g *Graph) NodeText(id string) string {
 			returns = append(returns, on.Name)
 		case (e.Type == EdgeAccepts || e.Type == EdgeRespondsWith) && e.To == id:
 			usedBy = append(usedBy, on.Name)
+		case e.Type == EdgeHasMethod && e.From == id:
+			methods = append(methods, on.Name)
+		case e.Type == EdgeCalls && e.To == id:
+			calledBy = append(calledBy, on.Name)
 		}
 	}
 	if len(cols) > 0 {
@@ -333,6 +421,12 @@ func (g *Graph) NodeText(id string) string {
 			label = "Properties"
 		}
 		fmt.Fprintf(&b, " %s: %s.", label, strings.Join(cols, ", "))
+	}
+	if len(methods) > 0 {
+		fmt.Fprintf(&b, " Methods: %s.", strings.Join(methods, ", "))
+	}
+	if len(calledBy) > 0 {
+		fmt.Fprintf(&b, " Called by: %s.", strings.Join(calledBy, ", "))
 	}
 	if len(accepts) > 0 {
 		fmt.Fprintf(&b, " Accepts: %s.", strings.Join(accepts, ", "))
@@ -355,6 +449,9 @@ func (g *Graph) NodeText(id string) string {
 func (g *Graph) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
+	}
+	if IsSQLitePath(path) {
+		return g.saveSQLite(path)
 	}
 	data, err := json.MarshalIndent(g, "", "  ")
 	if err != nil {
@@ -381,6 +478,9 @@ func Load(path string) (*Graph, error) {
 // annotations sidecar. Diffing two extractions must compare raw graphs, or
 // annotated attributes would show up as spurious source changes.
 func LoadRaw(path string) (*Graph, error) {
+	if IsSQLitePath(path) {
+		return loadSQLite(path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

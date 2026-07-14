@@ -53,9 +53,10 @@ gatt extract postgres "postgres://user:pass@host:5432/db?sslmode=disable"
 gatt extract openapi http://localhost:8000/openapi.json   # live FastAPI spec (or a .json/.yaml file; OpenAPI 3.x or Swagger 2.0)
 gatt index                                # embed nodes → gatt-out/vectors.json
 gatt install                              # register MCP server in Claude Code
+gatt install --scope agy                  # register MCP server in Antigravity CLI
 ```
 
-`gatt install` uses `claude mcp add` when the CLI is available (`--scope project|user`), otherwise merges into `./.mcp.json` directly.
+`gatt install` uses `claude mcp add` when the CLI is available (`--scope project|user`), otherwise merges into `./.mcp.json` directly. Use `--scope agy` to register in `~/.gemini/antigravity-cli/mcp_config.json`.
 
 Query from the terminal (same operations the MCP tools expose):
 

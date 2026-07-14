@@ -136,11 +136,55 @@ func (e *Engine) Find(ctx context.Context, query, nodeType string, limit int) (F
 			hits, err := e.VS.Search(ctx, vecs[0], limit, nodeType)
 			if err == nil {
 				out := FindResult{Method: "semantic"}
+				seen := map[string]bool{}
 				for _, h := range hits {
+					// Skip vectors for nodes no longer in the graph (stale index).
+					if e.G.Nodes[h.NodeID] == nil {
+						continue
+					}
+					seen[h.NodeID] = true
 					out.Hits = append(out.Hits, FindHit{
 						ID: h.NodeID, Type: h.Type, Name: h.Name,
 						Score: h.Score, Text: e.G.NodeText(h.NodeID),
 					})
+				}
+				// Hybrid: nodes added after the last index run have no vector,
+				// so a pure semantic answer silently misses them. Merge keyword
+				// hits — a query term matching the node *name* is high-signal
+				// and may evict the semantic tail; others only fill spare slots.
+				var nameHits, textHits []FindHit
+				terms := strings.Fields(strings.ToLower(query))
+				for _, kh := range e.keywordFind(query, nodeType, limit).Hits {
+					if seen[kh.ID] {
+						continue
+					}
+					lname := strings.ToLower(kh.Name)
+					matched := false
+					for _, t := range terms {
+						if strings.Contains(lname, t) {
+							matched = true
+							break
+						}
+					}
+					if matched {
+						nameHits = append(nameHits, kh)
+					} else {
+						textHits = append(textHits, kh)
+					}
+				}
+				if reserve := min(len(nameHits), 3); len(out.Hits) > limit-reserve {
+					out.Hits = out.Hits[:limit-reserve]
+				}
+				merged := false
+				for _, kh := range append(nameHits, textHits...) {
+					if len(out.Hits) >= limit {
+						break
+					}
+					out.Hits = append(out.Hits, kh)
+					merged = true
+				}
+				if merged {
+					out.Method = "hybrid"
 				}
 				return out, nil
 			}

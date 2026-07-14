@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 
+	"graphallthethings/internal/connector/codebase"
 	"graphallthethings/internal/connector/openapi"
 	"graphallthethings/internal/connector/postgres"
 	"graphallthethings/internal/connector/sqlite"
@@ -21,10 +22,10 @@ type Connector interface {
 }
 
 // Kinds lists the available connector kinds, for usage and error messages.
-const Kinds = "sqlite, postgres, openapi"
+const Kinds = "sqlite, postgres, openapi, codebase"
 
 // Open builds the connector for a source kind ("sqlite", "postgres",
-// "openapi") pointed at source (a file path, DSN, or URL). Shared by the CLI's
+// "openapi", "codebase") pointed at source (a file path, DSN, or URL). Shared by the CLI's
 // `extract` and the MCP server's refresh/drift tools so both resolve a source
 // the same way.
 func Open(kind, source string) (Connector, error) {
@@ -35,6 +36,8 @@ func Open(kind, source string) (Connector, error) {
 		return postgres.New(source), nil
 	case "openapi":
 		return openapi.New(source), nil
+	case "codebase":
+		return codebase.New(source), nil
 	default:
 		return nil, fmt.Errorf("unknown connector %q (available: %s)", kind, Kinds)
 	}
