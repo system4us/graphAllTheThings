@@ -25,16 +25,23 @@ func New(g *graph.Graph, vs store.VectorStore, emb *embed.Client) *Engine {
 }
 
 type Overview struct {
-	Source     string         `json:"source"`
-	NodeCounts map[string]int `json:"node_counts"`
-	Tables     []TableSummary `json:"tables"`
+	Source     string            `json:"source"`
+	NodeCounts map[string]int    `json:"node_counts"`
+	Tables     []TableSummary    `json:"tables"`              // tables (SQL) or schemas (API)
+	Endpoints  []EndpointSummary `json:"endpoints,omitempty"` // API only
 }
 
 type TableSummary struct {
 	Name       string   `json:"name"`
 	RowCount   string   `json:"row_count,omitempty"`
-	Columns    int      `json:"columns"`
+	Columns    int      `json:"columns"` // columns (SQL) or properties (API)
 	References []string `json:"references,omitempty"`
+}
+
+type EndpointSummary struct {
+	Name    string   `json:"name"` // "GET /users/{id}"
+	Summary string   `json:"summary,omitempty"`
+	Schemas []string `json:"schemas,omitempty"` // schemas the endpoint accepts/returns
 }
 
 type FindHit struct {
@@ -83,11 +90,17 @@ func (e *Engine) Overview() Overview {
 	for _, n := range e.G.Nodes {
 		out.NodeCounts[n.Type]++
 	}
-	for _, t := range e.G.NodesByType(graph.NodeTable) {
+	// Containers are tables for a SQL source, schemas for an API spec; both count
+	// their members (columns / properties) and their outgoing REFERENCES.
+	containerType := graph.NodeTable
+	if e.G.IsAPI() {
+		containerType = graph.NodeSchema
+	}
+	for _, t := range e.G.NodesByType(containerType) {
 		ts := TableSummary{Name: t.Name, RowCount: t.Attrs["row_count"]}
 		for _, ed := range e.G.EdgesOf(t.ID) {
 			switch {
-			case ed.Type == graph.EdgeHasColumn && ed.From == t.ID:
+			case (ed.Type == graph.EdgeHasColumn || ed.Type == graph.EdgeHasProperty) && ed.From == t.ID:
 				ts.Columns++
 			case ed.Type == graph.EdgeReferences && ed.From == t.ID:
 				if n := e.G.Nodes[ed.To]; n != nil {
@@ -96,6 +109,17 @@ func (e *Engine) Overview() Overview {
 			}
 		}
 		out.Tables = append(out.Tables, ts)
+	}
+	for _, ep := range e.G.NodesByType(graph.NodeEndpoint) {
+		es := EndpointSummary{Name: ep.Name, Summary: ep.Attrs["comment"]}
+		for _, ed := range e.G.EdgesOf(ep.ID) {
+			if (ed.Type == graph.EdgeAccepts || ed.Type == graph.EdgeRespondsWith) && ed.From == ep.ID {
+				if n := e.G.Nodes[ed.To]; n != nil {
+					es.Schemas = append(es.Schemas, n.Name)
+				}
+			}
+		}
+		out.Endpoints = append(out.Endpoints, es)
 	}
 	return out
 }
@@ -165,7 +189,7 @@ func (e *Engine) Describe(id string) (Description, error) {
 	n := e.G.Nodes[id]
 	if n == nil {
 	outer:
-		for _, prefix := range []string{"table:", "column:", "view:", "index:"} {
+		for _, prefix := range []string{"table:", "column:", "view:", "index:", "schema:", "property:", "endpoint:", "api:"} {
 			for _, cand := range []string{prefix + id, prefix + "public." + id} {
 				if e.G.Nodes[cand] != nil {
 					n = e.G.Nodes[cand]
@@ -197,16 +221,24 @@ func (e *Engine) Describe(id string) (Description, error) {
 // penalizing hub tables (tenant_id-style FKs every table carries) whose
 // joins are usually semantically wrong even at fewer hops.
 func (e *Engine) Join(fromName, toName string) JoinPath {
+	prefix := "table:"
+	if e.G.IsAPI() {
+		prefix = "schema:"
+	}
 	resolve := func(name string) string {
-		if e.G.Nodes["table:"+name] == nil && e.G.Nodes["table:public."+name] != nil {
-			return "table:public." + name
+		if e.G.Nodes[prefix+name] == nil && e.G.Nodes[prefix+"public."+name] != nil {
+			return prefix + "public." + name
 		}
-		return "table:" + name
+		return prefix + name
 	}
 	from, to := resolve(fromName), resolve(toName)
+	kind := "table"
+	if e.G.IsAPI() {
+		kind = "schema"
+	}
 	for name, id := range map[string]string{fromName: from, toName: to} {
 		if e.G.Nodes[id] == nil {
-			return JoinPath{Found: false, Hint: fmt.Sprintf("table %q not found; use find to locate it", name)}
+			return JoinPath{Found: false, Hint: fmt.Sprintf("%s %q not found; use find to locate it", kind, name)}
 		}
 	}
 	hubCost := func(id string) float64 {
@@ -220,22 +252,50 @@ func (e *Engine) Join(fromName, toName string) JoinPath {
 	}
 	path := e.G.CheapestPath(from, to, hubCost, graph.EdgeReferences)
 	if path == nil {
-		return JoinPath{Found: false, Hint: "no foreign-key path between these tables; they may be unrelated or joined through data (not schema)"}
+		miss := "no foreign-key path between these tables; they may be unrelated or joined through data (not schema)"
+		if e.G.IsAPI() {
+			miss = "no $ref path between these schemas; they may be unrelated"
+		}
+		return JoinPath{Found: false, Hint: miss}
 	}
 	out := JoinPath{Found: true}
 	cur := from
 	for _, ed := range path {
-		step := JoinStep{FromColumn: ed.Attrs["from_column"], ToColumn: ed.Attrs["to_column"]}
+		var step JoinStep
 		next := ed.To
+		if e.G.IsAPI() {
+			step.FromColumn = ed.Attrs["from_property"]
+			if ed.Attrs["cardinality"] == "array" && step.FromColumn != "" {
+				step.FromColumn += "[]"
+			}
+		} else {
+			step.FromColumn, step.ToColumn = ed.Attrs["from_column"], ed.Attrs["to_column"]
+		}
 		if next == cur {
 			next = ed.From
-			// edge traversed backwards: swap column roles
-			step.FromColumn, step.ToColumn = step.ToColumn, step.FromColumn
+			if !e.G.IsAPI() {
+				// edge traversed backwards: swap column roles
+				step.FromColumn, step.ToColumn = step.ToColumn, step.FromColumn
+			}
 		}
-		step.FromTable = strings.TrimPrefix(cur, "table:")
-		step.ToTable = strings.TrimPrefix(next, "table:")
+		step.FromTable = strings.TrimPrefix(cur, prefix)
+		step.ToTable = strings.TrimPrefix(next, prefix)
 		out.Steps = append(out.Steps, step)
 		cur = next
+	}
+	// API: render the reference chain (A → B via property). SQL: render a ready
+	// JOIN clause with the exact key columns.
+	if e.G.IsAPI() {
+		parts := []string{strings.TrimPrefix(from, prefix)}
+		for _, st := range out.Steps {
+			if st.FromColumn != "" {
+				parts = append(parts, fmt.Sprintf("→ %s (%s)", st.ToTable, st.FromColumn))
+			} else {
+				parts = append(parts, "→ "+st.ToTable)
+			}
+		}
+		out.Hint = strings.Join(parts, " ")
+		return out
 	}
 	var joins []string
 	for _, st := range out.Steps {

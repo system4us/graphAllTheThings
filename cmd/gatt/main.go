@@ -12,13 +12,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"graphallthethings/internal/connector"
-	"graphallthethings/internal/connector/postgres"
-	"graphallthethings/internal/connector/sqlite"
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/engine"
+	"graphallthethings/internal/enrich"
 	"graphallthethings/internal/graph"
+	"graphallthethings/internal/indexer"
 	"graphallthethings/internal/mcpserver"
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
@@ -37,6 +38,8 @@ func main() {
 	switch os.Args[1] {
 	case "extract":
 		err = cmdExtract(ctx, os.Args[2:])
+	case "enrich":
+		err = cmdEnrich(ctx, os.Args[2:])
 	case "index":
 		err = cmdIndex(ctx, os.Args[2:])
 	case "search", "find":
@@ -47,6 +50,8 @@ func main() {
 		err = cmdPath(ctx, os.Args[2:])
 	case "explain":
 		err = cmdExplain(ctx, os.Args[2:])
+	case "annotate":
+		err = cmdAnnotate(ctx, os.Args[2:])
 	case "overview":
 		err = cmdOverview(ctx, os.Args[2:])
 	case "mcp":
@@ -69,9 +74,15 @@ func usage() {
 	fmt.Fprint(os.Stderr, `gatt — turn any source's metadata into a semantic graph for AI agents
 
 build the graph:
-  gatt extract sqlite <db-file> [--out gatt-out/graph.json]
-  gatt extract postgres "postgres://user:pass@host:port/db?sslmode=disable" [--out PATH]
-  gatt index  [--graph PATH] [--embed-url URL] [--embed-model NAME] [--qdrant URL]
+  gatt extract sqlite <db-file> [--out gatt-out/graph.json] [--check]
+  gatt extract postgres "postgres://user:pass@host:port/db?sslmode=disable" [--out PATH] [--check]
+  gatt extract openapi <spec.json|spec.yaml|http://host:8000/openapi.json> [--out PATH] [--check] [--code REPO_ROOT]
+      re-extract reports schema drift vs the existing graph; --check reports it without writing
+      --code links endpoints/schemas to their Go source (swaggo): describe_entity shows source: file:line
+  gatt enrich <repo-root> [--graph PATH]
+      re-link an existing graph to its Go source without re-extracting (the cheap post-code-edit update)
+  gatt index  [--graph PATH] [--embed-url URL] [--embed-model NAME] [--qdrant URL] [--full]
+      only re-embeds nodes whose text changed since the last index; --full forces a full re-embed
 
 query it (graphify-style):
   gatt query "<question>"          context pack: relevant tables, columns, joins
@@ -80,9 +91,15 @@ query it (graphify-style):
   gatt explain <table|column>      one node in full: attrs + relationships
   gatt overview                    all tables, counts, references
 
+curate it (business knowledge the schema can't express):
+  gatt annotate <node> key=value   set entity_note / default_filter (survives re-extract)
+  gatt annotate <node> --clear     remove a node's annotations
+
 serve it:
-  gatt mcp     [--graph PATH] [--no-semantic] [--qdrant URL]
-  gatt install [--graph PATH] [--scope project|user]   register MCP server in Claude Code
+  gatt mcp     [--graph PATH] [--no-semantic] [--qdrant URL] [--source-kind KIND --source SRC]
+      --source-kind/--source wire the live source into the check_drift + refresh_graph MCP tools
+  gatt install [--graph PATH] [--scope project|user] [--source-kind KIND --source SRC]
+      register MCP server in Claude Code (a passed source is stored in the MCP config)
 
 all query/serve commands take --graph (default gatt-out/graph.json).
 vectors live in-process (vectors.json next to the graph); --qdrant URL opts into Qdrant.
@@ -91,27 +108,55 @@ vectors live in-process (vectors.json next to the graph); --qdrant URL opts into
 
 func cmdExtract(ctx context.Context, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: gatt extract sqlite|postgres <source> [--out PATH]")
+		return fmt.Errorf("usage: gatt extract sqlite|postgres|openapi <source> [--out PATH] [--check]")
 	}
 	kind, source := args[0], args[1]
 	fs := flag.NewFlagSet("extract", flag.ExitOnError)
 	out := fs.String("out", defaultGraph, "output graph path")
+	check := fs.Bool("check", false, "re-extract and report drift vs the existing graph without writing it")
+	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source (swaggo)")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	var conn connector.Connector
-	switch kind {
-	case "sqlite":
-		conn = sqlite.New(source)
-	case "postgres":
-		conn = postgres.New(source)
-	default:
-		return fmt.Errorf("unknown connector %q (available: sqlite, postgres)", kind)
+	conn, err := connector.Open(kind, source)
+	if err != nil {
+		return err
 	}
 	g, err := conn.Extract(ctx)
 	if err != nil {
 		return err
 	}
+	if *code != "" {
+		r, err := enrich.Code(g, *code)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("linked source: %d endpoints, %d schemas → %s\n", r.Endpoints, r.Schemas, *code)
+	}
+	g.ExtractedAt = time.Now()
+
+	// Diff against the current graph when one exists: report drift and warn
+	// about annotations left pointing at removed nodes. Compare raw graphs so
+	// merged annotations don't read as source changes.
+	if old, err := graph.LoadRaw(*out); err == nil {
+		d := graph.DiffGraphs(old, g)
+		printDiff(d, old)
+		warnOrphanAnnotations(*out, d.RemovedNodes)
+		if *check {
+			return nil // drift reported; leave the graph untouched
+		}
+		if d.Empty() {
+			// Refresh only the timestamp so freshness reflects this check.
+			if err := g.Save(*out); err != nil {
+				return err
+			}
+			fmt.Printf("schema unchanged; refreshed timestamp → %s\n", *out)
+			return nil
+		}
+	} else if *check {
+		return fmt.Errorf("no existing graph at %s to check against — run `gatt extract` first", *out)
+	}
+
 	if err := g.Save(*out); err != nil {
 		return err
 	}
@@ -125,6 +170,70 @@ func cmdExtract(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("  %-10s %d\n", "edges", len(g.Edges))
 	return nil
+}
+
+// cmdEnrich re-links an existing graph to its Go source without re-extracting
+// the spec — the cheap "update" an agent runs after editing code. Operates on
+// the raw graph so curated annotations stay in their sidecar.
+func cmdEnrich(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: gatt enrich <repo-root> [--graph PATH]")
+	}
+	root := args[0]
+	fs := flag.NewFlagSet("enrich", flag.ExitOnError)
+	graphPath := fs.String("graph", defaultGraph, "graph file")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	g, err := graph.LoadRaw(*graphPath)
+	if err != nil {
+		return err
+	}
+	r, err := enrich.Code(g, root)
+	if err != nil {
+		return err
+	}
+	if err := g.Save(*graphPath); err != nil {
+		return err
+	}
+	fmt.Printf("linked source: %d endpoints, %d schemas → %s\n", r.Endpoints, r.Schemas, *graphPath)
+	return nil
+}
+
+// printDiff prints a compact human summary of graph drift. Silent when the
+// graph is unchanged so `--check` on a fresh graph stays quiet.
+func printDiff(d *graph.Diff, old *graph.Graph) {
+	if d.Empty() {
+		if !old.ExtractedAt.IsZero() {
+			fmt.Printf("no schema drift since %s\n", old.ExtractedAt.Format("2006-01-02 15:04"))
+		} else {
+			fmt.Println("no schema drift")
+		}
+		return
+	}
+	fmt.Print(d.Text())
+}
+
+// warnOrphanAnnotations flags curated annotations whose target node no longer
+// exists after re-extraction, so the operator can fix or clear them.
+func warnOrphanAnnotations(graphPath string, removed []string) {
+	if len(removed) == 0 {
+		return
+	}
+	annPath := filepath.Join(filepath.Dir(graphPath), graph.AnnotationsFile)
+	ann, err := graph.LoadAnnotations(annPath)
+	if err != nil || len(ann) == 0 {
+		return
+	}
+	gone := make(map[string]bool, len(removed))
+	for _, id := range removed {
+		gone[id] = true
+	}
+	for id := range ann {
+		if gone[id] {
+			fmt.Fprintf(os.Stderr, "warning: annotation for removed node %q will be ignored (gatt annotate %s --clear to remove)\n", id, id)
+		}
+	}
 }
 
 func indexFlags(fs *flag.FlagSet) (graphPath, qdURL, coll, embURL, embModel *string) {
@@ -173,6 +282,7 @@ func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine
 func cmdIndex(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("index", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	full := fs.Bool("full", false, "re-embed every node, ignoring the incremental cache")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -180,51 +290,24 @@ func cmdIndex(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	model := *embModel
-	if model == "" {
-		model = embed.DefaultModel
-	}
-	emb := embed.New(*embURL, model)
 	vs := openStore(*graphPath, *qdURL, *coll)
-	if ls, ok := vs.(*local.Store); ok {
-		ls.Model = model
-	}
+	model := resolveModel(*embModel, vs)
+	emb := embed.New(*embURL, model)
 
-	var ids, texts []string
-	for id, n := range g.Nodes {
-		if n.Type == graph.NodeDatabase {
-			continue
-		}
-		ids = append(ids, id)
-		texts = append(texts, g.NodeText(id))
-	}
-	fmt.Printf("embedding %d nodes with %s...\n", len(ids), model)
-	batch := 64
-	var points []store.Point
-	for i := 0; i < len(ids); i += batch {
-		end := min(i+batch, len(ids))
-		vecs, err := emb.Embed(ctx, texts[i:end])
-		if err != nil {
-			return err
-		}
-		for j, v := range vecs {
-			n := g.Nodes[ids[i+j]]
-			points = append(points, store.Point{
-				NodeID: ids[i+j], Type: n.Type, Name: n.Name, Text: texts[i+j], Vector: v,
-			})
-		}
-	}
-	if len(points) == 0 {
-		return fmt.Errorf("nothing to index")
-	}
-	if err := vs.Upsert(ctx, points); err != nil {
+	res, err := indexer.Reindex(ctx, g, vs, emb, model, *full)
+	if err != nil {
 		return err
+	}
+	if res.Embedded > 0 {
+		fmt.Printf("embedded %d nodes with %s (%d reused from cache)\n", res.Embedded, model, res.Reused)
+	} else {
+		fmt.Printf("all %d nodes already current with %s\n", res.Reused, model)
 	}
 	backend := "in-process index"
 	if *qdURL != "" {
 		backend = fmt.Sprintf("qdrant collection %q", *coll)
 	}
-	fmt.Printf("indexed %d nodes into %s\n", len(points), backend)
+	fmt.Printf("indexed %d nodes into %s\n", res.Total, backend)
 	return nil
 }
 
@@ -295,10 +378,15 @@ func cmdPath(ctx context.Context, args []string) error {
 		fmt.Println(jp.Hint)
 		return nil
 	}
-	for _, st := range jp.Steps {
-		fmt.Printf("%s.%s → %s.%s\n", st.FromTable, st.FromColumn, st.ToTable, st.ToColumn)
+	// For an API graph the hint is already the readable $ref chain; the SQL
+	// per-step column form doesn't apply.
+	if !g.IsAPI() {
+		for _, st := range jp.Steps {
+			fmt.Printf("%s.%s → %s.%s\n", st.FromTable, st.FromColumn, st.ToTable, st.ToColumn)
+		}
+		fmt.Println()
 	}
-	fmt.Println("\n" + jp.Hint)
+	fmt.Println(jp.Hint)
 	return nil
 }
 
@@ -337,6 +425,70 @@ func cmdExplain(ctx context.Context, args []string) error {
 	return nil
 }
 
+// cmdAnnotate writes curated per-node overrides to the annotations sidecar
+// next to the graph. These carry business knowledge the schema can't express
+// (what an entity canonically means, the default filter to apply) so the
+// agent writes the right query without asking. Re-running `extract` keeps them.
+func cmdAnnotate(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf(`usage: gatt annotate <node> key=value ... | <node> --clear [--graph PATH]
+  common keys: entity_note (business definition), default_filter (canonical WHERE)
+  example: gatt annotate contacts default_filter="enabled = true" entity_note="CRM contacts; enabled=false is a draft"`)
+	}
+	node := args[0]
+	fs := flag.NewFlagSet("annotate", flag.ExitOnError)
+	graphPath := fs.String("graph", defaultGraph, "graph file")
+	clear := fs.Bool("clear", false, "remove all annotations for the node")
+	// Separate key=value pairs from flags so they can appear in any order. An
+	// arg is a pair only if it contains '=' and isn't a flag; everything else
+	// (flags and their space-separated values, e.g. --graph PATH) goes to Parse.
+	var pairs, flags []string
+	for _, a := range args[1:] {
+		if !strings.HasPrefix(a, "-") && strings.Contains(a, "=") {
+			pairs = append(pairs, a)
+		} else {
+			flags = append(flags, a)
+		}
+	}
+	if err := fs.Parse(flags); err != nil {
+		return err
+	}
+	if !*clear && len(pairs) == 0 {
+		return fmt.Errorf("nothing to do: pass key=value pairs or --clear")
+	}
+
+	g, err := graph.Load(*graphPath)
+	if err != nil {
+		return err
+	}
+	// Resolve bare names ("contacts") to the canonical node id the merge keys on.
+	d, err := engine.New(g, nil, nil).Describe(node)
+	if err != nil {
+		return err
+	}
+	id := d.ID
+
+	set := map[string]string{}
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok {
+			return fmt.Errorf("bad pair %q: expected key=value", p)
+		}
+		set[k] = v // empty value removes that single annotation
+	}
+
+	annPath := filepath.Join(filepath.Dir(*graphPath), graph.AnnotationsFile)
+	result, err := graph.SetAnnotation(annPath, id, set, *clear)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("annotated %s → %s\n", id, annPath)
+	for k, v := range result {
+		fmt.Printf("  %s: %s\n", k, v)
+	}
+	return nil
+}
+
 func cmdOverview(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("overview", flag.ExitOnError)
 	graphPath := fs.String("graph", defaultGraph, "graph file")
@@ -348,18 +500,39 @@ func cmdOverview(ctx context.Context, args []string) error {
 		return err
 	}
 	ov := engine.New(g, nil, nil).Overview()
+	if fr := g.Freshness(time.Now()); fr != "" {
+		fmt.Printf("# %s\n", fr)
+	}
 	fmt.Printf("source: %s\n", ov.Source)
+	if g.IsAPI() {
+		for _, n := range g.NodesByType(graph.NodeAPI) {
+			if base := n.Attrs["base_url"]; base != "" {
+				fmt.Printf("base url: %s\n", base)
+			}
+		}
+	}
 	for t, c := range ov.NodeCounts {
 		fmt.Printf("  %-10s %d\n", t, c)
 	}
 	fmt.Println()
+	unit := "cols"
+	if g.IsAPI() {
+		unit = "props"
+	}
 	for _, t := range ov.Tables {
-		line := fmt.Sprintf("%-40s %3d cols", t.Name, t.Columns)
+		line := fmt.Sprintf("%-40s %3d %s", t.Name, t.Columns, unit)
 		if t.RowCount != "" {
 			line += fmt.Sprintf("  ~%s rows", t.RowCount)
 		}
 		if len(t.References) > 0 {
 			line += "  → " + strings.Join(t.References, ", ")
+		}
+		fmt.Println(line)
+	}
+	for _, ep := range ov.Endpoints {
+		line := ep.Name
+		if len(ep.Schemas) > 0 {
+			line += "  → " + strings.Join(ep.Schemas, ", ")
 		}
 		fmt.Println(line)
 	}
@@ -370,17 +543,27 @@ func cmdMCP(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
 	noSemantic := fs.Bool("no-semantic", false, "disable semantic search, keyword only")
+	srcKind := fs.String("source-kind", "", "source connector for the check_drift/refresh_graph tools ("+connector.Kinds+")")
+	src := fs.String("source", "", "source the connector reads (file/DSN/URL); enables check_drift and refresh_graph")
+	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source on refresh")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	g, err := graph.Load(*graphPath)
-	if err != nil {
-		return err
+	if (*srcKind == "") != (*src == "") {
+		return fmt.Errorf("--source-kind and --source must be given together")
 	}
-	var vs store.VectorStore
-	var emb *embed.Client
+	cfg := mcpserver.Config{
+		GraphPath:  *graphPath,
+		SourceKind: *srcKind,
+		Source:     *src,
+		CodeRoot:   *code,
+	}
 	if !*noSemantic {
-		vs = openStore(*graphPath, *qdURL, *coll)
+		// Resolve the store/model up front so the refresh tool re-embeds with
+		// the same model; fall back to keyword search if a configured Qdrant is
+		// unreachable. OpenStore returns a fresh instance each call so reload
+		// picks up newly written vectors.
+		vs := openStore(*graphPath, *qdURL, *coll)
 		if qd, ok := vs.(*qdrant.Client); ok {
 			if err := qd.Ping(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "qdrant unreachable, falling back to keyword search:", err)
@@ -388,10 +571,17 @@ func cmdMCP(ctx context.Context, args []string) error {
 			}
 		}
 		if vs != nil {
-			emb = embed.New(*embURL, resolveModel(*embModel, vs))
+			model := resolveModel(*embModel, vs)
+			cfg.OpenStore = func() store.VectorStore { return openStore(*graphPath, *qdURL, *coll) }
+			cfg.Embedder = embed.New(*embURL, model)
+			cfg.EmbModel = model
 		}
 	}
-	return mcpserver.New(engine.New(g, vs, emb)).Run(ctx)
+	srv, err := mcpserver.New(cfg)
+	if err != nil {
+		return err
+	}
+	return srv.Run(ctx)
 }
 
 // cmdInstall registers gatt as an MCP server for Claude Code: via the
@@ -401,8 +591,14 @@ func cmdInstall(ctx context.Context, args []string) error {
 	graphPath := fs.String("graph", defaultGraph, "graph file the server will use")
 	scope := fs.String("scope", "project", "project (this repo's .mcp.json) or user (all projects)")
 	name := fs.String("name", "gatt", "MCP server name")
+	srcKind := fs.String("source-kind", "", "source connector to wire in for the check_drift/refresh_graph tools ("+connector.Kinds+")")
+	src := fs.String("source", "", "source the connector reads (file/DSN/URL); note a DB DSN is stored in the MCP config")
+	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source on refresh")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if (*srcKind == "") != (*src == "") {
+		return fmt.Errorf("--source-kind and --source must be given together")
 	}
 
 	absGraph, err := filepath.Abs(*graphPath)
@@ -421,14 +617,27 @@ func cmdInstall(ctx context.Context, args []string) error {
 		return fmt.Errorf("running via `go run`; build a stable binary first: go build -o ~/.local/bin/gatt ./cmd/gatt")
 	}
 
+	// The args the registered server launches with; a configured source enables
+	// the drift/refresh tools.
+	mcpArgs := []string{"mcp", "--graph", absGraph}
+	if *srcKind != "" {
+		mcpArgs = append(mcpArgs, "--source-kind", *srcKind, "--source", *src)
+	}
+	if *code != "" {
+		absCode, err := filepath.Abs(*code)
+		if err != nil {
+			return err
+		}
+		mcpArgs = append(mcpArgs, "--code", absCode)
+	}
+
 	if claude, err := exec.LookPath("claude"); err == nil {
-		cmd := exec.CommandContext(ctx, claude, "mcp", "add", "--scope", *scope, *name, "--",
-			exe, "mcp", "--graph", absGraph)
+		cmd := exec.CommandContext(ctx, claude, append([]string{"mcp", "add", "--scope", *scope, *name, "--", exe}, mcpArgs...)...)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("claude mcp add failed: %w", err)
 		}
-		fmt.Printf("registered MCP server %q (scope %s) → %s mcp --graph %s\n", *name, *scope, exe, absGraph)
+		fmt.Printf("registered MCP server %q (scope %s) → %s %s\n", *name, *scope, exe, strings.Join(mcpArgs, " "))
 		return nil
 	}
 
@@ -446,7 +655,7 @@ func cmdInstall(ctx context.Context, args []string) error {
 	if servers == nil {
 		servers = map[string]any{}
 	}
-	servers[*name] = map[string]any{"command": exe, "args": []string{"mcp", "--graph", absGraph}}
+	servers[*name] = map[string]any{"command": exe, "args": mcpArgs}
 	cfg["mcpServers"] = servers
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -455,6 +664,6 @@ func cmdInstall(ctx context.Context, args []string) error {
 	if err := os.WriteFile(".mcp.json", data, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("wrote .mcp.json: server %q → %s mcp --graph %s\n", *name, exe, absGraph)
+	fmt.Printf("wrote .mcp.json: server %q → %s %s\n", *name, exe, strings.Join(mcpArgs, " "))
 	return nil
 }

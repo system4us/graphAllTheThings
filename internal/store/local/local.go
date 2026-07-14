@@ -6,6 +6,8 @@ package local
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -20,6 +22,7 @@ type entry struct {
 	NodeID string    `json:"id"`
 	Type   string    `json:"type"`
 	Name   string    `json:"name"`
+	Hash   string    `json:"h,omitempty"` // hash of the text this vector was embedded from
 	Vector []float32 `json:"vector"`
 }
 
@@ -55,11 +58,21 @@ func normalize(v []float32) {
 	}
 }
 
+// TextHash is the content hash of the text a node was embedded from. `index`
+// compares it against the stored hash to skip re-embedding unchanged nodes.
+func TextHash(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:8])
+}
+
 func (s *Store) Upsert(_ context.Context, points []store.Point) error {
 	f := file{Model: s.Model}
 	for _, p := range points {
 		normalize(p.Vector)
-		f.Entries = append(f.Entries, entry{NodeID: p.NodeID, Type: p.Type, Name: p.Name, Vector: p.Vector})
+		f.Entries = append(f.Entries, entry{
+			NodeID: p.NodeID, Type: p.Type, Name: p.Name,
+			Hash: TextHash(p.Text), Vector: p.Vector,
+		})
 		f.Dim = len(p.Vector)
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
@@ -100,6 +113,27 @@ func (s *Store) load() error {
 func (s *Store) StoredModel() string {
 	_ = s.load()
 	return s.Model
+}
+
+// Cached is a previously-embedded node: the text hash it was embedded from
+// and its (already normalized) vector, so `index` can reuse it unchanged.
+type Cached struct {
+	Hash   string
+	Vector []float32
+}
+
+// Indexed returns the node ids already in the index keyed to their cached
+// vector, so incremental indexing can reuse unchanged nodes. Returns an empty
+// map (no error) when no index exists yet.
+func (s *Store) Indexed() map[string]Cached {
+	if err := s.load(); err != nil {
+		return map[string]Cached{}
+	}
+	out := make(map[string]Cached, len(s.entries))
+	for _, e := range s.entries {
+		out[e.NodeID] = Cached{Hash: e.Hash, Vector: e.Vector}
+	}
+	return out
 }
 
 func (s *Store) Search(_ context.Context, vector []float32, limit int, nodeType string) ([]store.Hit, error) {

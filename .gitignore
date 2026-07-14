@@ -6,3 +6,4 @@ gatt-out/
 
 # machine-local MCP registration (absolute paths)
 .mcp.json
+swagger.json

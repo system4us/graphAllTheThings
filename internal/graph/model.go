@@ -5,30 +5,47 @@ package graph
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
-// Node types
+// Node types. The first group models a SQL source; the second models an API
+// spec (OpenAPI/FastAPI). Both live in the same graph shape so the engine's
+// traversal, search and join machinery is shared.
 const (
 	NodeDatabase = "database"
 	NodeTable    = "table"
 	NodeColumn   = "column"
 	NodeView     = "view"
 	NodeIndex    = "index"
+
+	NodeAPI      = "api"      // root of an API spec (analogous to database)
+	NodeSchema   = "schema"   // a component schema / model (analogous to table)
+	NodeProperty = "property" // a schema property (analogous to column)
+	NodeEndpoint = "endpoint" // an HTTP operation, e.g. "GET /users/{id}"
 )
 
-// Edge types
+// Edge types.
 const (
 	EdgeHasTable   = "HAS_TABLE"
 	EdgeHasColumn  = "HAS_COLUMN"
 	EdgeHasIndex   = "HAS_INDEX"
 	EdgeIndexes    = "INDEXES"
 	EdgeForeignKey = "FOREIGN_KEY" // column -> column
-	EdgeReferences = "REFERENCES"  // table -> table (derived from FKs) or view -> table
+	EdgeReferences = "REFERENCES"  // table -> table / schema -> schema (derived), or view -> table
+
+	EdgeHasSchema    = "HAS_SCHEMA"    // api -> schema
+	EdgeHasProperty  = "HAS_PROPERTY"  // schema -> property
+	EdgeHasEndpoint  = "HAS_ENDPOINT"  // api -> endpoint
+	EdgeRefersTo     = "REFERS_TO"     // property -> schema (a $ref, analogous to FOREIGN_KEY)
+	EdgeAccepts      = "ACCEPTS"       // endpoint -> schema (request body)
+	EdgeRespondsWith = "RESPONDS_WITH" // endpoint -> schema (response)
 )
 
 type Node struct {
@@ -46,15 +63,66 @@ type Edge struct {
 }
 
 type Graph struct {
-	Source string           `json:"source"` // e.g. "sqlite:/path/to/db"
-	Nodes  map[string]*Node `json:"nodes"`
-	Edges  []Edge           `json:"edges"`
+	Source string `json:"source"` // e.g. "sqlite:/path/to/db"
+	// ExtractedAt records when the metadata was pulled from the source, so
+	// agents can judge how stale the answer is. Zero when unknown (older
+	// graphs, hand-built graphs).
+	ExtractedAt time.Time        `json:"extracted_at,omitzero"`
+	Nodes       map[string]*Node `json:"nodes"`
+	Edges       []Edge           `json:"edges"`
 
 	adj map[string][]int // node id -> edge indexes (both directions), built lazily
 }
 
 func New(source string) *Graph {
 	return &Graph{Source: source, Nodes: map[string]*Node{}}
+}
+
+// Dialect returns the SQL dialect implied by the source, so agents write
+// dialect-correct SQL instead of inferring it from column types. Source is
+// "<kind>:<detail>" (e.g. "postgres:app", "sqlite:/path"); the kind maps to
+// its canonical dialect name, or "" when unknown.
+func (g *Graph) Dialect() string {
+	kind := g.Source
+	if i := strings.IndexByte(kind, ':'); i >= 0 {
+		kind = kind[:i]
+	}
+	switch kind {
+	case "postgres", "postgresql":
+		return "postgresql"
+	case "sqlite":
+		return "sqlite"
+	default:
+		return kind
+	}
+}
+
+// IsAPI reports whether this graph describes an API spec (OpenAPI/FastAPI)
+// rather than a database. The engine uses it to switch its container node type
+// (schema vs table), rendering, and join semantics ($ref chain vs FK JOIN).
+func (g *Graph) IsAPI() bool { return strings.HasPrefix(g.Source, "openapi:") }
+
+// Freshness returns a one-line provenance string for agent output, e.g.
+// "postgres:app, extracted 3h ago (2026-07-13)". Empty when no extraction
+// time was recorded. Agents use it to decide whether to trust the graph or
+// re-verify against the live source.
+func (g *Graph) Freshness(now time.Time) string {
+	if g.ExtractedAt.IsZero() {
+		return ""
+	}
+	d := now.Sub(g.ExtractedAt)
+	var age string
+	switch {
+	case d < time.Minute:
+		age = "just now"
+	case d < time.Hour:
+		age = fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		age = fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		age = fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+	return fmt.Sprintf("%s, extracted %s (%s)", g.Source, age, g.ExtractedAt.Format("2006-01-02"))
 }
 
 func (g *Graph) AddNode(n *Node) {
@@ -77,7 +145,11 @@ func (g *Graph) buildAdj() {
 	g.adj = map[string][]int{}
 	for i, e := range g.Edges {
 		g.adj[e.From] = append(g.adj[e.From], i)
-		g.adj[e.To] = append(g.adj[e.To], i)
+		// A self-loop (self-referential FK, or a schema whose property $refs
+		// itself) must be recorded once, not twice, or EdgesOf returns it twice.
+		if e.To != e.From {
+			g.adj[e.To] = append(g.adj[e.To], i)
+		}
 	}
 }
 
@@ -221,13 +293,16 @@ func (g *Graph) NodeText(id string) string {
 	if c := n.Attrs["comment"]; c != "" {
 		fmt.Fprintf(&b, " %s.", c)
 	}
+	if en := n.Attrs["entity_note"]; en != "" {
+		fmt.Fprintf(&b, " %s.", en)
+	}
 	if ev := n.Attrs["enum_values"]; ev != "" {
 		fmt.Fprintf(&b, " Allowed values: %s.", ev)
 	}
 	if dt := n.Attrs["data_type"]; dt != "" {
 		fmt.Fprintf(&b, " Type %s.", dt)
 	}
-	var cols, refs, refBy []string
+	var cols, refs, refBy, accepts, returns, usedBy []string
 	for _, e := range g.EdgesOf(id) {
 		other := e.To
 		if other == id {
@@ -238,22 +313,41 @@ func (g *Graph) NodeText(id string) string {
 			continue
 		}
 		switch {
-		case e.Type == EdgeHasColumn && e.From == id:
+		case (e.Type == EdgeHasColumn || e.Type == EdgeHasProperty) && e.From == id:
 			cols = append(cols, on.Name)
 		case e.Type == EdgeReferences && e.From == id:
 			refs = append(refs, on.Name)
 		case e.Type == EdgeReferences && e.To == id:
 			refBy = append(refBy, on.Name)
+		case e.Type == EdgeAccepts && e.From == id:
+			accepts = append(accepts, on.Name)
+		case e.Type == EdgeRespondsWith && e.From == id:
+			returns = append(returns, on.Name)
+		case (e.Type == EdgeAccepts || e.Type == EdgeRespondsWith) && e.To == id:
+			usedBy = append(usedBy, on.Name)
 		}
 	}
 	if len(cols) > 0 {
-		fmt.Fprintf(&b, " Columns: %s.", strings.Join(cols, ", "))
+		label := "Columns"
+		if n.Type == NodeSchema {
+			label = "Properties"
+		}
+		fmt.Fprintf(&b, " %s: %s.", label, strings.Join(cols, ", "))
+	}
+	if len(accepts) > 0 {
+		fmt.Fprintf(&b, " Accepts: %s.", strings.Join(accepts, ", "))
+	}
+	if len(returns) > 0 {
+		fmt.Fprintf(&b, " Returns: %s.", strings.Join(returns, ", "))
 	}
 	if len(refs) > 0 {
 		fmt.Fprintf(&b, " References: %s.", strings.Join(refs, ", "))
 	}
 	if len(refBy) > 0 {
 		fmt.Fprintf(&b, " Referenced by: %s.", strings.Join(refBy, ", "))
+	}
+	if len(usedBy) > 0 {
+		fmt.Fprintf(&b, " Used by: %s.", strings.Join(usedBy, ", "))
 	}
 	return b.String()
 }
@@ -270,6 +364,23 @@ func (g *Graph) Save(path string) error {
 }
 
 func Load(path string) (*Graph, error) {
+	g, err := LoadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	// Curated annotations live in a sibling file so hand-written business
+	// knowledge (entity_note, default_filter, ...) survives re-extraction and
+	// is merged over the auto-extracted graph on every load.
+	if err := g.applyAnnotations(filepath.Join(filepath.Dir(path), AnnotationsFile)); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// LoadRaw loads the graph exactly as extracted, without merging the curated
+// annotations sidecar. Diffing two extractions must compare raw graphs, or
+// annotated attributes would show up as spurious source changes.
+func LoadRaw(path string) (*Graph, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -282,4 +393,84 @@ func Load(path string) (*Graph, error) {
 		g.Nodes = map[string]*Node{}
 	}
 	return &g, nil
+}
+
+// AnnotationsFile is the sidecar, relative to the graph file, holding curated
+// per-node attribute overrides: {"<node-id>": {"<attr>": "<value>", ...}}.
+const AnnotationsFile = "annotations.json"
+
+// LoadAnnotations reads the curated overrides map from path, returning an
+// empty map (not an error) when the file does not exist.
+func LoadAnnotations(path string) (map[string]map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ann := map[string]map[string]string{}
+	if err := json.Unmarshal(data, &ann); err != nil {
+		return nil, fmt.Errorf("annotations %s: %w", path, err)
+	}
+	return ann, nil
+}
+
+// SetAnnotation updates the annotations sidecar at annPath for one node id.
+// With clear, the node's annotations are removed entirely; otherwise each
+// key in set is applied (an empty value deletes that single key). Returns the
+// node's resulting annotation map. Shared by `gatt annotate` and the MCP
+// annotate_entity tool so curated business knowledge is written the same way.
+func SetAnnotation(annPath, id string, set map[string]string, clear bool) (map[string]string, error) {
+	ann, err := LoadAnnotations(annPath)
+	if err != nil {
+		return nil, err
+	}
+	if clear {
+		delete(ann, id)
+	} else {
+		if ann[id] == nil {
+			ann[id] = map[string]string{}
+		}
+		for k, v := range set {
+			if v == "" {
+				delete(ann[id], k)
+			} else {
+				ann[id][k] = v
+			}
+		}
+		if len(ann[id]) == 0 {
+			delete(ann, id)
+		}
+	}
+	result := ann[id]
+	data, err := json.MarshalIndent(ann, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(annPath), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(annPath, data, 0o644); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (g *Graph) applyAnnotations(path string) error {
+	ann, err := LoadAnnotations(path)
+	if err != nil {
+		return err
+	}
+	for id, attrs := range ann {
+		n := g.Nodes[id]
+		if n == nil {
+			continue // annotation for a node that no longer exists; ignore
+		}
+		if n.Attrs == nil {
+			n.Attrs = map[string]string{}
+		}
+		maps.Copy(n.Attrs, attrs)
+	}
+	return nil
 }

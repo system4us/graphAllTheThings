@@ -197,6 +197,12 @@ func (c *Connector) relations(ctx context.Context, db *sql.DB, g *graph.Graph, d
 				a["enum_values"] = vals
 			}
 		}
+		// TODO(#2): categorical string columns (status, type, source) carry no
+		// declared enum, so the agent can't know their valid values without
+		// querying. For low-cardinality text/varchar columns, sample
+		// `SELECT DISTINCT <col> ... LIMIT N` here and store it as
+		// a["sample_values"]; renderColumn already has the enum-style slot to
+		// print it. Guard with a distinct-count check to skip free-text columns.
 		parentID := tableID(schema, table)
 		if kind == "v" || kind == "m" {
 			parentID = viewID(schema, table)
