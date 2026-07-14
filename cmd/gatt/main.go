@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +27,14 @@ import (
 	"graphallthethings/internal/store/local"
 	"graphallthethings/internal/store/qdrant"
 )
+
+// skillMD is the Claude Code skill that teaches agents graph-first navigation.
+// It ships in the binary so `gatt install` drops it next to the MCP
+// registration, keeping the skill in lockstep with the commands this build
+// actually exposes.
+//
+//go:embed skill/SKILL.md
+var skillMD string
 
 // defaultGraph prefers an existing SQLite graph (created via
 // `extract --out gatt-out/graph.db`) over the JSON default: the format is
@@ -690,11 +699,20 @@ func cmdInstall(ctx context.Context, args []string) error {
 	srcKind := fs.String("source-kind", "", "source connector to wire in for the check_drift/refresh_graph tools ("+connector.Kinds+")")
 	src := fs.String("source", "", "source the connector reads (file/DSN/URL); note a DB DSN is stored in the MCP config")
 	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source on refresh")
+	skill := fs.Bool("skill", true, "also install the Claude Code skill into ~/.claude/skills/gatt/")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if (*srcKind == "") != (*src == "") {
 		return fmt.Errorf("--source-kind and --source must be given together")
+	}
+
+	if *skill {
+		if err := installSkill(); err != nil {
+			// A skill write failure shouldn't abort the MCP registration; the
+			// two are independent conveniences.
+			fmt.Printf("warning: could not install skill: %v\n", err)
+		}
 	}
 
 	absGraph, err := filepath.Abs(*graphPath)
@@ -780,6 +798,27 @@ func updateMCPConfig(configPath, name, exe string, mcpArgs []string) error {
 		return err
 	}
 	fmt.Printf("wrote %s: server %q → %s %s\n", filepath.Base(configPath), name, exe, strings.Join(mcpArgs, " "))
+	return nil
+}
+
+// installSkill writes the embedded Claude Code skill to
+// ~/.claude/skills/gatt/SKILL.md, overwriting any prior copy so the skill
+// always matches this binary's commands. It's a user-scoped convenience run
+// from cmdInstall; failures are non-fatal to the MCP registration.
+func installSkill() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("could not find home dir: %w", err)
+	}
+	dir := filepath.Join(home, ".claude", "skills", "gatt")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(path, []byte(skillMD), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("installed skill → %s\n", path)
 	return nil
 }
 
