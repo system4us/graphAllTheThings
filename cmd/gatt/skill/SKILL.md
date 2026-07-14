@@ -18,6 +18,8 @@ never stale even mid-editing-session.
 - **Planning phase**: map every function/type a plan will touch before writing the plan;
   quote the `file:line` locations in the plan itself
 - **Before changing any function signature or behavior**: run `impact`
+- **Before editing shared config/schema/data files** (JSON, YAML, SQL): run `blast`
+  — it finds importers, generated copies, and diverged duplicates
 
 ## When NOT to use it
 
@@ -45,6 +47,14 @@ gatt code-query "<question>"        # FIRST CALL for any code question: relevant
                                     # functions (signature, file:line, callers/callees,
                                     # doc, body if short), types with methods, docs
 gatt impact <func-name-or-id>       # transitive callers to depth N (--depth 3 default)
+gatt blast <file-or-func-or-id>     # blast radius of ANY node, incl. JSON/YAML/SQL/CSS
+                                    # data files: callers + file importers + regenerated
+                                    # outputs (GENERATES) + same-basename copies flagged
+                                    # [identical]/[diverged] + git co-change companions
+                                    # (files that historically ship in the same commits:
+                                    # stylesheets, docs, e2e tests, i18n — edges no parser
+                                    # can see); warns if target is generated.
+                                    # ALWAYS before editing shared config/schema files
                                     # ALWAYS before signature/behavior changes;
                                     # [test] tags show affected tests
 gatt search "<text>" [--type function|definition|file]   # locate by name/keyword/semantics
@@ -73,10 +83,18 @@ All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
   still findable via `gatt search`.
 - No hits ≠ doesn't exist: names invisible to tree-sitter queries (dynamic dispatch,
   reflection) won't be in the call graph. Fall back to Grep for those.
+- `blast` regenerated outputs come from `"generates"` declarations in
+  `.gatt/relations.json` (`[{"from": "path", "to": "path"}]`) — when you discover a
+  script that copies/generates files, declare the pipeline there so future blasts see it.
+- Import edges cover relative specifiers AND tsconfig path aliases
+  (`@modules/...` via `compilerOptions.paths`); bare package imports stay external.
+- Graphs record an absolute repo root: commands work from any cwd via `--graph`.
+  A graph extracted by an older gatt (relative root) refuses to refresh from the
+  wrong cwd — re-extract once to upgrade it.
 
 ## MCP alternative
 
 If the `gatt` MCP server is installed in the client (`mcp__gatt__*` tools visible),
-`code_context`, `impact`, `find_entities`, `describe_entity` mirror the commands
+`code_context`, `impact`, `blast`, `find_entities`, `describe_entity` mirror the commands
 above with the engine resident in memory (faster on huge repos). Prefer whichever
 is already available; functionality is identical.

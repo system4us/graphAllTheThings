@@ -69,6 +69,10 @@ func main() {
 		err = cmdQuery(ctx, os.Args[2:])
 	case "impact":
 		err = cmdImpact(ctx, os.Args[2:])
+	case "blast":
+		err = cmdBlast(ctx, os.Args[2:])
+	case "doc-drift", "docdrift":
+		err = cmdDocDrift(ctx, os.Args[2:])
 	case "code-query", "codequery":
 		err = cmdCodeQuery(ctx, os.Args[2:])
 	case "path":
@@ -117,6 +121,9 @@ query it (graphify-style):
   gatt query "<question>"          context pack: relevant tables, columns, joins
   gatt code-query "<question>"     context pack for code: functions, types, docs, call graph
   gatt search "<text>"             semantic search over all nodes [--type table|column|...]
+  gatt impact <function>           transitive callers: what breaks on a signature change [--depth N]
+  gatt blast <file-or-function>    blast radius of any node: callers + importers + generated copies [--depth N]
+  gatt doc-drift                   docs whose code references broke or went stale (needs git for staleness)
   gatt path <tableA> <tableB>      cheapest FK join path with exact columns
   gatt explain <table|column>      one node in full: attrs + relationships
   gatt overview                    all tables, counts, references
@@ -351,7 +358,11 @@ func autoRefreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, em
 		return
 	}
 	ng, summary, err := conn.Update(ctx, raw)
-	if err != nil || summary == "" {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "graph auto-refresh skipped: %v\n", err)
+		return
+	}
+	if summary == "" {
 		return
 	}
 	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
@@ -887,6 +898,54 @@ func cmdImpact(ctx context.Context, args []string) error {
 		return err
 	}
 	out, err := e.Impact(target, *depth)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdBlast prints the blast radius of modifying any node — file, function or
+// type: transitive callers, importers, regenerated outputs and diverged copies.
+func cmdBlast(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: gatt blast <file-path|function-name|node-id> [--depth N]")
+	}
+	target := args[0]
+	fs := flag.NewFlagSet("blast", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	depth := fs.Int("depth", 3, "how many dependency levels to walk")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.Blast(target, *depth)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdDocDrift prints markdown docs whose code references no longer resolve or
+// point at code that changed after the doc's last commit.
+func cmdDocDrift(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("doc-drift", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	limit := fs.Int("limit", 15, "max docs to report")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.DocDrift(*limit)
 	if err != nil {
 		return err
 	}

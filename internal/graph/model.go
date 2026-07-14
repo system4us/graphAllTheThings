@@ -45,6 +45,9 @@ const (
 	EdgeCalls      = "CALLS"
 	EdgeImports    = "IMPORTS"
 	EdgeHasMethod  = "HAS_METHOD" // definition -> function (type owns method)
+	EdgeGenerates  = "GENERATES"  // file -> file (source regenerates target; overlay-declared)
+	EdgeCoChanged  = "CO_CHANGED" // file -> file (frequently change in the same git commit)
+	EdgeMentions   = "MENTIONS"   // doc -> function/definition/file it references
 
 	EdgeHasTable   = "HAS_TABLE"
 	EdgeHasColumn  = "HAS_COLUMN"

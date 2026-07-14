@@ -3,11 +3,14 @@ package codebase
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,15 +28,67 @@ type Connector struct {
 	// only restricts parseFiles to this set of relative paths. nil = all.
 	// Set internally by Update for incremental re-parsing.
 	only map[string]bool
+	// tsconfigs holds path-alias mappings (baseUrl + paths) of every
+	// tsconfig.json in the tree, deepest directory first. Loaded lazily.
+	tsconfigs []tsPathsConfig
+	// pendingMentions collects code tokens found in each parsed markdown doc,
+	// resolved against the finished graph by wireMentions.
+	pendingMentions []docMentions
+}
+
+// docMentions holds the candidate code references extracted from one doc.
+type docMentions struct {
+	docID  string
+	tokens []string
+}
+
+// tsPathsConfig is one tsconfig.json's compilerOptions alias mapping.
+type tsPathsConfig struct {
+	dir     string // directory containing the tsconfig
+	baseURL string
+	paths   map[string][]string // "@modules/*" → ["src/modules/*"]
 }
 
 func New(dir string) *Connector {
+	// Anchor to an absolute root: the graph's source then identifies the repo
+	// unambiguously, so refresh/query work from any cwd instead of silently
+	// re-pointing the graph at whatever tree the process happens to run in.
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
 	return &Connector{dir: dir}
 }
 
 // parseableExts are the file extensions the extractor understands.
 var parseableExts = map[string]bool{
 	".go": true, ".ts": true, ".tsx": true, ".py": true, ".rs": true, ".md": true,
+}
+
+// dataExts are data/config/style files indexed as plain file nodes (no
+// parsing): they carry a content hash so blast-radius queries can walk
+// IMPORTS/CO_CHANGED edges into them and flag identical/diverged copies.
+// Stylesheets are here because git co-change is their only edge source.
+var dataExts = map[string]bool{
+	".json": true, ".yaml": true, ".yml": true, ".sql": true, ".toml": true,
+	".css": true, ".scss": true, ".less": true,
+}
+
+func indexableExt(name string) bool {
+	ext := filepath.Ext(name)
+	return parseableExts[ext] || dataExts[ext]
+}
+
+// contentHash returns a short sha256 of the file, or "" for unreadable/huge files.
+func contentHash(path string, size int64) string {
+	if size > 2<<20 {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:8])
 }
 
 func (c *Connector) Name() string { return "codebase" }
@@ -61,6 +116,8 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 
 	funcs, funcsByName := c.parseFiles(ctx, g)
 	resolveAndWire(g, funcs, funcsByName)
+	c.wireMentions(g)
+	c.mineGitCoChanges(ctx, g)
 
 	return g, nil
 }
@@ -76,12 +133,12 @@ func (c *Connector) scanFiles() map[string]string {
 		if d.IsDir() {
 			name := d.Name()
 			isHidden := strings.HasPrefix(name, ".") && path != c.dir
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || isHidden {
+			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !parseableExts[filepath.Ext(d.Name())] {
+		if !indexableExt(d.Name()) {
 			return nil
 		}
 		rel, _ := filepath.Rel(c.dir, path)
@@ -139,6 +196,22 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 		return prev, "", nil
 	}
 
+	// Root-mismatch guard: if most of the graph's recorded files don't exist
+	// under this root, the connector is pointed at the wrong tree (legacy
+	// graphs record a relative source, so a wrong cwd used to silently evict
+	// the whole graph and re-extract the wrong repo). Refuse instead.
+	if len(prevM) >= 20 {
+		found := 0
+		for rel := range prevM {
+			if _, ok := cur[rel]; ok {
+				found++
+			}
+		}
+		if found*2 < len(prevM) {
+			return prev, "", fmt.Errorf("refusing refresh: %d/%d files recorded in the graph exist under %s — graph root mismatch (wrong cwd for a relative-source graph, or the repo moved); run from the repo root or re-extract", found, len(prevM), c.dir)
+		}
+	}
+
 	// Track mutations from here on: a SQLite-backed graph then saves only
 	// the delta rows instead of rewriting everything.
 	prev.StartJournal()
@@ -157,15 +230,45 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	// Remember CALLS edges from surviving callers into functions of dirty
 	// files, so they can be re-attached to the re-parsed nodes (whose ids
 	// change when line numbers shift).
-	type relink struct{ from, name, file string }
+	type relink struct{ from, name, file, typ string }
 	var relinks []relink
+	// File↔file edges touching dirty file nodes: file ids are path-stable, so
+	// these can be re-added verbatim once the node is re-created. IMPORTS from
+	// dirty files are excluded (their re-parse re-emits them); CO_CHANGED has
+	// no re-emitter until the next full extract, so keep any edge with a
+	// surviving counterpart.
+	var fileEdgeRelinks []graph.Edge
 	for _, e := range prev.Edges {
-		if e.Type != graph.EdgeCalls {
+		tn, fn := prev.Nodes[e.To], prev.Nodes[e.From]
+		if tn == nil || fn == nil {
 			continue
 		}
-		tn, fn := prev.Nodes[e.To], prev.Nodes[e.From]
-		if tn != nil && fn != nil && dirty[tn.Attrs["file"]] && !dirty[fn.Attrs["file"]] {
-			relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"]})
+		bothFiles := tn.Type == graph.NodeFile && fn.Type == graph.NodeFile
+		switch e.Type {
+		case graph.EdgeImports:
+			if bothFiles && dirty[tn.Name] && !dirty[fn.Name] {
+				fileEdgeRelinks = append(fileEdgeRelinks, e)
+			}
+		case graph.EdgeCoChanged:
+			if bothFiles && (dirty[tn.Name] || dirty[fn.Name]) {
+				fileEdgeRelinks = append(fileEdgeRelinks, e)
+			}
+		case graph.EdgeCalls:
+			if dirty[tn.Attrs["file"]] && !dirty[fn.Attrs["file"]] {
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls})
+			}
+		case graph.EdgeMentions:
+			// Doc unchanged, target evicted: function ids shift with line
+			// numbers → relink by name; def/file ids are path-stable → verbatim.
+			if dirty[fn.Attrs["file"]] {
+				continue // dirty doc re-parses and re-emits its mentions
+			}
+			if dirty[tn.Attrs["file"]] && strings.HasPrefix(e.To, "func:") {
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions})
+			} else if (strings.HasPrefix(e.To, "def:") && dirty[tn.Attrs["file"]]) ||
+				(tn.Type == graph.NodeFile && dirty[tn.Name]) {
+				fileEdgeRelinks = append(fileEdgeRelinks, e)
+			}
 		}
 	}
 
@@ -198,6 +301,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 		}
 	}
 	resolveAndWire(prev, newFuncs, funcsByName)
+	c.wireMentions(prev)
 
 	// Calls from *unchanged* files may now have a target that didn't exist at
 	// their extract time: re-resolve their persisted raw call names against
@@ -241,15 +345,33 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 			byFileName[key] = fi.id
 		}
 	}
+	for _, e := range fileEdgeRelinks {
+		if prev.Nodes[e.From] != nil && prev.Nodes[e.To] != nil {
+			prev.AddEdge(e.From, e.To, e.Type, e.Attrs)
+		}
+	}
+
+	// GENERATES edges come from the overlay, not the parser: eviction dropped
+	// those touching a dirty file node, so re-declare exactly that subset.
+	for _, p := range c.generatesPairs() {
+		fn, tn := prev.Nodes[p[0]], prev.Nodes[p[1]]
+		if fn == nil || tn == nil {
+			continue
+		}
+		if dirty[fn.Name] || dirty[tn.Name] {
+			prev.AddEdge(p[0], p[1], graph.EdgeGenerates, nil)
+		}
+	}
+
 	seenRelink := map[string]bool{}
 	for _, r := range relinks {
-		key := r.from + "\x00" + r.file + "\x00" + r.name
+		key := r.from + "\x00" + r.file + "\x00" + r.name + "\x00" + r.typ
 		if seenRelink[key] {
 			continue
 		}
 		seenRelink[key] = true
 		if target := byFileName[r.file+"\x00"+r.name]; target != "" {
-			prev.AddEdge(r.from, target, graph.EdgeCalls, nil)
+			prev.AddEdge(r.from, target, r.typ, nil)
 		}
 	}
 
@@ -288,6 +410,10 @@ func (c *Connector) loadSemanticOverlay(g *graph.Graph) {
 		}
 	}
 
+	for _, p := range c.generatesPairs() {
+		g.AddEdge(p[0], p[1], graph.EdgeGenerates, nil)
+	}
+
 	relPath := filepath.Join(gattDir, "relations.json")
 	if data, err := os.ReadFile(relPath); err == nil {
 		var payload struct {
@@ -322,6 +448,32 @@ func (c *Connector) loadSemanticOverlay(g *graph.Graph) {
 	}
 }
 
+// generatesPairs reads the overlay's generates declarations —
+// [{"from": "backend/scripts/gen.js", "to": "frontend/src/api/x.json"}] in
+// .gatt/relations.json — as (fromID, toID) file-node pairs. These declare
+// file → file generation pipelines the parser can't see.
+func (c *Connector) generatesPairs() [][2]string {
+	data, err := os.ReadFile(filepath.Join(c.dir, ".gatt", "relations.json"))
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		Generates []map[string]string `json:"generates"`
+	}
+	if json.Unmarshal(data, &payload) != nil {
+		return nil
+	}
+	var out [][2]string
+	for _, gen := range payload.Generates {
+		from, to := gen["from"], gen["to"]
+		if from == "" || to == "" {
+			continue
+		}
+		out = append(out, [2]string{"file:" + filepath.Join(c.dir, from), "file:" + filepath.Join(c.dir, to)})
+	}
+	return out
+}
+
 // detectProjects walks the repo looking for project manifest files.
 func (c *Connector) detectProjects(g *graph.Graph) {
 	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
@@ -331,7 +483,7 @@ func (c *Connector) detectProjects(g *graph.Graph) {
 		if d.IsDir() {
 			name := d.Name()
 			isHidden := strings.HasPrefix(name, ".") && path != c.dir
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || isHidden {
+			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
 				return filepath.SkipDir
 			}
 			if _, e := os.Stat(filepath.Join(path, "go.mod")); e == nil {
@@ -382,6 +534,8 @@ func langFor(ext string) *langConfig {
 			(class_declaration name: (type_identifier) @def.name)
 			(function_declaration name: (identifier) @func.name)
 			(method_definition name: (property_identifier) @func.name)
+			(variable_declarator name: (identifier) @func.name value: (arrow_function))
+			(variable_declarator name: (identifier) @func.name value: (function_expression))
 			(call_expression function: (identifier) @call.func)
 			(call_expression function: (member_expression property: (property_identifier) @call.sel))
 			(import_statement source: (string) @import.path)
@@ -424,7 +578,9 @@ func declarationRange(nameNode *sitter.Node) (int, int) {
 		switch t {
 		case "function_declaration", "method_declaration",
 			"function_definition", "fn_item",
-			"method_definition", "method":
+			"method_definition", "method",
+			// const x = () => {…}: the declarator spans name + arrow body.
+			"variable_declarator":
 			return int(n.StartPoint().Row) + 1, int(n.EndPoint().Row) + 1
 		}
 		n = n.Parent()
@@ -441,13 +597,20 @@ func buildSignature(name string, nameNode *sitter.Node, src []byte) string {
 		t := decl.Type()
 		if t == "function_declaration" || t == "method_declaration" ||
 			t == "function_definition" || t == "fn_item" ||
-			t == "method_definition" || t == "method" {
+			t == "method_definition" || t == "method" ||
+			t == "variable_declarator" {
 			break
 		}
 		decl = decl.Parent()
 	}
 	if decl == nil {
 		return name
+	}
+	// const x = () => {…}: parameters/return type live on the arrow value.
+	if decl.Type() == "variable_declarator" {
+		if v := decl.ChildByFieldName("value"); v != nil {
+			decl = v
+		}
 	}
 
 	sig := name
@@ -562,6 +725,10 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	var funcs []funcInfo
 	funcsByName := map[string][]string{}
 
+	if c.tsconfigs == nil {
+		c.loadTSConfigs()
+	}
+
 	// Pre-compile queries for all supported extensions once.
 	// NewQuery is not safe to call in a tight loop inside WalkDir callbacks.
 	compiledLangs := map[string]*langConfig{}
@@ -586,7 +753,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				// Skip hidden dirs, but NOT the root dir itself (which may be "." when
 				// invoked as `gatt extract codebase .`).
 				isHidden := strings.HasPrefix(name, ".") && path != c.dir
-				if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || isHidden {
+				if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
 					return filepath.SkipDir
 				}
 			}
@@ -602,8 +769,29 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		fileID := "file:" + path
 
 		mtime := ""
+		var size int64
 		if info, err := d.Info(); err == nil {
 			mtime = fmt.Sprint(info.ModTime().UnixNano())
+			size = info.Size()
+		}
+
+		// Data/config files → bare file nodes with a content hash; no parsing.
+		// The hash lets Blast flag identical vs diverged copies of the same file.
+		if dataExts[ext] {
+			attrs := map[string]string{"path": path, "mtime": mtime, "data": "true"}
+			if h := contentHash(path, size); h != "" {
+				attrs["hash"] = h
+			}
+			g.AddNode(&graph.Node{
+				ID:    fileID,
+				Type:  graph.NodeFile,
+				Name:  relPath,
+				Attrs: attrs,
+			})
+			if projID != "" {
+				g.AddEdge(fileID, projID, graph.EdgeBelongsTo, nil)
+			}
+			return nil
 		}
 
 		// Markdown files → doc nodes (semantic search oriented).
@@ -801,16 +989,22 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			// ── Import ────────────────────────────────────────────────────────
 			if importNode, ok := caps["import.path"]; ok {
 				importStr := strings.Trim(importNode.Content(data), `"'`)
-				importID := "import:" + importStr
-				if g.Nodes[importID] == nil {
-					g.AddNode(&graph.Node{
-						ID:    importID,
-						Type:  graph.NodeComponent,
-						Name:  importStr,
-						Attrs: map[string]string{"external": "true"},
-					})
+				if local := c.resolveLocalImport(path, importStr); local != "" {
+					// Relative import of a file we index (code or data):
+					// wire file → file so Blast can walk importers.
+					g.AddEdge(fileID, "file:"+local, graph.EdgeImports, nil)
+				} else {
+					importID := "import:" + importStr
+					if g.Nodes[importID] == nil {
+						g.AddNode(&graph.Node{
+							ID:    importID,
+							Type:  graph.NodeComponent,
+							Name:  importStr,
+							Attrs: map[string]string{"external": "true"},
+						})
+					}
+					g.AddEdge(fileID, importID, graph.EdgeImports, nil)
 				}
-				g.AddEdge(fileID, importID, graph.EdgeImports, nil)
 			}
 		}
 
@@ -839,6 +1033,8 @@ func (c *Connector) parseMarkdown(g *graph.Graph, path, relPath, fileID, projID,
 
 	title := relPath
 	var bodyLines []string
+	var tokens []string
+	inFence := false
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	headingFound := false
 	for scanner.Scan() {
@@ -849,6 +1045,22 @@ func (c *Connector) parseMarkdown(g *graph.Graph, path, relPath, fileID, projID,
 			continue
 		}
 		bodyLines = append(bodyLines, line)
+		// Mine inline-code references (`funcName`, `path/to/file.ts`) for
+		// MENTIONS edges. Fenced blocks are skipped: whole code samples
+		// mention everything and mean nothing.
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || len(tokens) >= 100 {
+			continue
+		}
+		for _, m := range inlineCodeRe.FindAllStringSubmatch(line, -1) {
+			tok := strings.TrimSuffix(strings.TrimSpace(m[1]), "()")
+			if len(tok) >= 3 && identLikeRe.MatchString(tok) {
+				tokens = append(tokens, tok)
+			}
+		}
 	}
 	body := strings.Join(bodyLines, " ")
 	if len(body) > 500 {
@@ -866,6 +1078,90 @@ func (c *Connector) parseMarkdown(g *graph.Graph, path, relPath, fileID, projID,
 		},
 	})
 	g.AddEdge(docID, fileID, graph.EdgeBelongsTo, nil)
+	if len(tokens) > 0 {
+		c.pendingMentions = append(c.pendingMentions, docMentions{docID: docID, tokens: tokens})
+	}
+}
+
+var (
+	inlineCodeRe = regexp.MustCompile("`([^`\n]{1,80})`")
+	identLikeRe  = regexp.MustCompile(`^[A-Za-z_][\w./-]*$`)
+)
+
+// wireMentions resolves the code tokens mined from markdown docs against the
+// finished graph: paths match file nodes, names match definitions then
+// functions. Each hit becomes a MENTIONS edge, and the doc node records the
+// resolved set in mentions_resolved so doc-drift can later re-check whether
+// those references still exist. Ambiguous names (>3 targets) are dropped.
+func (c *Connector) wireMentions(g *graph.Graph) {
+	if len(c.pendingMentions) == 0 {
+		return
+	}
+	funcIDs := map[string][]string{}
+	defIDs := map[string][]string{}
+	fileByName := map[string]string{}
+	for id, n := range g.Nodes {
+		switch {
+		case n.Type == graph.NodeFunction && n.Attrs["external"] != "true" && strings.HasPrefix(id, "func:"):
+			funcIDs[n.Name] = append(funcIDs[n.Name], id)
+		case n.Type == graph.NodeDefinition:
+			defIDs[n.Name] = append(defIDs[n.Name], id)
+		case n.Type == graph.NodeFile && !strings.HasPrefix(id, "doc:"):
+			fileByName[n.Name] = id
+		}
+	}
+	for _, dm := range c.pendingMentions {
+		doc := g.Nodes[dm.docID]
+		if doc == nil {
+			continue
+		}
+		var resolved []string
+		seen := map[string]bool{}
+		for _, tok := range dm.tokens {
+			if seen[tok] {
+				continue
+			}
+			seen[tok] = true
+			ids := resolveMention(tok, fileByName, defIDs, funcIDs)
+			if len(ids) == 0 || len(ids) > 3 {
+				continue
+			}
+			for _, id := range ids {
+				g.AddEdge(dm.docID, id, graph.EdgeMentions, nil)
+			}
+			resolved = append(resolved, tok)
+		}
+		if len(resolved) > 0 {
+			sort.Strings(resolved)
+			doc.Attrs["mentions_resolved"] = strings.Join(resolved, " ")
+		}
+	}
+	c.pendingMentions = nil
+}
+
+// resolveMention maps one doc token to graph node ids: path-looking tokens
+// try file nodes (exact then suffix), bare names try definitions then
+// functions. Shared by wireMentions and the doc-drift re-check.
+func resolveMention(tok string, fileByName map[string]string, defIDs, funcIDs map[string][]string) []string {
+	if strings.ContainsAny(tok, "/.") {
+		if id := fileByName[tok]; id != "" {
+			return []string{id}
+		}
+		var ids []string
+		for name, id := range fileByName {
+			if strings.HasSuffix(name, "/"+tok) {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			sort.Strings(ids)
+			return ids
+		}
+	}
+	if ids := defIDs[tok]; len(ids) > 0 {
+		return ids
+	}
+	return funcIDs[tok]
 }
 
 // builtinNames are language builtins that never deserve a call stub node.
@@ -922,6 +1218,148 @@ func resolveCall(g *graph.Graph, fromFile, raw string, funcsByName map[string][]
 // It also persists each function's raw call names (calls_raw) so a later
 // incremental Update can resolve calls from unchanged files against functions
 // that did not exist yet at extract time.
+// probeIndexable resolves an extension-less or extension-full import target to
+// an existing indexable file, following TS/JS resolution (bare, .ts/.tsx,
+// /index, .js → .ts). Returns "" when nothing matches.
+func probeIndexable(base string) string {
+	cands := []string{base, base + ".ts", base + ".tsx",
+		filepath.Join(base, "index.ts"), filepath.Join(base, "index.tsx")}
+	if strings.HasSuffix(base, ".js") {
+		cands = append(cands, strings.TrimSuffix(base, ".js")+".ts")
+	}
+	for _, p := range cands {
+		if !indexableExt(p) {
+			continue
+		}
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// resolveLocalImport maps an import specifier from fromPath to the walked path
+// of an existing indexable file, or "". Handles relative specifiers (./x,
+// ../y/z.json) and tsconfig path aliases (@modules/x → src/modules/x).
+func (c *Connector) resolveLocalImport(fromPath, spec string) string {
+	if strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") {
+		return probeIndexable(filepath.Join(filepath.Dir(fromPath), spec))
+	}
+	for _, tc := range c.tsconfigs { // deepest dir first: innermost tsconfig wins
+		if !strings.HasPrefix(fromPath, tc.dir+string(filepath.Separator)) {
+			continue
+		}
+		for pat, targets := range tc.paths {
+			var rest string
+			if star := strings.IndexByte(pat, '*'); star >= 0 {
+				prefix, suffix := pat[:star], pat[star+1:]
+				if !strings.HasPrefix(spec, prefix) || !strings.HasSuffix(spec, suffix) {
+					continue
+				}
+				rest = spec[len(prefix) : len(spec)-len(suffix)]
+			} else if spec != pat {
+				continue
+			}
+			for _, t := range targets {
+				cand := strings.Replace(t, "*", rest, 1)
+				if p := probeIndexable(filepath.Join(tc.dir, tc.baseURL, cand)); p != "" {
+					return p
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// loadTSConfigs scans the tree for tsconfig.json files and records their
+// baseUrl+paths alias mappings, deepest directory first. tsconfig is JSONC:
+// line comments and trailing commas are stripped before parsing.
+func (c *Connector) loadTSConfigs() {
+	c.tsconfigs = []tsPathsConfig{}
+	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			isHidden := strings.HasPrefix(name, ".") && path != c.dir
+			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "tsconfig.json" {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var raw struct {
+			CompilerOptions struct {
+				BaseURL string              `json:"baseUrl"`
+				Paths   map[string][]string `json:"paths"`
+			} `json:"compilerOptions"`
+		}
+		if json.Unmarshal(stripJSONC(data), &raw) != nil || len(raw.CompilerOptions.Paths) == 0 {
+			return nil
+		}
+		c.tsconfigs = append(c.tsconfigs, tsPathsConfig{
+			dir:     filepath.Dir(path),
+			baseURL: raw.CompilerOptions.BaseURL,
+			paths:   raw.CompilerOptions.Paths,
+		})
+		return nil
+	})
+	sort.Slice(c.tsconfigs, func(i, j int) bool {
+		return len(c.tsconfigs[i].dir) > len(c.tsconfigs[j].dir)
+	})
+}
+
+// stripJSONC removes // line comments and trailing commas so tsconfig-style
+// JSONC parses with encoding/json. String-aware for the comment pass.
+func stripJSONC(data []byte) []byte {
+	var out []byte
+	inStr, esc := false, false
+	for i := 0; i < len(data); i++ {
+		ch := data[i]
+		if inStr {
+			out = append(out, ch)
+			if esc {
+				esc = false
+			} else if ch == '\\' {
+				esc = true
+			} else if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inStr = true
+			out = append(out, ch)
+			continue
+		}
+		if ch == '/' && i+1 < len(data) && data[i+1] == '/' {
+			for i < len(data) && data[i] != '\n' {
+				i++
+			}
+			out = append(out, '\n')
+			continue
+		}
+		if ch == ',' {
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				continue // trailing comma: drop
+			}
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
 func resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
 	for i := range funcs {
 		fi := &funcs[i]

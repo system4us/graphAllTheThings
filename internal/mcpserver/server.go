@@ -141,6 +141,15 @@ type impactIn struct {
 	Depth    int    `json:"depth,omitempty" jsonschema:"caller levels to walk, default 3"`
 }
 
+type blastIn struct {
+	Target string `json:"target" jsonschema:"file path (e.g. shared/schemas/product.schema.json), function name, or full node id"`
+	Depth  int    `json:"depth,omitempty" jsonschema:"dependency levels to walk, default 3"`
+}
+
+type docDriftIn struct {
+	Limit int `json:"limit,omitempty" jsonschema:"max docs to report, default 15"`
+}
+
 type annotateIn struct {
 	Node          string `json:"node" jsonschema:"table/column/schema name or node id to annotate"`
 	EntityNote    string `json:"entity_note,omitempty" jsonschema:"free-text business definition of the entity (what it canonically means, edge cases)"`
@@ -190,6 +199,38 @@ func (s *Server) register() {
 			return nil, nil, err
 		}
 		out, err := e.Impact(in.Function, in.Depth)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "blast",
+		Description: "Blast radius of modifying ANY node — a file (including JSON/YAML/SQL/CSS data files), function, or type. Superset of impact: walks transitive callers, file importers, REFERENCES, and forward GENERATES edges (outputs regenerated from the target); warns when the target is itself generated; lists same-basename copies flagged [identical]/[diverged] by content hash; and shows git co-change companions — files with no static edge that historically ship in the same commits (stylesheets, docs, e2e tests, i18n). Call before editing shared config/schema files or any widely-imported module. Codebase graphs only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in blastIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Blast(in.Target, in.Depth)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "doc_drift",
+		Description: "Which documentation lies: markdown docs whose inline code references (`funcName`, `path/file.ts`) either no longer resolve in the graph (broken) or point at code that changed after the doc's last commit (stale). Run before trusting a doc, and after refactors to list docs needing an update. Codebase graphs only; staleness needs git history.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in docDriftIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.DocDrift(in.Limit)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -351,7 +392,10 @@ func (s *Server) autoRefreshCodebase(ctx context.Context) string {
 		return ""
 	}
 	ng, summary, err := conn.Update(ctx, raw)
-	if err != nil || summary == "" {
+	if err != nil {
+		return fmt.Sprintf("graph auto-refresh skipped: %v\n", err)
+	}
+	if summary == "" {
 		return ""
 	}
 	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal

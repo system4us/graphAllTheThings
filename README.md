@@ -1,33 +1,42 @@
 # graphAllTheThings (gatt)
 
-Turn any source's metadata into a semantic knowledge graph that AI agents query through MCP — instead of re-discovering schemas with live introspection queries on every question.
+Turn any source's metadata into a semantic knowledge graph that AI agents query through MCP — instead of re-discovering schemas with live introspection queries (or re-grepping a codebase) on every question.
 
-**Problem:** an agent asked *"average users that logged in 3 months ago"* today burns many round-trips discovering tables, columns, and joins before writing a single query.
+**Problem:** an agent asked *"average users that logged in 3 months ago"* today burns many round-trips discovering tables, columns, and joins before writing a single query. Asked *"where is auth handled"* in a repo, it burns the same round-trips in Grep → Glob → Read chains.
 
-**Solution:** extract metadata **once** (schema, enums, foreign keys, indexes, comments) into a graph, index it semantically, and give the agent five MCP tools that answer "which tables?", "which columns?", "how do I join them?" instantly.
+**Solution:** extract metadata **once** (schema, enums, foreign keys — or functions, call edges, doc comments) into a graph, index it semantically, and give the agent MCP tools that answer "which tables?", "which columns?", "how do I join them?", "who calls this function?" instantly.
+
+Three source shapes, one graph engine:
+
+| Source | Extracted | Ask it |
+|--------|-----------|--------|
+| **Database** (SQLite, PostgreSQL) | tables, columns, enums, FKs, indexes, comments | "which tables hold login events, and how do I join them?" |
+| **API spec** (OpenAPI 3.x, Swagger 2.0) | endpoints, schemas, `$ref` relationships, auth | "what's the full request to create an order?" |
+| **Codebase** (Go, TypeScript, Python, Rust) | functions, types, call graph, doc comments, docs | "how does extraction work?" / "what breaks if I change this signature?" |
 
 ## Architecture
 
 ```
-source (sqlite | postgres | openapi | ...)
-        │  extract (once)
+source (sqlite | postgres | openapi | codebase)
+        │  extract (once; incremental after that)
         ▼
-  gatt-out/graph.json      ← source of truth: typed nodes + edges, traversal in memory
+  gatt-out/graph.db        ← source of truth: typed nodes + edges (SQLite + FTS5,
+        │                    preferred) — or graph.json (portable, versionable)
         │  index
         ▼
   gatt-out/vectors.json    ← semantic layer: node embeddings (Ollama bge-m3, multilingual),
         │                    cosine search in-process; --qdrant swaps in a Qdrant server
         ▼
-  MCP stdio server         ← agents call tools; zero live-DB introspection
+  MCP stdio server         ← agents call tools; zero live introspection
 ```
 
-- **Graph structure** (nodes, edges, join paths) lives in `graph.json` — portable, versionable, traversed in memory.
+- **Graph structure** (nodes, edges, join paths) lives in `graph.db` (SQLite with an FTS5 full-text index, incremental delta writes) or `graph.json` (portable, diff-able). All commands auto-detect whichever exists; `--graph PATH` overrides.
+- **Search is hybrid**: FTS5 bm25 (when the graph is SQLite) + semantic embeddings, so results are good even before indexing. If the vector index or Ollama is unavailable, `find_entities` falls back to keyword matching.
 - **Vector index is in-process by default.** Metadata graphs are small (hundreds to a few thousand nodes), so brute-force cosine takes microseconds — no vector database required. Pass `--qdrant URL` to `index`/`search`/`mcp` to opt into a Qdrant server (useful for very large or shared indexes).
-- **Semantic search degrades gracefully**: if the index or Ollama is unavailable, `find_entities` falls back to keyword matching.
 
 ### Graph model
 
-Two source shapes share one graph so the traversal, search and join machinery is reused across both.
+Three source shapes share one graph so the traversal, search, and join machinery is reused across all of them.
 
 **Database** — Nodes: `database`, `table`, `column`, `view`, `index` — attrs carry data types, enum values, defaults, row counts, DDL.
 Edges: `HAS_TABLE`, `HAS_COLUMN`, `HAS_INDEX`, `INDEXES`, `FOREIGN_KEY` (column→column), `REFERENCES` (table→table, with `from_column`/`to_column` for join building).
@@ -37,20 +46,22 @@ Edges: `HAS_SCHEMA`, `HAS_PROPERTY`, `HAS_ENDPOINT`, `REFERS_TO` (property→sch
 
 Each endpoint carries what a request actually needs: the **full URL** (server base — 3.x `servers` with variables substituted, or 2.0 `host`+`basePath` — joined to the path) and the **auth scheme** (`Bearer`, `Basic`, `apiKey header X-API-Key`, resolved from the operation's `security` or the global default, `OAuth2`/public overrides included). So an agent gets a copy-pasteable curl skeleton — method, URL, auth header, and the typed request body with its enums — from one `sql_context` call instead of loading a multi-megabyte spec.
 
+**Codebase** — tree-sitter parses Go, TypeScript/TSX, Python, and Rust (plus Markdown docs). Nodes: `project`, `file`, `function` (with signature, `file:line` range, doc comment, body for short functions), `definition` (types, with their methods), `component`, `feature`, `doc`.
+Edges: `CALLS` (resolved local calls — the call graph), `HAS_METHOD`, `BELONGS_TO`, `IMPORTS`. Generated code (`.pb.go`, `_gen.go`, `.min.js`, …) is excluded from context packs but still findable via search.
+
 ## Quickstart
 
-Requires: Go 1.24+ and Ollama on `:11434` with `bge-m3` pulled (optional — keyword fallback works without it).
+Requires: Go 1.24+ and Ollama on `:11434` with `bge-m3` pulled (optional — keyword/FTS fallback works without it).
 
-Measured on a real 113-table CRM: answering one data question costs **~2.3k tokens in 1 tool call** with gatt vs ~7.8k tokens across 6 introspection queries (list tables + describe candidates) — and the join chain comes out correct on the first try.
+Measured on a real 113-table CRM: answering one data question costs **~2.3k tokens in 1 tool call** with gatt vs ~7.8k tokens across 6 introspection queries (list tables + describe candidates) — and the join chain comes out correct on the first try. On a codebase, one `code-query` (~3 KB) replaces a 20–50k-token Grep/Read exploration.
 
 ```bash
-go build -o gatt ./cmd/gatt
-
 go build -o ~/.local/bin/gatt ./cmd/gatt
 
 gatt extract sqlite path/to/db.sqlite     # → gatt-out/graph.json
 gatt extract postgres "postgres://user:pass@host:5432/db?sslmode=disable"
 gatt extract openapi http://localhost:8000/openapi.json   # live FastAPI spec (or a .json/.yaml file; OpenAPI 3.x or Swagger 2.0)
+gatt extract codebase . --out gatt-out/graph.db           # parse a repo (SQLite graph preferred for code)
 gatt index                                # embed nodes → gatt-out/vectors.json
 gatt install                              # register MCP server in Claude Code
 gatt install --scope agy                  # register MCP server in Antigravity CLI
@@ -63,13 +74,56 @@ Query from the terminal (same operations the MCP tools expose):
 ```bash
 gatt query "how many messages did each client send this month"
                                           # context pack: tables, columns, enums, joins
-gatt search "user login timestamps"       # semantic search over all nodes
+gatt code-query "how does incremental refresh work"
+                                          # context pack: functions (signature, file:line,
+                                          # callers/callees, doc), types, docs
+gatt impact saveSQLite --depth 3          # transitive callers: what breaks on a signature
+                                          # change; test callers tagged [test]
+gatt blast shared/schemas/product.json    # blast radius of a file: callers + importers +
+                                          # generated copies + diverged duplicates
+gatt search "user login timestamps"       # hybrid search over all nodes
 gatt path clients conversation_messages   # FK join path with exact columns
 gatt explain messages                     # one node: attrs + relationships
-gatt overview                             # all tables, counts, references
+gatt overview                             # all tables (or files/components), counts, references
 ```
 
-### Curated annotations
+## Codebase graphs
+
+`gatt extract codebase <dir>` parses the repo with tree-sitter and builds the call graph. Two commands are built for agent workflows:
+
+- **`gatt code-query "<question>"`** — the code analogue of `query`: the most relevant functions (signature, exact `file:line`, resolved callers/callees, doc comment, body when short), types with their methods, and matching docs, in one compact pack. An agent reads only the line ranges the pack points at instead of whole files.
+- **`gatt impact <function>`** — walks `CALLS` edges backwards, transitively (`--depth`, default 3): every caller that breaks if the signature or behavior changes. Run it before refactors; `[test]` tags show which tests cover the blast radius.
+- **`gatt blast <file-or-function>`** — blast radius of modifying *any* node, including JSON/YAML/SQL/CSS data files (indexed with a content hash): transitive callers **plus** file importers (relative imports and tsconfig path aliases resolve to local file nodes), regenerated outputs via `GENERATES` edges (declared as `"generates": [{"from": …, "to": …}]` in `.gatt/relations.json`), a warning when the target is itself generated, same-basename copies flagged `[identical]`/`[diverged]` by hash, and **git co-change companions** — files with no static edge that historically ship in the same commits (a component's stylesheet, the doc page of a service, the e2e test of a controller, i18n bundles). Run it before editing shared schema/config files.
+
+**Never stale:** both commands (and the MCP server) check file mtimes before answering (~60ms), re-parse only the files that changed since the last extract, evict deleted entities, and re-embed just the changed nodes. Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exception: `CO_CHANGED` edges are mined from git history at full extract only — incremental refresh preserves them but new commits are folded in on the next re-extract.)
+
+### Semantic overlay (`.gatt/`)
+
+Structure comes from parsing; *meaning* comes from a curated overlay. `gatt init` scaffolds a `.gatt/` workspace:
+
+```
+.gatt/
+  gatt.spec.json      project name, namespaces, manifest paths
+  definitions.json    high-level business/architectural domains + their critical rules
+  relations.json      features linked to their physical entry points and dependencies
+  contracts.json      API/database contracts
+  prompt.md           a directive you hand to an AI agent to populate the above
+```
+
+Point your agent at `.gatt/prompt.md` once: it explores the codebase and writes the domain definitions. Extraction then merges the overlay into the graph as `component`/`feature` nodes wired to real files — so `code-query` answers carry architecture context, not just symbols. The overlay lives in git and survives every re-extract.
+
+### Linking API specs to source
+
+For a swaggo/Go service, the spec and the code describe the same thing — gatt can wire them together:
+
+```bash
+gatt extract openapi swagger.json --code .   # endpoints/schemas link to their Go source:
+                                             # describe_entity shows source: file:line
+gatt enrich .                                # re-link an existing graph after code edits,
+                                             # without re-extracting the spec
+```
+
+## Curated annotations
 
 The schema knows structure, not business meaning: whether `enabled=false` rows count as real contacts, what a "contact" canonically is. Encode that once and every `sql_context`/`describe_entity` response carries it, so the agent writes the right query instead of asking:
 
@@ -82,7 +136,7 @@ gatt annotate contacts --clear            # remove
 
 Annotations live in `gatt-out/annotations.json` (a sidecar keyed by node id), merged over the graph on every load — so they survive re-running `extract`. Recognized keys: `default_filter` (a canonical `WHERE` clause, rendered like the auto-detected soft-delete filter) and `entity_note` (free-text definition). Any other key is stored and shown too. `sql_context` also emits the SQL `dialect:` up front so generated SQL is dialect-correct without inference.
 
-### Keeping it fresh
+## Keeping it fresh
 
 The graph is a snapshot, so agents need to know how old it is and you need a cheap way to tell when the source has drifted:
 
@@ -93,21 +147,25 @@ gatt index                             # re-embed only the nodes whose text chan
 ```
 
 - **Every extraction stamps `extracted_at`.** `sql_context` and `graph_overview` lead with a `# source: postgres:app, extracted 3h ago (2026-07-13)` line, so the agent can judge staleness and re-verify against the live DB when it matters — instead of trusting a snapshot blindly.
-- **`--check` is the drift probe.** It hits the source and diffs against the current graph (added/removed tables & columns, changed types, FK count deltas) without touching `graph.json`. Run it on a schedule or in CI; a non-empty drift report means it's time to re-extract and re-index.
-- **Re-extraction is non-destructive to curated knowledge.** Annotations live in their sidecar and are re-applied on load; if a re-extract removes a node an annotation targeted, you get a warning naming the orphaned annotation.
+- **`--check` is the drift probe.** It hits the source and diffs against the current graph (added/removed tables & columns, changed types, FK count deltas) without touching the graph. Run it on a schedule or in CI; a non-empty drift report means it's time to re-extract and re-index.
+- **Codebase graphs refresh themselves.** `code-query`, `impact`, and the MCP server detect changed files by mtime and re-parse only those before answering — no manual re-extract.
+- **Re-extraction is non-destructive to curated knowledge.** Annotations live in their sidecar and are re-applied on load; if a re-extract removes a node an annotation targeted, you get a warning naming the orphaned annotation. The `.gatt/` overlay is merged fresh on every extract.
 - **Re-indexing is incremental.** `index` reuses cached vectors for nodes whose embedding text is unchanged (content-hashed) and only embeds what actually moved — so re-indexing a 113-table CRM after a one-column migration embeds two nodes, not two thousand.
 
 ## MCP tools
 
-**Read** — answer schema questions from the pre-built graph:
+**Read** — answer schema/code questions from the pre-built graph:
 
 | Tool | Purpose |
 |------|---------|
-| `graph_overview` | Source, node counts, all tables (or API schemas) with member counts and references, plus endpoints. Orientation call. |
-| `find_entities` | Semantic search: "user login timestamps" → `sessions.logged_in_at`. Filter by node type. |
-| `describe_entity` | One node in full: a table (types, enums, row counts, DDL) or an API schema/endpoint (properties, `$ref`s, request/response bodies) + all relationships. |
+| `graph_overview` | Source, node counts, all tables (or API schemas, or files/components) with member counts and references. Orientation call. |
+| `find_entities` | Hybrid search: "user login timestamps" → `sessions.logged_in_at`. Filter by node type. |
+| `describe_entity` | One node in full: a table (types, enums, row counts, DDL), an API schema/endpoint (properties, `$ref`s, bodies), or a function/type (signature, doc, call edges) + all relationships. |
 | `join_path` | Cheapest FK path between two tables with exact join columns — a ready `JOIN ... ON ...` hint (or the `$ref` chain between two API schemas). Routes around hub tables (`tenant_id`-style FKs every table carries), which a naive shortest path would cut through, producing semantically wrong joins. |
-| `sql_context` | One-shot context pack for a question: most relevant tables/schemas fully described. Feed straight into SQL generation. |
+| `sql_context` | One-shot context pack for a data question: most relevant tables/schemas fully described. Feed straight into SQL generation. |
+| `code_context` | One-shot context pack for a code question: relevant functions, types, docs with `file:line` and call graph. The `code-query` CLI, as a tool. |
+| `impact` | Transitive callers of a function to depth N — what breaks if it changes. Run before refactors; `[test]` tags included. |
+| `blast` | Blast radius of any node — file (incl. data files), function, or type: callers + importers + regenerated outputs + diverged copies. Run before editing shared config/schema files. |
 
 **Maintain** — the agent curates and refreshes the graph itself:
 
@@ -150,19 +208,23 @@ Emit nodes/edges with the model in `internal/graph/model.go`, wire into `cmd/gat
 ## Roadmap
 
 - [x] PostgreSQL connector (`pg_catalog`: native enums, column comments, multi-column FKs, view dependencies, multi-schema)
-- [ ] Sample values for low-cardinality string columns (`status`, `type`, ...) that carry no declared enum — see `TODO(#2)` in `internal/connector/postgres/postgres.go`
 - [x] OpenAPI connector (endpoints, schemas, `$ref` relationships) — OpenAPI 3.x + Swagger 2.0, from a `.json`/`.yaml` file or a live `http(s)://.../openapi.json` (FastAPI, swaggo)
+- [x] Codebase connector (tree-sitter: Go, TS/TSX, Python, Rust) with call graph, `.gatt/` semantic overlay, and mtime-based incremental refresh
+- [x] SQLite graph storage (`graph.db`): FTS5 full-text index, delta writes
 - [x] Incremental re-extraction with change detection (`extract --check` reports drift; `index` re-embeds only changed nodes)
+- [x] Spec↔code linking (`extract openapi --code`, `gatt enrich`): endpoints/schemas point at their Go source
+- [ ] Sample values for low-cardinality string columns (`status`, `type`, ...) that carry no declared enum — see `TODO(#2)` in `internal/connector/postgres/postgres.go`
 - [ ] Cross-source graphs (DB + API spec merged: which endpoint touches which table)
 - [ ] Query-log mining: add edges from JOINs observed in real queries (relationships not declared as FKs)
 
 ## Layout
 
 ```
-cmd/gatt/                 CLI: extract | index | query | search | path | explain | annotate | overview | mcp | install
+cmd/gatt/                 CLI: init | extract | enrich | index | query | code-query | impact |
+                          blast | search | path | explain | annotate | overview | mcp | install
 internal/engine/          query operations shared by CLI and MCP
-internal/graph/           graph model, traversal, persistence
-internal/connector/       Connector interface + sqlite/, postgres/ and openapi/ implementations
+internal/graph/           graph model, traversal, persistence (JSON + SQLite/FTS5)
+internal/connector/       Connector interface + sqlite/, postgres/, openapi/, codebase/
 internal/embed/           Ollama embedding client
 internal/store/           VectorStore interface
 internal/store/local/     default in-process cosine index (vectors.json)

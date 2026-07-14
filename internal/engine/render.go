@@ -7,6 +7,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -687,6 +688,257 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 		b.WriteString("no callers found — signature change is local\n")
 	} else {
 		fmt.Fprintf(&b, "\ntotal affected: %d function(s) within depth %d\n", total, depth)
+	}
+	return b.String(), nil
+}
+
+// blastCommonBasenames are file names that repeat across every project by
+// convention; same-basename copy detection skips them as pure noise.
+var blastCommonBasenames = map[string]bool{
+	"package.json": true, "package-lock.json": true, "tsconfig.json": true,
+	"index.ts": true, "index.tsx": true, "index.js": true,
+	"__init__.py": true, "mod.rs": true, "README.md": true, "Cargo.toml": true,
+}
+
+// Blast computes the blast radius of modifying any node — a file (code or
+// data), function, or definition. Where Impact walks only reverse CALLS edges
+// from a function, Blast seeds a file with its member functions/types and also
+// walks reverse IMPORTS/REFERENCES and forward GENERATES edges, warns when the
+// target is itself generated, and flags same-basename copies (identical vs
+// diverged by content hash). Accepts a node id, a repo-relative path, a bare
+// file name, or a unique function name.
+func (e *Engine) Blast(target string, depth int) (string, error) {
+	n := e.G.Nodes[target]
+	if n == nil {
+		n = e.G.Nodes["file:"+target]
+	}
+	if n == nil {
+		var matches []string
+		for id, nn := range e.G.Nodes {
+			if nn.Type == graph.NodeFile &&
+				(nn.Name == target || strings.HasSuffix(nn.Name, "/"+target) || filepath.Base(nn.Name) == target) {
+				matches = append(matches, id)
+			}
+		}
+		if len(matches) == 0 {
+			for id, nn := range e.G.Nodes {
+				if nn.Type == graph.NodeFunction && nn.Name == target && nn.Attrs["external"] != "true" {
+					matches = append(matches, id)
+				}
+			}
+		}
+		switch len(matches) {
+		case 0:
+			return "", fmt.Errorf("%q not found as file or function; use search to locate it", target)
+		case 1:
+			n = e.G.Nodes[matches[0]]
+		default:
+			sort.Strings(matches)
+			var lines []string
+			for _, id := range matches {
+				h := e.G.Nodes[id].Attrs["hash"]
+				if h != "" {
+					h = " hash:" + h
+				}
+				lines = append(lines, "  "+id+h)
+			}
+			return "", fmt.Errorf("ambiguous %q — %d matches (equal hash = identical content), pick one id:\n%s",
+				target, len(matches), strings.Join(lines, "\n"))
+		}
+	}
+	if depth <= 0 {
+		depth = 3
+	}
+
+	loc := func(nn *graph.Node) string {
+		l := nn.Attrs["file"]
+		if l == "" {
+			l = nn.Name
+		}
+		if ls := nn.Attrs["line_start"]; ls != "" {
+			l += ":" + ls
+		}
+		return l
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "blast radius of modifying %s (%s)\n", n.Name, n.Type)
+
+	// Warn when the target is a generated artifact: edits get overwritten.
+	if n.Attrs["generated"] == "true" {
+		b.WriteString("⚠ marked as generated code — direct edits are likely overwritten\n")
+	}
+	for _, ed := range e.G.EdgesOf(n.ID) {
+		if ed.Type == graph.EdgeGenerates && ed.To == n.ID {
+			if src := e.G.Nodes[ed.From]; src != nil {
+				fmt.Fprintf(&b, "⚠ generated from %s — edit the source, not this file\n", src.Name)
+			}
+		}
+	}
+
+	// Seed: the node itself, plus member functions/types when it is a file.
+	visited := map[string]bool{n.ID: true}
+	level := []string{n.ID}
+	if n.Type == graph.NodeFile {
+		for _, ed := range e.G.EdgesOf(n.ID) {
+			if ed.Type == graph.EdgeBelongsTo && ed.To == n.ID && !visited[ed.From] {
+				visited[ed.From] = true
+				level = append(level, ed.From)
+			}
+		}
+	}
+
+	// Reverse BFS over CALLS/IMPORTS/REFERENCES, forward over GENERATES.
+	type hit struct {
+		node  *graph.Node
+		depth int
+	}
+	byEdge := map[string][]hit{}
+	total := 0
+	for d := 1; d <= depth && len(level) > 0; d++ {
+		var next []string
+		for _, cur := range level {
+			for _, ed := range e.G.EdgesOf(cur) {
+				var nb string
+				switch {
+				case ed.To == cur && (ed.Type == graph.EdgeCalls || ed.Type == graph.EdgeImports || ed.Type == graph.EdgeReferences || ed.Type == graph.EdgeMentions):
+					nb = ed.From
+				case ed.From == cur && ed.Type == graph.EdgeGenerates:
+					nb = ed.To
+				}
+				if nb == "" || visited[nb] {
+					continue
+				}
+				visited[nb] = true
+				nn := e.G.Nodes[nb]
+				if nn == nil || nn.Attrs["external"] == "true" {
+					continue
+				}
+				byEdge[ed.Type] = append(byEdge[ed.Type], hit{nn, d})
+				next = append(next, nb)
+				total++
+			}
+		}
+		level = next
+	}
+
+	sections := []struct{ edge, label string }{
+		{graph.EdgeImports, "importers"},
+		{graph.EdgeCalls, "callers"},
+		{graph.EdgeGenerates, "regenerated outputs"},
+		{graph.EdgeReferences, "references"},
+		{graph.EdgeMentions, "documented in — update these docs too"},
+	}
+	for _, s := range sections {
+		hits := byEdge[s.edge]
+		if len(hits) == 0 {
+			continue
+		}
+		sort.Slice(hits, func(i, j int) bool {
+			if hits[i].depth != hits[j].depth {
+				return hits[i].depth < hits[j].depth
+			}
+			return hits[i].node.Name < hits[j].node.Name
+		})
+		fmt.Fprintf(&b, "\n%s (%d):\n", s.label, len(hits))
+		shown := hits
+		if len(shown) > 25 {
+			shown = shown[:25]
+		}
+		for _, h := range shown {
+			tag := ""
+			f := h.node.Attrs["file"]
+			if f == "" {
+				f = h.node.Name
+			}
+			if strings.Contains(f, "_test.") || strings.Contains(f, ".test.") {
+				tag = " [test]"
+			}
+			where := loc(h.node)
+			if where == h.node.Name {
+				// File nodes: the location is the name; don't print it twice.
+				fmt.Fprintf(&b, "  %s [depth %d]%s\n", h.node.Name, h.depth, tag)
+			} else {
+				fmt.Fprintf(&b, "  %s (%s) [depth %d]%s\n", h.node.Name, where, h.depth, tag)
+			}
+		}
+		if extra := len(hits) - len(shown); extra > 0 {
+			fmt.Fprintf(&b, "  … +%d more\n", extra)
+		}
+	}
+
+	// Co-change companions from git history: files with no static edge to the
+	// target that nonetheless ship together — the "you'll also have to touch
+	// these" list (stylesheets, docs, e2e tests, i18n).
+	if n.Type == graph.NodeFile {
+		type comp struct {
+			name string
+			cnt  int
+			conf string
+		}
+		var comps []comp
+		for _, ed := range e.G.EdgesOf(n.ID) {
+			if ed.Type != graph.EdgeCoChanged {
+				continue
+			}
+			other := ed.To
+			if other == n.ID {
+				other = ed.From
+			}
+			if on := e.G.Nodes[other]; on != nil {
+				cnt := 0
+				fmt.Sscanf(ed.Attrs["count"], "%d", &cnt)
+				comps = append(comps, comp{on.Name, cnt, ed.Attrs["confidence"]})
+			}
+		}
+		if len(comps) > 0 {
+			sort.Slice(comps, func(i, j int) bool {
+				if comps[i].cnt != comps[j].cnt {
+					return comps[i].cnt > comps[j].cnt
+				}
+				return comps[i].name < comps[j].name
+			})
+			if len(comps) > 10 {
+				comps = comps[:10]
+			}
+			fmt.Fprintf(&b, "\nco-change companions (git history — usually ship together):\n")
+			for _, cp := range comps {
+				fmt.Fprintf(&b, "  %s (%d shared commits, confidence %s)\n", cp.name, cp.cnt, cp.conf)
+			}
+		}
+	}
+
+	// Same-basename copies: schema/config files duplicated across a monorepo.
+	if n.Type == graph.NodeFile {
+		base := filepath.Base(n.Name)
+		if !blastCommonBasenames[base] {
+			var copies []string
+			for id, nn := range e.G.Nodes {
+				if id == n.ID || nn.Type != graph.NodeFile || filepath.Base(nn.Name) != base {
+					continue
+				}
+				state := ""
+				if h, h2 := n.Attrs["hash"], nn.Attrs["hash"]; h != "" && h2 != "" {
+					if h == h2 {
+						state = " [identical]"
+					} else {
+						state = " [diverged]"
+					}
+				}
+				copies = append(copies, "  "+nn.Name+state)
+			}
+			if len(copies) > 0 {
+				sort.Strings(copies)
+				fmt.Fprintf(&b, "\nsame-basename copies (%d) — check which one is authoritative:\n%s\n",
+					len(copies), strings.Join(copies, "\n"))
+			}
+		}
+	}
+
+	if total == 0 {
+		b.WriteString("no dependents found — change is local\n")
+	} else {
+		fmt.Fprintf(&b, "\ntotal affected: %d node(s) within depth %d\n", total, depth)
 	}
 	return b.String(), nil
 }

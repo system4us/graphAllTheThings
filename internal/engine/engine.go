@@ -57,8 +57,49 @@ type FindHit struct {
 }
 
 type FindResult struct {
-	Method string    `json:"method"` // "semantic" or "keyword"
+	Method string    `json:"method"` // "semantic", "keyword", "hybrid" or "name"
 	Hits   []FindHit `json:"hits"`
+}
+
+// nameFind matches the query against node names: exact > basename/prefix >
+// substring, case-insensitive. External stubs are skipped.
+func (e *Engine) nameFind(query, nodeType string, limit int) FindResult {
+	q := strings.ToLower(query)
+	out := FindResult{Method: "name"}
+	for id, n := range e.G.Nodes {
+		if nodeType != "" && n.Type != nodeType {
+			continue
+		}
+		if n.Attrs["external"] == "true" {
+			continue
+		}
+		lname := strings.ToLower(n.Name)
+		var score float32
+		switch {
+		case lname == q:
+			score = 1.0
+		case strings.HasSuffix(lname, "/"+q) || strings.HasPrefix(lname, q):
+			score = 0.9
+		case strings.Contains(lname, q):
+			score = 0.8
+		default:
+			continue
+		}
+		out.Hits = append(out.Hits, FindHit{
+			ID: id, Type: n.Type, Name: n.Name,
+			Score: score, Text: e.G.NodeText(id),
+		})
+	}
+	sort.Slice(out.Hits, func(i, j int) bool {
+		if out.Hits[i].Score != out.Hits[j].Score {
+			return out.Hits[i].Score > out.Hits[j].Score
+		}
+		return out.Hits[i].Name < out.Hits[j].Name
+	})
+	if len(out.Hits) > limit {
+		out.Hits = out.Hits[:limit]
+	}
+	return out
 }
 
 type EdgeInfo struct {
@@ -133,6 +174,14 @@ func (e *Engine) Overview() Overview {
 func (e *Engine) Find(ctx context.Context, query, nodeType string, limit int) (FindResult, error) {
 	if limit <= 0 {
 		limit = 8
+	}
+	// A spaceless query is an identifier or path, not a description: exact and
+	// substring name matches beat any semantic neighbor ("product.schema" must
+	// return the file, not a conceptually similar validator).
+	if q := strings.TrimSpace(query); q != "" && !strings.ContainsAny(q, " \t") {
+		if r := e.nameFind(q, nodeType, limit); len(r.Hits) > 0 {
+			return r, nil
+		}
 	}
 	if e.VS != nil && e.Emb != nil {
 		vecs, err := e.Emb.Embed(ctx, []string{query})
