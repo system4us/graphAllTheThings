@@ -18,6 +18,10 @@ type Engine struct {
 	G   *graph.Graph
 	VS  store.VectorStore // nil disables semantic search
 	Emb *embed.Client
+	// FTS is an optional indexed keyword search (SQLite FTS5) returning node
+	// ids best-first. keywordFind uses it instead of scanning every NodeText
+	// in memory; nil or an empty result falls back to the scan.
+	FTS func(query, nodeType string, limit int) []string
 }
 
 func New(g *graph.Graph, vs store.VectorStore, emb *embed.Client) *Engine {
@@ -196,6 +200,31 @@ func (e *Engine) Find(ctx context.Context, query, nodeType string, limit int) (F
 
 func (e *Engine) keywordFind(query, typ string, limit int) FindResult {
 	terms := strings.Fields(strings.ToLower(query))
+
+	if e.FTS != nil {
+		if ids := e.FTS(query, typ, limit); len(ids) > 0 {
+			out := FindResult{Method: "keyword-fts"}
+			for _, id := range ids {
+				n := e.G.Nodes[id]
+				if n == nil {
+					continue
+				}
+				text := e.G.NodeText(id)
+				var sc float32
+				lower := strings.ToLower(n.Name + " " + text)
+				for _, t := range terms {
+					if strings.Contains(lower, t) {
+						sc++
+					}
+				}
+				out.Hits = append(out.Hits, FindHit{ID: id, Type: n.Type, Name: n.Name, Score: sc, Text: text})
+			}
+			if len(out.Hits) > 0 {
+				return out
+			}
+		}
+	}
+
 	type scored struct {
 		hit   FindHit
 		score float32

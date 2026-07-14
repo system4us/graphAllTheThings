@@ -103,6 +103,20 @@ func (g *Graph) StartJournal() {
 	g.journal = &journal{removedNodes: map[string]bool{}, addedNodes: map[string]bool{}}
 }
 
+// JournalAddedNodeIDs returns the node ids added since StartJournal — the set
+// an incremental re-embed targets. Read it before Save (a SQLite save resets
+// the journal). Nil when no journal is active.
+func (g *Graph) JournalAddedNodeIDs() []string {
+	if g.journal == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(g.journal.addedNodes))
+	for id := range g.journal.addedNodes {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func New(source string) *Graph {
 	return &Graph{Source: source, Nodes: map[string]*Node{}}
 }

@@ -80,7 +80,14 @@ func (s *Server) build() (*engine.Engine, error) {
 	if s.cfg.OpenStore != nil {
 		vs = s.cfg.OpenStore()
 	}
-	return engine.New(g, vs, s.cfg.Embedder), nil
+	e := engine.New(g, vs, s.cfg.Embedder)
+	if graph.IsSQLitePath(s.cfg.GraphPath) {
+		gp := s.cfg.GraphPath
+		e.FTS = func(q, typ string, limit int) []string {
+			return graph.FTSQuery(gp, q, typ, limit)
+		}
+	}
+	return e, nil
 }
 
 func (s *Server) requireEngine() (*engine.Engine, error) {
@@ -129,6 +136,11 @@ type contextIn struct {
 	Limit    int    `json:"limit,omitempty" jsonschema:"max tables/schemas to include, default 4"`
 }
 
+type impactIn struct {
+	Function string `json:"function" jsonschema:"function name (if unique) or full node id, e.g. func:internal/engine/engine.go:Find:129"`
+	Depth    int    `json:"depth,omitempty" jsonschema:"caller levels to walk, default 3"`
+}
+
 type annotateIn struct {
 	Node          string `json:"node" jsonschema:"table/column/schema name or node id to annotate"`
 	EntityNote    string `json:"entity_note,omitempty" jsonschema:"free-text business definition of the entity (what it canonically means, edge cases)"`
@@ -162,6 +174,22 @@ func (s *Server) register() {
 			return nil, nil, err
 		}
 		out, err := e.CodeContextPack(ctx, in.Question, in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "impact",
+		Description: "Transitive callers of a function up to N levels — call BEFORE changing any function signature or behavior to see everything that breaks. Codebase graphs only. Direct callers first, then each depth level, test callers tagged [test].",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in impactIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Impact(in.Function, in.Depth)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -326,11 +354,19 @@ func (s *Server) autoRefreshCodebase(ctx context.Context) string {
 	if err != nil || summary == "" {
 		return ""
 	}
+	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
 	if err := ng.Save(s.cfg.GraphPath); err != nil {
 		return ""
 	}
 	if ne, err := s.build(); err == nil {
 		s.setEngine(ne)
+	}
+	// Re-embed just the changed nodes, best-effort: an unreachable embedder
+	// never blocks the refresh (hybrid Find covers the gap until it's back).
+	if len(added) > 0 && s.cfg.OpenStore != nil && s.cfg.Embedder != nil {
+		if n, err := indexer.ReindexNodes(ctx, ng, s.cfg.OpenStore(), s.cfg.Embedder, s.cfg.EmbModel, added); err == nil && n > 0 {
+			summary += fmt.Sprintf("; re-embedded %d node(s)", n)
+		}
 	}
 	return "note: graph auto-refreshed (" + summary + ")\n\n"
 }

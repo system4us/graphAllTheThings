@@ -66,13 +66,32 @@ func TextHash(text string) string {
 }
 
 func (s *Store) Upsert(_ context.Context, points []store.Point) error {
-	f := file{Model: s.Model}
+	// Merge over the existing index so a partial upsert (post-refresh
+	// re-embed of a few changed nodes) doesn't wipe the other vectors.
+	// A missing file or a model switch starts from empty.
+	desired := s.Model
+	_ = s.load()
+	if desired != "" && desired != s.Model {
+		s.entries = nil
+		s.Model = desired
+	}
+	byID := map[string]int{}
+	for i, e := range s.entries {
+		byID[e.NodeID] = i
+	}
+	f := file{Model: s.Model, Entries: s.entries}
 	for _, p := range points {
 		normalize(p.Vector)
-		f.Entries = append(f.Entries, entry{
+		e := entry{
 			NodeID: p.NodeID, Type: p.Type, Name: p.Name,
 			Hash: TextHash(p.Text), Vector: p.Vector,
-		})
+		}
+		if i, ok := byID[p.NodeID]; ok {
+			f.Entries[i] = e
+		} else {
+			byID[p.NodeID] = len(f.Entries)
+			f.Entries = append(f.Entries, e)
+		}
 		f.Dim = len(p.Vector)
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {

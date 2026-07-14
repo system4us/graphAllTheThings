@@ -594,6 +594,100 @@ func (e *Engine) RenderFunction(id string) (string, error) {
 		sort.Strings(calls)
 		b.WriteString("calls: " + joinCapped(calls, 12) + "\n")
 	}
+	if body := d.Attrs["body"]; body != "" {
+		fmt.Fprintf(&b, "```\n%s\n```\n", body)
+	}
+	return b.String(), nil
+}
+
+// Impact walks CALLS edges backwards from a function — every caller,
+// transitively, up to depth levels — answering "what breaks if I change this
+// signature" before a refactor. Accepts a node id or a bare function name
+// (must be unique). Test-file callers are tagged [test].
+func (e *Engine) Impact(id string, depth int) (string, error) {
+	n := e.G.Nodes[id]
+	if n == nil {
+		var matches []string
+		for nid, nn := range e.G.Nodes {
+			if nn.Type == graph.NodeFunction && nn.Name == id && nn.Attrs["external"] != "true" {
+				matches = append(matches, nid)
+			}
+		}
+		switch len(matches) {
+		case 0:
+			return "", fmt.Errorf("function %q not found; use find_entities to locate it", id)
+		case 1:
+			id = matches[0]
+			n = e.G.Nodes[id]
+		default:
+			sort.Strings(matches)
+			return "", fmt.Errorf("ambiguous name %q — pick one id:\n  %s", id, strings.Join(matches, "\n  "))
+		}
+	}
+	if depth <= 0 {
+		depth = 3
+	}
+
+	funcLoc := func(nn *graph.Node) string {
+		loc := nn.Attrs["file"]
+		if ls := nn.Attrs["line_start"]; ls != "" {
+			loc += ":" + ls
+		}
+		return loc
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "impact of changing %s (%s)\n", n.Name, funcLoc(n))
+	visited := map[string]bool{id: true}
+	level := []string{id}
+	total := 0
+	for d := 1; d <= depth && len(level) > 0; d++ {
+		var next []string
+		for _, cur := range level {
+			for _, ed := range e.G.EdgesOf(cur) {
+				if ed.Type == graph.EdgeCalls && ed.To == cur && !visited[ed.From] {
+					visited[ed.From] = true
+					next = append(next, ed.From)
+				}
+			}
+		}
+		if len(next) == 0 {
+			break
+		}
+		label := "direct callers"
+		if d > 1 {
+			label = fmt.Sprintf("depth %d", d)
+		}
+		fmt.Fprintf(&b, "\n%s (%d):\n", label, len(next))
+		var lines []string
+		for _, cid := range next {
+			cn := e.G.Nodes[cid]
+			if cn == nil {
+				continue
+			}
+			tag := ""
+			if strings.Contains(cn.Attrs["file"], "_test.") || strings.Contains(cn.Attrs["file"], ".test.") {
+				tag = " [test]"
+			}
+			lines = append(lines, fmt.Sprintf("  %s (%s)%s", cn.Name, funcLoc(cn), tag))
+		}
+		sort.Strings(lines)
+		shown := lines
+		if len(shown) > 25 {
+			shown = shown[:25]
+		}
+		b.WriteString(strings.Join(shown, "\n") + "\n")
+		if extra := len(lines) - len(shown); extra > 0 {
+			fmt.Fprintf(&b, "  … +%d more\n", extra)
+		}
+		total += len(next)
+		level = next
+	}
+	if total == 0 {
+		b.WriteString("no callers found — signature change is local\n")
+	} else {
+		fmt.Fprintf(&b, "\ntotal affected: %d function(s) within depth %d\n", total, depth)
+	}
 	return b.String(), nil
 }
 
@@ -687,9 +781,16 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	rendered := 0
 	const budget = 16 * 1024 // hard cap: keep the pack one cheap tool call
 
+	// Generated code (ANTLR parsers, protobufs…) stays findable via
+	// find_entities but never earns context-pack space.
+	skipGenerated := func(id string) bool {
+		n := e.G.Nodes[id]
+		return n != nil && n.Attrs["generated"] == "true"
+	}
+
 	// 1. Type definitions (orientation layer).
 	for _, h := range defHits.Hits {
-		if seen[h.ID] || b.Len() > budget {
+		if seen[h.ID] || b.Len() > budget || skipGenerated(h.ID) {
 			continue
 		}
 		seen[h.ID] = true
@@ -703,7 +804,7 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 
 	// 2. Relevant functions.
 	for _, h := range funcHits.Hits {
-		if seen[h.ID] || b.Len() > budget {
+		if seen[h.ID] || b.Len() > budget || skipGenerated(h.ID) {
 			continue
 		}
 		if n := e.G.Nodes[h.ID]; n != nil && n.Attrs["external"] == "true" {
@@ -722,6 +823,9 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	for _, h := range fileHits.Hits {
 		if seen[h.ID] || rendered >= limit*2 || b.Len() > budget {
 			break
+		}
+		if skipGenerated(h.ID) {
+			continue
 		}
 		n := e.G.Nodes[h.ID]
 		if n == nil {
@@ -759,4 +863,5 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	}
 	return b.String(), nil
 }
+
 

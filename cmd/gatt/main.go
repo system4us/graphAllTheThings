@@ -58,6 +58,8 @@ func main() {
 		err = cmdSearch(ctx, os.Args[2:])
 	case "query":
 		err = cmdQuery(ctx, os.Args[2:])
+	case "impact":
+		err = cmdImpact(ctx, os.Args[2:])
 	case "code-query", "codequery":
 		err = cmdCodeQuery(ctx, os.Args[2:])
 	case "path":
@@ -319,11 +321,12 @@ func openStore(graphPath, qdURL, coll string) store.VectorStore {
 	return local.New(filepath.Join(filepath.Dir(graphPath), "vectors.json"))
 }
 
-// openEngine loads the graph and wires the vector store + embedder.
 // autoRefreshCodebase incrementally re-parses changed files of a codebase
 // graph before answering, so line numbers and call edges never go stale
-// mid-session. No-op for non-codebase graphs or when nothing changed.
-func autoRefreshCodebase(ctx context.Context, graphPath string) {
+// mid-session, then re-embeds just the changed nodes (best-effort — an
+// unreachable embedder never blocks the refresh; hybrid Find covers the gap).
+// No-op for non-codebase graphs or when nothing changed.
+func autoRefreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, embModel string) {
 	// Cheap precheck first (stat walk + light metadata read): the common
 	// no-drift case never materializes the graph.
 	source, mts, err := graph.LoadCodebaseState(graphPath)
@@ -342,10 +345,19 @@ func autoRefreshCodebase(ctx context.Context, graphPath string) {
 	if err != nil || summary == "" {
 		return
 	}
+	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
 	if err := ng.Save(graphPath); err != nil {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "graph auto-refreshed: %s\n", summary)
+
+	if len(added) > 0 {
+		vs := openStore(graphPath, qdURL, coll)
+		emb := embed.New(embURL, resolveModel(embModel, vs))
+		if n, err := indexer.ReindexNodes(ctx, ng, vs, emb, resolveModel(embModel, vs), added); err == nil && n > 0 {
+			fmt.Fprintf(os.Stderr, "re-embedded %d changed node(s)\n", n)
+		}
+	}
 }
 
 func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine, error) {
@@ -354,7 +366,13 @@ func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine
 		return nil, err
 	}
 	vs := openStore(graphPath, qdURL, coll)
-	return engine.New(g, vs, embed.New(embURL, resolveModel(embModel, vs))), nil
+	e := engine.New(g, vs, embed.New(embURL, resolveModel(embModel, vs)))
+	if graph.IsSQLitePath(graphPath) {
+		e.FTS = func(q, typ string, limit int) []string {
+			return graph.FTSQuery(graphPath, q, typ, limit)
+		}
+	}
+	return e, nil
 }
 
 func cmdIndex(ctx context.Context, args []string) error {
@@ -811,6 +829,32 @@ Your goal is to populate gatt.spec.json, definitions.json, and relations.json wi
 // cmdCodeQuery is the codebase analogue of cmdQuery: it renders the most
 // relevant functions, types, and docs for a natural-language question against
 // a codebase graph.
+// cmdImpact prints the transitive callers of a function — what breaks if its
+// signature changes.
+func cmdImpact(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: gatt impact <function-name-or-id> [--depth N]")
+	}
+	target := args[0]
+	fs := flag.NewFlagSet("impact", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	depth := fs.Int("depth", 3, "how many caller levels to walk")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.Impact(target, *depth)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
 func cmdCodeQuery(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf(`usage: gatt code-query "<question>" [flags]`)
@@ -822,7 +866,7 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	autoRefreshCodebase(ctx, *graphPath)
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
 	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
 	if err != nil {
 		return err

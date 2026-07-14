@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(efrom);
 CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(eto);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(id UNINDEXED, type UNINDEXED, text);
 `
 
 func openGraphDB(path string) (*sql.DB, error) {
@@ -95,11 +97,10 @@ func (g *Graph) saveSQLite(path string) error {
 			return err
 		}
 	} else {
-		if _, err := tx.Exec(`DELETE FROM nodes`); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM edges`); err != nil {
-			return err
+		for _, table := range []string{"nodes", "edges", "fts"} {
+			if _, err := tx.Exec(`DELETE FROM ` + table); err != nil {
+				return err
+			}
 		}
 		if err := insertAll(tx, g); err != nil {
 			return err
@@ -142,6 +143,16 @@ func insertAll(tx *sql.Tx, g *Graph) error {
 	defer es.Close()
 	for _, e := range g.Edges {
 		if _, err := es.Exec(e.From, e.To, e.Type, marshalAttrs(e.Attrs)); err != nil {
+			return err
+		}
+	}
+	fs, err := tx.Prepare(`INSERT INTO fts(id,type,text) VALUES(?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer fs.Close()
+	for id, n := range g.Nodes {
+		if _, err := fs.Exec(id, n.Type, g.NodeText(id)); err != nil {
 			return err
 		}
 	}
@@ -199,7 +210,78 @@ func applyDelta(tx *sql.Tx, g *Graph, j *journal) error {
 			return err
 		}
 	}
+
+	fd, err := tx.Prepare(`DELETE FROM fts WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+	fi, err := tx.Prepare(`INSERT INTO fts(id,type,text) VALUES(?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+	for id := range j.removedNodes {
+		if _, err := fd.Exec(id); err != nil {
+			return err
+		}
+	}
+	for id := range j.addedNodes {
+		n := g.Nodes[id]
+		if n == nil {
+			continue
+		}
+		if _, err := fd.Exec(id); err != nil {
+			return err
+		}
+		if _, err := fi.Exec(id, n.Type, g.NodeText(id)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// FTSQuery runs an indexed full-text search over a SQLite graph's fts table.
+// Terms are OR-quoted so free-form phrasing can't break MATCH syntax. Returns
+// node ids best-first (bm25); empty on any error or when the table has no
+// rows yet (pre-FTS graphs), so callers fall back to the in-memory scan.
+func FTSQuery(path, query, nodeType string, limit int) []string {
+	db, err := openGraphDB(path)
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+
+	var quoted []string
+	for _, t := range strings.Fields(query) {
+		if t = strings.ReplaceAll(t, `"`, ""); t != "" {
+			quoted = append(quoted, `"`+t+`"`)
+		}
+	}
+	if len(quoted) == 0 {
+		return nil
+	}
+	match := strings.Join(quoted, " OR ")
+
+	q := `SELECT id FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?`
+	args := []any{match, limit}
+	if nodeType != "" {
+		q = `SELECT id FROM fts WHERE fts MATCH ? AND type = ? ORDER BY bm25(fts) LIMIT ?`
+		args = []any{match, nodeType, limit}
+	}
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // FileMtimes returns relPath → mtime for every physical file node — the

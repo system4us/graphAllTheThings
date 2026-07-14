@@ -199,6 +199,40 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	}
 	resolveAndWire(prev, newFuncs, funcsByName)
 
+	// Calls from *unchanged* files may now have a target that didn't exist at
+	// their extract time: re-resolve their persisted raw call names against
+	// the names newly defined in this update.
+	newNames := map[string]bool{}
+	for _, fi := range newFuncs {
+		newNames[fi.name] = true
+	}
+	if len(newNames) > 0 {
+		hasEdge := map[string]bool{} // caller id + target name, local targets only
+		for _, e := range prev.Edges {
+			if e.Type != graph.EdgeCalls {
+				continue
+			}
+			if tn := prev.Nodes[e.To]; tn != nil && tn.Attrs["external"] != "true" {
+				hasEdge[e.From+"\x00"+tn.Name] = true
+			}
+		}
+		for id, n := range prev.Nodes {
+			if n.Type != graph.NodeFunction || n.Attrs["calls_raw"] == "" || dirty[n.Attrs["file"]] {
+				continue
+			}
+			for _, raw := range strings.Fields(n.Attrs["calls_raw"]) {
+				bare := strings.TrimPrefix(raw, ".")
+				if !newNames[bare] || hasEdge[id+"\x00"+bare] {
+					continue
+				}
+				if target := resolveCall(prev, n.Attrs["file"], raw, funcsByName); target != "" {
+					prev.AddEdge(id, target, graph.EdgeCalls, nil)
+					hasEdge[id+"\x00"+bare] = true
+				}
+			}
+		}
+	}
+
 	// Re-attach surviving callers to the re-parsed targets.
 	byFileName := map[string]string{}
 	for _, fi := range newFuncs {
@@ -487,6 +521,30 @@ func docComment(nameNode *sitter.Node, src []byte) string {
 	return doc
 }
 
+// isGenerated reports whether the source carries a generated-code marker in
+// its first lines (Go convention "Code generated ... DO NOT EDIT",
+// "@generated") or a telltale filename. Generated entities stay in the graph
+// and remain findable, but context packs skip them: a 1,700-method ANTLR
+// parser must never win the ranking over hand-written code.
+func isGenerated(relPath string, data []byte) bool {
+	base := filepath.Base(relPath)
+	for _, suf := range []string{".pb.go", "_gen.go", ".gen.go", ".min.js", ".min.css"} {
+		if strings.HasSuffix(base, suf) {
+			return true
+		}
+	}
+	head := data
+	if len(head) > 2048 {
+		head = head[:2048]
+	}
+	for _, line := range strings.SplitN(string(head), "\n", 20) {
+		if strings.Contains(line, "DO NOT EDIT") || strings.Contains(line, "@generated") {
+			return true
+		}
+	}
+	return false
+}
+
 // receiverTypeName extracts the type name from a Go receiver node like "(e *Engine)" → "Engine".
 func receiverTypeName(recvNode *sitter.Node, src []byte) string {
 	text := strings.Trim(recvNode.Content(src), "()")
@@ -559,19 +617,25 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			return nil
 		}
 
-		g.AddNode(&graph.Node{
-			ID:   fileID,
-			Type: graph.NodeFile,
-			Name: relPath,
-			Attrs: map[string]string{"path": path, "mtime": mtime},
-		})
-		if projID != "" {
-			g.AddEdge(fileID, projID, graph.EdgeBelongsTo, nil)
-		}
-
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
+		}
+		gen := isGenerated(relPath, data)
+		srcLines := strings.Split(string(data), "\n")
+
+		fileAttrs := map[string]string{"path": path, "mtime": mtime}
+		if gen {
+			fileAttrs["generated"] = "true"
+		}
+		g.AddNode(&graph.Node{
+			ID:    fileID,
+			Type:  graph.NodeFile,
+			Name:  relPath,
+			Attrs: fileAttrs,
+		})
+		if projID != "" {
+			g.AddEdge(fileID, projID, graph.EdgeBelongsTo, nil)
 		}
 
 		parser := sitter.NewParser()
@@ -619,6 +683,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				}
 				if doc := docComment(defNode, data); doc != "" {
 					attrs["doc"] = doc
+				}
+				if gen {
+					attrs["generated"] = "true"
 				}
 				g.AddNode(&graph.Node{
 					ID:    nodeID,
@@ -675,6 +742,17 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				}
 				if doc := docComment(funcNameNode, data); doc != "" {
 					attrs["doc"] = doc
+				}
+				if gen {
+					attrs["generated"] = "true"
+				}
+				// Short functions carry their body: the context pack can then
+				// answer without a follow-up file read.
+				if n := lineEnd - lineStart + 1; n > 0 && n <= 15 && lineEnd <= len(srcLines) {
+					body := strings.Join(srcLines[lineStart-1:lineEnd], "\n")
+					if len(body) <= 600 {
+						attrs["body"] = body
+					}
 				}
 				g.AddNode(&graph.Node{
 					ID:    nodeID,
@@ -807,13 +885,52 @@ var builtinNames = map[string]bool{
 	"Number": true, "String": true, "Array": true, "Object": true, "Symbol": true,
 }
 
+// resolveCall applies the call-resolution rules to one raw call name (a "."
+// prefix marks a selector call) and returns the local target node id, or ""
+// when the call is external or ambiguous:
+//   - selector calls resolve to same-file locals only (receiver methods live
+//     next to their type; filepath.Join must never match a local Join)
+//   - direct calls resolve to the unique global match, same-file tiebreak
+func resolveCall(g *graph.Graph, fromFile, raw string, funcsByName map[string][]string) string {
+	isSelector := strings.HasPrefix(raw, ".")
+	bare := strings.TrimPrefix(raw, ".")
+	targets := funcsByName[bare]
+	sameFile := ""
+	for _, tid := range targets {
+		if tn := g.Nodes[tid]; tn != nil && tn.Attrs["file"] == fromFile {
+			sameFile = tid
+			break
+		}
+	}
+	switch {
+	case sameFile != "":
+		return sameFile
+	case isSelector:
+		return ""
+	case len(targets) == 1:
+		return targets[0]
+	default:
+		return "" // ambiguous cross-file or unresolved
+	}
+}
+
 // resolveAndWire does the second pass:
 //  1. Resolves each call target to a local function node when possible.
 //  2. Falls back to an external stub when not found locally.
 //  3. Wires HAS_METHOD edges for cases missed during the first pass.
+//
+// It also persists each function's raw call names (calls_raw) so a later
+// incremental Update can resolve calls from unchanged files against functions
+// that did not exist yet at extract time.
 func resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
 	for i := range funcs {
 		fi := &funcs[i]
+
+		if len(fi.calls) > 0 {
+			if n := g.Nodes[fi.id]; n != nil {
+				n.Attrs["calls_raw"] = strings.Join(fi.calls, " ")
+			}
+		}
 
 		// Wire HAS_METHOD when receiver type was defined after the method.
 		if fi.receiverDef != "" && g.Nodes[fi.receiverDef] != nil {
@@ -837,50 +954,32 @@ func resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]s
 			}
 			seen[calledName] = true
 
-			// Selector call ("." prefix): pkg.Func or obj.Method. Only resolve
-			// against same-file locals (receiver methods live next to their
-			// type); anything else is external — never match cross-package by
-			// bare name (filepath.Join must not resolve to a local Join).
-			isSelector := strings.HasPrefix(calledName, ".")
-			bareName := strings.TrimPrefix(calledName, ".")
-
-			targets := funcsByName[bareName]
-			sameFile := ""
-			for _, tid := range targets {
-				if tn := g.Nodes[tid]; tn != nil && tn.Attrs["file"] == fi.file {
-					sameFile = tid
-					break
-				}
+			if target := resolveCall(g, fi.file, calledName, funcsByName); target != "" {
+				g.AddEdge(fi.id, target, graph.EdgeCalls, nil)
+				continue
 			}
-
-			switch {
-			case isSelector && sameFile != "":
-				g.AddEdge(fi.id, sameFile, graph.EdgeCalls, nil)
-			case isSelector:
-				// External selector call: skip. Stubs for stdlib/methods
-				// (Join, Sprintf, Close…) are pure noise in the graph.
-			case len(targets) == 1:
-				g.AddEdge(fi.id, targets[0], graph.EdgeCalls, nil)
-			case len(targets) > 1 && sameFile != "":
-				g.AddEdge(fi.id, sameFile, graph.EdgeCalls, nil)
-			case len(targets) > 1:
+			bareName := strings.TrimPrefix(calledName, ".")
+			if strings.HasPrefix(calledName, ".") || builtinNames[bareName] {
+				// External selector (stdlib/method) or language builtin:
+				// stubs for these are pure noise in the graph.
+				continue
+			}
+			if len(funcsByName[bareName]) > 1 {
 				// Ambiguous cross-file name (e.g. dozens of "append" defs in a
 				// monorepo): wiring to all targets creates quadratic false
 				// edges. Skip — better no edge than thousands of wrong ones.
-			case builtinNames[bareName]:
-				// Language builtins (append, len, print…) — no stub, pure noise.
-			default:
-				stubID := "call:" + bareName
-				if g.Nodes[stubID] == nil {
-					g.AddNode(&graph.Node{
-						ID:    stubID,
-						Type:  graph.NodeFunction,
-						Name:  bareName,
-						Attrs: map[string]string{"external": "true"},
-					})
-				}
-				g.AddEdge(fi.id, stubID, graph.EdgeCalls, nil)
+				continue
 			}
+			stubID := "call:" + bareName
+			if g.Nodes[stubID] == nil {
+				g.AddNode(&graph.Node{
+					ID:    stubID,
+					Type:  graph.NodeFunction,
+					Name:  bareName,
+					Attrs: map[string]string{"external": "true"},
+				})
+			}
+			g.AddEdge(fi.id, stubID, graph.EdgeCalls, nil)
 		}
 	}
 }

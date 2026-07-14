@@ -22,6 +22,46 @@ type Result struct {
 	Reused   int // nodes served from the incremental cache
 }
 
+// ReindexNodes embeds only the given node ids and merges them into the store.
+// This is the post-refresh path: a handful of changed nodes in milliseconds,
+// instead of walking the whole graph. Ids no longer in the graph are skipped.
+func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, ids []string) (int, error) {
+	if ls, ok := vs.(*local.Store); ok {
+		ls.Model = model
+	}
+	var liveIDs, texts []string
+	for _, id := range ids {
+		n := g.Nodes[id]
+		if n == nil || n.Type == graph.NodeDatabase || n.Type == graph.NodeAPI {
+			continue
+		}
+		liveIDs = append(liveIDs, id)
+		texts = append(texts, g.NodeText(id))
+	}
+	if len(liveIDs) == 0 {
+		return 0, nil
+	}
+	var points []store.Point
+	const batch = 64
+	for i := 0; i < len(liveIDs); i += batch {
+		end := min(i+batch, len(liveIDs))
+		vecs, err := emb.Embed(ctx, texts[i:end])
+		if err != nil {
+			return 0, err
+		}
+		for j, v := range vecs {
+			n := g.Nodes[liveIDs[i+j]]
+			points = append(points, store.Point{
+				NodeID: liveIDs[i+j], Type: n.Type, Name: n.Name, Text: texts[i+j], Vector: v,
+			})
+		}
+	}
+	if err := vs.Upsert(ctx, points); err != nil {
+		return 0, err
+	}
+	return len(points), nil
+}
+
 // Reindex embeds every graph node (except the source root) into vs using emb
 // with the given model. When full is false and the store already holds vectors
 // from the same model, unchanged nodes reuse their cached vector.
