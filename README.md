@@ -15,7 +15,7 @@ source (sqlite | postgres | openapi | ...)
   gatt-out/graph.json      ← source of truth: typed nodes + edges, traversal in memory
         │  index
         ▼
-  gatt-out/vectors.json    ← semantic layer: node embeddings (Ollama nomic-embed-text),
+  gatt-out/vectors.json    ← semantic layer: node embeddings (Ollama bge-m3, multilingual),
         │                    cosine search in-process; --qdrant swaps in a Qdrant server
         ▼
   MCP stdio server         ← agents call tools; zero live-DB introspection
@@ -32,7 +32,9 @@ Edges: `HAS_TABLE`, `HAS_COLUMN`, `HAS_INDEX`, `INDEXES`, `FOREIGN_KEY` (column�
 
 ## Quickstart
 
-Requires: Go 1.24+ and Ollama on `:11434` with `nomic-embed-text` pulled (optional — keyword fallback works without it).
+Requires: Go 1.24+ and Ollama on `:11434` with `bge-m3` pulled (optional — keyword fallback works without it).
+
+Measured on a real 113-table CRM: answering one data question costs **~2.3k tokens in 1 tool call** with gatt vs ~7.8k tokens across 6 introspection queries (list tables + describe candidates) — and the join chain comes out correct on the first try.
 
 ```bash
 go build -o gatt ./cmd/gatt

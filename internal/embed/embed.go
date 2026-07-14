@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	DefaultURL   = "http://localhost:11434"
-	DefaultModel = "nomic-embed-text"
+	DefaultURL = "http://localhost:11434"
+	// DefaultModel is multilingual (bge-m3): schema names are English but
+	// user questions often aren't; nomic-embed-text missed obvious tables
+	// on Spanish queries.
+	DefaultModel = "bge-m3"
 )
 
 type Client struct {
