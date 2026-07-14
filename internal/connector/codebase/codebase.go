@@ -42,6 +42,9 @@ type Connector struct {
 	// modelBases is the inheritance-marker set identifying ORM model classes
 	// (defaults + .gatt/models.json base_classes). Loaded lazily.
 	modelBases map[string]bool
+	// pendingClientCalls collects client-side HTTP call sites, wired to
+	// their matching route nodes by wireClientCalls.
+	pendingClientCalls []clientCall
 	// pendingRoutes collects HTTP route registrations found while parsing,
 	// resolved against the finished function index by wireRoutes.
 	pendingRoutes []routeInfo
@@ -139,6 +142,8 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	c.wireMentions(g)
 	c.wireRoutes(g, funcsByName)
 	c.wireModels(g)
+	c.wireClientCalls(g, funcs)
+	c.wireRouteModels(g)
 	c.mineGitCoChanges(ctx, g)
 
 	return g, nil
@@ -342,6 +347,8 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	c.wireMentions(prev)
 	c.wireRoutes(prev, funcsByName)
 	c.wireModels(prev)
+	c.wireClientCalls(prev, newFuncs)
+	c.wireRouteModels(prev)
 
 	// Calls from *unchanged* files may now have a target that didn't exist at
 	// their extract time: re-resolve their persisted raw call names against
@@ -594,7 +601,10 @@ func langFor(ext string) *langConfig {
 			  function: (member_expression
 			    object: (identifier) @route.obj
 			    property: (property_identifier) @route.method)
-			  arguments: (arguments . (string) @route.path)) @route.call
+			  arguments: (arguments . [(string) (template_string)] @route.path)) @route.call
+			(call_expression
+			  function: (identifier) @fetch.fn
+			  arguments: (arguments . [(string) (template_string)] @fetch.path)) @fetch.call
 			(call_expression
 			  function: (member_expression
 			    object: (identifier) @model.obj
@@ -664,7 +674,10 @@ func langFor(ext string) *langConfig {
 			  function: (member_expression
 			    object: (identifier) @route.obj
 			    property: (property_identifier) @route.method)
-			  arguments: (arguments . (string) @route.path)) @route.call
+			  arguments: (arguments . [(string) (template_string)] @route.path)) @route.call
+			(call_expression
+			  function: (identifier) @fetch.fn
+			  arguments: (arguments . [(string) (template_string)] @fetch.path)) @fetch.call
 			(call_expression
 			  function: (member_expression
 			    object: (identifier) @model.obj
@@ -1465,6 +1478,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 			if _, ok := caps["gomodel.struct"]; ok {
 				c.detectGoModel(g, caps, relPath, fileID, data)
+			}
+			if _, ok := caps["fetch.call"]; ok {
+				c.detectClientFetch(caps, relPath, data)
 			}
 
 			// ── Shared-state singleton tracking (JS/TS/JSX) ─────────────────────

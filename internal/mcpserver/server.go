@@ -298,7 +298,7 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "routes",
-		Description: "Every HTTP route detected in the codebase: method, path, handler (with file:line), and middleware chain in order. Statically detects Express-style JS/TS/JSX router/app.get|post|put|delete|patch|all|use(...) registrations, plus any function tagged via annotate_entity's route_method/route_path/route_framework fields — the way to cover other languages, frameworks, or coding styles the static detector doesn't recognize. Codebase graphs only.",
+		Description: "Every HTTP route detected in the codebase: method, path, handler (with file:line; controller.method references resolve too), middleware chain, the ORM models the handler chain touches (models: line), and the frontend call sites that hit the route (called from: line — axios/fetch calls matched by method + path tail, template paths normalized). The full-stack intersection in one call: frontend function → route → models. Statically detects Express-style JS/TS/JSX registrations, plus any function tagged via annotate_entity's route_method/route_path/route_framework fields. Codebase graphs only.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in routesIn) (*mcp.CallToolResult, any, error) {
 		note := s.autoRefreshCodebase(ctx)
 		e, err := s.requireEngine()

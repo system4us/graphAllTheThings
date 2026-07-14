@@ -68,8 +68,22 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 		}
 
 		var handler string
-		var middleware []string
+		var middleware, models, callers []string
 		for _, ed := range e.G.EdgesOf(n.ID) {
+			if ed.Type == graph.EdgeCallsEndpoint && ed.To == n.ID {
+				if on := e.G.Nodes[ed.From]; on != nil {
+					label := on.Name
+					if f := on.Attrs["file"]; f != "" {
+						label += " (" + f
+						if l := ed.Attrs["line"]; l != "" {
+							label += ":" + l
+						}
+						label += ")"
+					}
+					callers = append(callers, label)
+				}
+				continue
+			}
 			if ed.From != n.ID {
 				continue
 			}
@@ -86,6 +100,8 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 				handler = label
 			case graph.EdgeUsesMiddleware:
 				middleware = append(middleware, label)
+			case graph.EdgeUsesModel:
+				models = append(models, on.Name)
 			}
 		}
 		line := fmt.Sprintf("  :%s  %s %s", n.Attrs["line_start"], n.Attrs["method"], n.Attrs["path"])
@@ -96,6 +112,14 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 			line += "  [middleware: " + strings.Join(middleware, ", ") + "]"
 		}
 		b.WriteString(line + "\n")
+		if len(models) > 0 {
+			sort.Strings(models)
+			fmt.Fprintf(&b, "      models: %s\n", joinCapped(models, 10))
+		}
+		if len(callers) > 0 {
+			sort.Strings(callers)
+			fmt.Fprintf(&b, "      called from: %s\n", joinCapped(callers, 6))
+		}
 	}
 	return b.String(), nil
 }

@@ -53,6 +53,8 @@ const (
 	EdgeGenerates  = "GENERATES"  // file -> file (source regenerates target; overlay-declared)
 	EdgeCoChanged  = "CO_CHANGED" // file -> file (frequently change in the same git commit)
 	EdgeMentions   = "MENTIONS"   // doc -> function/definition/file it references
+	EdgeCallsEndpoint = "CALLS_ENDPOINT" // function (client call site) -> route it hits over HTTP
+	EdgeUsesModel     = "USES_MODEL"     // route -> ORM model its handler chain touches
 
 	EdgeHandledBy      = "HANDLED_BY"      // route -> function (the terminal handler)
 	EdgeUsesMiddleware = "USES_MIDDLEWARE" // route -> function (middleware in chain order)
@@ -459,6 +461,7 @@ func (g *Graph) NodeText(id string) string {
 	}
 	var cols, refs, refBy, accepts, returns, usedBy, methods, calledBy []string
 	var handledBy, middleware, writesState, readsState, writtenBy, readBy []string
+	var callsEndpoints, usesModels, usedByRoutes []string
 	for _, e := range g.EdgesOf(id) {
 		other := e.To
 		if other == id {
@@ -497,6 +500,12 @@ func (g *Graph) NodeText(id string) string {
 			writtenBy = append(writtenBy, on.Name)
 		case e.Type == EdgeReadsState && e.To == id:
 			readBy = append(readBy, on.Name)
+		case e.Type == EdgeCallsEndpoint && e.From == id:
+			callsEndpoints = append(callsEndpoints, on.Name)
+		case e.Type == EdgeUsesModel && e.From == id:
+			usesModels = append(usesModels, on.Name)
+		case e.Type == EdgeUsesModel && e.To == id:
+			usedByRoutes = append(usedByRoutes, on.Name)
 		}
 	}
 	if len(cols) > 0 {
@@ -511,6 +520,15 @@ func (g *Graph) NodeText(id string) string {
 	}
 	if len(calledBy) > 0 {
 		fmt.Fprintf(&b, " Called by: %s.", strings.Join(calledBy, ", "))
+	}
+	if len(callsEndpoints) > 0 {
+		fmt.Fprintf(&b, " Calls backend routes: %s.", strings.Join(callsEndpoints, ", "))
+	}
+	if len(usesModels) > 0 {
+		fmt.Fprintf(&b, " Touches models: %s.", strings.Join(usesModels, ", "))
+	}
+	if len(usedByRoutes) > 0 {
+		fmt.Fprintf(&b, " Used by routes: %s.", strings.Join(usedByRoutes, ", "))
 	}
 	if len(handledBy) > 0 {
 		fmt.Fprintf(&b, " Handled by: %s.", strings.Join(handledBy, ", "))

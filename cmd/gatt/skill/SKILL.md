@@ -63,7 +63,14 @@ gatt grep <pattern> [--regex]       # exhaustive literal/regex scan of every fil
                                     # above is semantic/top-N and is NOT exhaustive
 gatt tree [path] [--depth N]        # directory tree annotated with each file's doc summary
 gatt routes [--file substr]         # HTTP routes found in code (Express JS/TS/JSX):
-                                    # method, path, handler, middleware chain
+                                    # method, path, handler (incl. controller.method
+                                    # refs), middleware chain, plus per route: the ORM
+                                    # models its handler chain touches and the frontend
+                                    # call sites that hit it (axios/fetch/template
+                                    # paths matched by method + path tail). Full-stack
+                                    # chain: frontend fn → route → models; the reverse
+                                    # (fn → "Calls backend routes: …", model → "routes
+                                    # touching") shows in search/describe/blast
 gatt models [--file substr]         # ORM models found in code: name, DB table,
                                     # field→column renames, associations. Detects
                                     # Sequelize init/define, TypeORM decorators, Go
