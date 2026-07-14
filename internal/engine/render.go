@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -1193,11 +1194,66 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	return b.String(), nil
 }
 
+var (
+	docInlineCodeRe = regexp.MustCompile("`([^`\n]{1,80})`")
+	docIdentLikeRe  = regexp.MustCompile(`^[A-Za-z_][\w./-]*$`)
+)
+
+// docSourceExts are extensions a doc-cited path must carry to count as a
+// checkable source reference; docSkipDirs are first path segments that the
+// extractor never indexes, so their absence from the graph proves nothing.
+var docSourceExts = map[string]bool{
+	".go": true, ".ts": true, ".tsx": true, ".py": true, ".rs": true, ".md": true,
+	".json": true, ".yaml": true, ".yml": true, ".sql": true, ".toml": true,
+	".css": true, ".scss": true, ".less": true,
+}
+var docSkipDirs = map[string]bool{
+	"node_modules": true, "gatt-out": true, "vendor": true, "dist": true, "build": true,
+}
+
+// mineDocPathTokens re-extracts file-path references from a doc's current
+// text (fenced blocks skipped): identifier-shaped, containing a "/", ending
+// in an indexed source extension, not under a never-indexed directory. Paths
+// are the one token class where "resolves to no file node" reliably means
+// "this doc points at a file that moved or is gone" even right after a full
+// re-extract; bare symbol names are instead checked via mentions_resolved,
+// which survives incremental refresh (the everyday flow).
+func mineDocPathTokens(data []byte) []string {
+	var tokens []string
+	inFence := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || len(tokens) >= 200 {
+			continue
+		}
+		for _, m := range docInlineCodeRe.FindAllStringSubmatch(line, -1) {
+			tok := strings.TrimSuffix(strings.TrimSpace(m[1]), "()")
+			if len(tok) < 3 || !strings.Contains(tok, "/") || !docIdentLikeRe.MatchString(tok) {
+				continue
+			}
+			if !docSourceExts[filepath.Ext(tok)] {
+				continue
+			}
+			if first, _, ok := strings.Cut(tok, "/"); ok && docSkipDirs[first] {
+				continue
+			}
+			tokens = append(tokens, tok)
+		}
+	}
+	return tokens
+}
+
 // DocDrift reports markdown docs whose inline-code references either no
-// longer resolve in the graph (broken — the symbol resolved when the doc was
-// extracted and has since been deleted or renamed) or resolve to code that was
-// last touched, per git, after the doc itself was (stale). Staleness needs a
-// git checkout; outside one, only broken references are reported.
+// longer resolve in the graph (broken) or resolve to code that was last
+// touched, per git, after the doc itself was (stale). Broken combines two
+// detectors: tokens that resolved at extract time and no longer do (precise;
+// survives incremental refresh, which is how symbol renames surface), and
+// doc-cited source paths that match no file node (path existence is
+// re-checkable even after a full re-extract recomputes mentions_resolved).
+// Staleness needs a git checkout; outside one, only broken refs are reported.
 func (e *Engine) DocDrift(limit int) (string, error) {
 	if !e.IsCodebase() {
 		return "", fmt.Errorf("doc drift needs a codebase graph")
@@ -1292,9 +1348,19 @@ func (e *Engine) DocDrift(limit int) (string, error) {
 
 		var d drift
 		d.name = relPath
+		seen := map[string]bool{}
 		for _, tok := range strings.Fields(n.Attrs["mentions_resolved"]) {
-			if !resolvesNow(tok) {
+			if !seen[tok] && !resolvesNow(tok) {
+				seen[tok] = true
 				d.broken = append(d.broken, tok)
+			}
+		}
+		if data, err := os.ReadFile(filepath.Join(dir, relPath)); err == nil {
+			for _, tok := range mineDocPathTokens(data) {
+				if !seen[tok] && !resolvesNow(tok) {
+					seen[tok] = true
+					d.broken = append(d.broken, tok)
+				}
 			}
 		}
 
