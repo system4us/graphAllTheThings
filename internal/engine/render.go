@@ -7,7 +7,10 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -689,7 +692,79 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 	} else {
 		fmt.Fprintf(&b, "\ntotal affected: %d function(s) within depth %d\n", total, depth)
 	}
+	b.WriteString(e.sharedStateText(id))
 	return b.String(), nil
+}
+
+// sharedStateText renders the cross-file "you'll also have to look at this"
+// signal CALLS can't see: for each shared-state node (a tracked property on
+// a singleton — see internal/connector/codebase/stateflow.go, JS/TS/JSX
+// only, v1) the given function id reads or writes, list the *other*
+// functions that also read or write it. One hop only, not transitive.
+// Returns "" when the function touches no tracked shared state.
+func (e *Engine) sharedStateText(id string) string {
+	var stateIDs []string
+	seen := map[string]bool{}
+	for _, ed := range e.G.EdgesOf(id) {
+		if ed.From != id || (ed.Type != graph.EdgeWritesState && ed.Type != graph.EdgeReadsState) {
+			continue
+		}
+		if !seen[ed.To] {
+			seen[ed.To] = true
+			stateIDs = append(stateIDs, ed.To)
+		}
+	}
+	if len(stateIDs) == 0 {
+		return ""
+	}
+	sort.Strings(stateIDs)
+
+	var b strings.Builder
+	b.WriteString("\nshares mutable state:\n")
+	any := false
+	for _, sid := range stateIDs {
+		sn := e.G.Nodes[sid]
+		if sn == nil {
+			continue
+		}
+		var writers, readers []string
+		for _, ed := range e.G.EdgesOf(sid) {
+			if ed.To != sid || ed.From == id {
+				continue
+			}
+			on := e.G.Nodes[ed.From]
+			if on == nil {
+				continue
+			}
+			label := on.Name
+			if f := on.Attrs["file"]; f != "" && on.Attrs["line_start"] != "" {
+				label += fmt.Sprintf(" (%s:%s)", f, on.Attrs["line_start"])
+			}
+			if ed.Type == graph.EdgeWritesState {
+				writers = append(writers, label)
+			} else {
+				readers = append(readers, label)
+			}
+		}
+		if len(writers) == 0 && len(readers) == 0 {
+			continue
+		}
+		any = true
+		fmt.Fprintf(&b, "  %s:", sn.Name)
+		if len(writers) > 0 {
+			sort.Strings(writers)
+			fmt.Fprintf(&b, " written by %s;", strings.Join(writers, ", "))
+		}
+		if len(readers) > 0 {
+			sort.Strings(readers)
+			fmt.Fprintf(&b, " read by %s", strings.Join(readers, ", "))
+		}
+		b.WriteString("\n")
+	}
+	if !any {
+		return ""
+	}
+	return b.String()
 }
 
 // blastCommonBasenames are file names that repeat across every project by
@@ -940,6 +1015,9 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 	} else {
 		fmt.Fprintf(&b, "\ntotal affected: %d node(s) within depth %d\n", total, depth)
 	}
+	if n.Type == graph.NodeFunction {
+		b.WriteString(e.sharedStateText(n.ID))
+	}
 	return b.String(), nil
 }
 
@@ -1116,4 +1194,207 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	return b.String(), nil
 }
 
+// docInlineCodeRe, docIdentLikeRe and docHTTPVerbTokens mirror the mining
+// regexes/filters the codebase connector uses to extract inline-code
+// references from markdown (see codebase.parseMarkdown / isLikelyNonSymbolToken);
+// duplicated here so DocDrift can re-mine a doc's current text without the
+// engine package depending on tree-sitter.
+var (
+	docInlineCodeRe  = regexp.MustCompile("`([^`\n]{1,80})`")
+	docIdentLikeRe   = regexp.MustCompile(`^[A-Za-z_][\w./-]*$`)
+	docHTTPVerbToken = map[string]bool{
+		"GET": true, "POST": true, "PUT": true, "DELETE": true,
+		"PATCH": true, "HEAD": true, "OPTIONS": true,
+	}
+)
 
+// docLikelyNonSymbolToken mirrors codebase.isLikelyNonSymbolToken: excludes
+// directory paths, HTTP verbs, and SCREAMING_SNAKE_CASE env vars/constants
+// from being treated as a candidate symbol reference — prose in backticks
+// that was never meant to resolve, not an actual broken reference.
+func docLikelyNonSymbolToken(tok string) bool {
+	if strings.HasSuffix(tok, "/") {
+		return true
+	}
+	if docHTTPVerbToken[tok] {
+		return true
+	}
+	if strings.Contains(tok, "_") && tok == strings.ToUpper(tok) {
+		return true
+	}
+	return false
+}
+
+// mineDocTokens re-extracts the inline-code tokens a doc currently contains,
+// skipping fenced code blocks, the same way the codebase connector does at
+// extract time. Used to detect tokens that no longer resolve to anything.
+func mineDocTokens(data []byte) []string {
+	var tokens []string
+	inFence := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || len(tokens) >= 100 {
+			continue
+		}
+		for _, m := range docInlineCodeRe.FindAllStringSubmatch(line, -1) {
+			tok := strings.TrimSuffix(strings.TrimSpace(m[1]), "()")
+			if len(tok) >= 3 && docIdentLikeRe.MatchString(tok) && !docLikelyNonSymbolToken(tok) {
+				tokens = append(tokens, tok)
+			}
+		}
+	}
+	return tokens
+}
+
+// DocDrift reports markdown docs whose inline-code references either no
+// longer resolve in the graph (broken — the connector's mining/resolution
+// pass, mirrored by mineDocTokens, dropped them) or resolve to code that was
+// last touched, per git, after the doc itself was (stale). Staleness needs a
+// git checkout; outside one, only broken references are reported.
+func (e *Engine) DocDrift(limit int) (string, error) {
+	if !e.IsCodebase() {
+		return "", fmt.Errorf("doc drift needs a codebase graph")
+	}
+	if limit <= 0 {
+		limit = 15
+	}
+	dir := strings.TrimPrefix(e.G.Source, "codebase:")
+	hasGit := false
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		hasGit = true
+	}
+	commitCache := map[string]int64{}
+	lastCommit := func(relPath string) int64 {
+		if !hasGit {
+			return 0
+		}
+		if t, ok := commitCache[relPath]; ok {
+			return t
+		}
+		out, err := exec.Command("git", "-C", dir, "log", "-1", "--format=%at", "--", relPath).Output()
+		var t int64
+		if err == nil {
+			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &t)
+		}
+		commitCache[relPath] = t
+		return t
+	}
+
+	type drift struct {
+		name   string
+		broken []string
+		stale  []string
+	}
+	var drifted []drift
+
+	for id, n := range e.G.Nodes {
+		if !strings.HasPrefix(id, "doc:") {
+			continue
+		}
+		relPath := n.Attrs["file"]
+		if relPath == "" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, relPath))
+		if err != nil {
+			continue
+		}
+		resolved := map[string]bool{}
+		for _, tok := range strings.Fields(n.Attrs["mentions_resolved"]) {
+			resolved[tok] = true
+		}
+
+		var d drift
+		d.name = relPath
+		seen := map[string]bool{}
+		for _, tok := range mineDocTokens(data) {
+			if seen[tok] {
+				continue
+			}
+			seen[tok] = true
+			if !resolved[tok] {
+				d.broken = append(d.broken, tok)
+			}
+		}
+
+		if hasGit {
+			docTime := lastCommit(relPath)
+			staleSeen := map[string]bool{}
+			for _, ed := range e.G.EdgesOf(id) {
+				if ed.Type != graph.EdgeMentions || ed.From != id {
+					continue
+				}
+				tn := e.G.Nodes[ed.To]
+				if tn == nil {
+					continue
+				}
+				targetPath := tn.Attrs["file"]
+				if targetPath == "" && tn.Type == graph.NodeFile {
+					targetPath = tn.Name
+				}
+				if targetPath == "" || staleSeen[targetPath] {
+					continue
+				}
+				staleSeen[targetPath] = true
+				if t := lastCommit(targetPath); t > docTime && docTime > 0 {
+					d.stale = append(d.stale, targetPath)
+				}
+			}
+		}
+
+		if len(d.broken) > 0 || len(d.stale) > 0 {
+			sort.Strings(d.broken)
+			sort.Strings(d.stale)
+			drifted = append(drifted, d)
+		}
+	}
+
+	if len(drifted) == 0 {
+		if hasGit {
+			return "no doc drift found — every inline reference resolves and no referenced code outdates its doc\n", nil
+		}
+		return "no broken doc references found (no git checkout — staleness not checked)\n", nil
+	}
+
+	sort.Slice(drifted, func(i, j int) bool {
+		ci := len(drifted[i].broken) + len(drifted[i].stale)
+		cj := len(drifted[j].broken) + len(drifted[j].stale)
+		if ci != cj {
+			return ci > cj
+		}
+		return drifted[i].name < drifted[j].name
+	})
+	if len(drifted) > limit {
+		drifted = drifted[:limit]
+	}
+
+	anyStale := false
+	for _, d := range drifted {
+		if len(d.stale) > 0 {
+			anyStale = true
+			break
+		}
+	}
+
+	var b strings.Builder
+	if !hasGit {
+		b.WriteString("no git checkout found — staleness not checked, only broken references below\n\n")
+	}
+	if anyStale {
+		b.WriteString("note: \"stale\" compares git COMMIT dates, not working-tree mtimes — an uncommitted rewrite of the doc itself still looks stale against any committed code, since git can't see it yet. Commit the doc (or judge staleness yourself) before trusting this list on a doc you just edited.\n\n")
+	}
+	fmt.Fprintf(&b, "%d doc(s) with drift:\n", len(drifted))
+	for _, d := range drifted {
+		fmt.Fprintf(&b, "\n%s\n", d.name)
+		if len(d.broken) > 0 {
+			fmt.Fprintf(&b, "  broken: %s\n", strings.Join(d.broken, ", "))
+		}
+		if len(d.stale) > 0 {
+			fmt.Fprintf(&b, "  stale — changed after this doc: %s\n", strings.Join(d.stale, ", "))
+		}
+	}
+	return b.String(), nil
+}

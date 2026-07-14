@@ -73,6 +73,14 @@ func main() {
 		err = cmdBlast(ctx, os.Args[2:])
 	case "doc-drift", "docdrift":
 		err = cmdDocDrift(ctx, os.Args[2:])
+	case "grep":
+		err = cmdGrep(ctx, os.Args[2:])
+	case "tree":
+		err = cmdTree(ctx, os.Args[2:])
+	case "routes":
+		err = cmdRoutes(ctx, os.Args[2:])
+	case "diff":
+		err = cmdDiff(ctx, os.Args[2:])
 	case "code-query", "codequery":
 		err = cmdCodeQuery(ctx, os.Args[2:])
 	case "path":
@@ -123,7 +131,12 @@ query it (graphify-style):
   gatt search "<text>"             semantic search over all nodes [--type table|column|...]
   gatt impact <function>           transitive callers: what breaks on a signature change [--depth N]
   gatt blast <file-or-function>    blast radius of any node: callers + importers + generated copies [--depth N]
-  gatt doc-drift                   docs whose code references broke or went stale (needs git for staleness)
+  gatt doc-drift                   docs whose code references broke or went stale (needs git for staleness;
+                                      staleness is by commit date, not working-tree mtime)
+  gatt grep <pattern>              exhaustive literal search across every file — a proof of absence, not top-N [--regex] [--limit N]
+  gatt tree [path]                 directory tree annotated with each file's doc summary [--depth N]
+  gatt routes [--file substr]      HTTP routes detected in code (Express-style JS/TS): method, path, handler, middleware
+  gatt diff [ref]                  structural diff vs a git ref (default HEAD): added/removed/changed/renamed/moved functions & types, plus current callers [--limit N]
   gatt path <tableA> <tableB>      cheapest FK join path with exact columns
   gatt explain <table|column>      one node in full: attrs + relationships
   gatt overview                    all tables, counts, references
@@ -946,6 +959,113 @@ func cmdDocDrift(ctx context.Context, args []string) error {
 		return err
 	}
 	out, err := e.DocDrift(*limit)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdGrep prints an exhaustive literal/regex match list across every file in
+// the codebase root — unlike search/find (semantic, top-N), a zero-result
+// answer here is a reliable proof of absence.
+func cmdGrep(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: gatt grep <pattern> [--regex] [--limit N]")
+	}
+	pattern := args[0]
+	fs := flag.NewFlagSet("grep", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	useRegex := fs.Bool("regex", false, "treat pattern as a case-insensitive regex")
+	limit := fs.Int("limit", 50, "max matches to display (the total count is always exact)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.Grep(pattern, *useRegex, *limit)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdTree prints a directory tree of the codebase, one file per line,
+// annotated with its doc summary — a scan of repo structure without an
+// ls+Read round-trip per file.
+func cmdTree(ctx context.Context, args []string) error {
+	var path string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		path = args[0]
+		args = args[1:]
+	}
+	fs := flag.NewFlagSet("tree", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	depth := fs.Int("depth", 0, "max path segments deep to print, 0 = unlimited")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.Tree(path, *depth)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdRoutes prints every HTTP route detected in the codebase (Express-style
+// JS/TS/JSX router/app.METHOD registrations): method, path, handler, and
+// middleware chain.
+func cmdRoutes(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("routes", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	file := fs.String("file", "", "only routes in files whose path contains this substring")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.Routes(*file)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdDiff prints the structural diff between the working tree and a git ref
+// (default HEAD): added/removed/changed/renamed/moved functions and types,
+// plus the current callers of anything that changed.
+func cmdDiff(ctx context.Context, args []string) error {
+	var ref string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		ref = args[0]
+		args = args[1:]
+	}
+	fs := flag.NewFlagSet("diff", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	limit := fs.Int("limit", 30, "max changes to display")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.CodeDiff(ctx, ref, *limit)
 	if err != nil {
 		return err
 	}

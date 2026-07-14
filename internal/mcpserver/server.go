@@ -150,6 +150,26 @@ type docDriftIn struct {
 	Limit int `json:"limit,omitempty" jsonschema:"max docs to report, default 15"`
 }
 
+type grepIn struct {
+	Pattern string `json:"pattern" jsonschema:"literal text (default) or regex (with regex=true) to search for"`
+	Regex   bool   `json:"regex,omitempty" jsonschema:"treat pattern as a case-insensitive regex instead of a literal substring"`
+	Limit   int    `json:"limit,omitempty" jsonschema:"max matches to display, default 50 (the reported total count is always exact)"`
+}
+
+type treeIn struct {
+	Path  string `json:"path,omitempty" jsonschema:"relative path to scope the tree to, e.g. internal/engine; omit for the whole repo"`
+	Depth int    `json:"depth,omitempty" jsonschema:"max path segments deep to print, 0 (default) = unlimited"`
+}
+
+type routesIn struct {
+	File string `json:"file,omitempty" jsonschema:"only routes in files whose path contains this substring"`
+}
+
+type codeDiffIn struct {
+	Ref   string `json:"ref,omitempty" jsonschema:"git ref to diff against, default HEAD"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max changes to display, default 30"`
+}
+
 type annotateIn struct {
 	Node          string `json:"node" jsonschema:"table/column/schema name or node id to annotate"`
 	EntityNote    string `json:"entity_note,omitempty" jsonschema:"free-text business definition of the entity (what it canonically means, edge cases)"`
@@ -191,7 +211,7 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "impact",
-		Description: "Transitive callers of a function up to N levels — call BEFORE changing any function signature or behavior to see everything that breaks. Codebase graphs only. Direct callers first, then each depth level, test callers tagged [test].",
+		Description: "Transitive callers of a function up to N levels — call BEFORE changing any function signature or behavior to see everything that breaks. Codebase graphs only. Direct callers first, then each depth level, test callers tagged [test]. Also lists any shared mutable state (a singleton property this function reads/writes, e.g. config.session) and the other functions touching it — a data-flow signal CALLS alone can't see (heuristic, JS/TS/JSX only, v1).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in impactIn) (*mcp.CallToolResult, any, error) {
 		note := s.autoRefreshCodebase(ctx)
 		e, err := s.requireEngine()
@@ -207,7 +227,7 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "blast",
-		Description: "Blast radius of modifying ANY node — a file (including JSON/YAML/SQL/CSS data files), function, or type. Superset of impact: walks transitive callers, file importers, REFERENCES, and forward GENERATES edges (outputs regenerated from the target); warns when the target is itself generated; lists same-basename copies flagged [identical]/[diverged] by content hash; and shows git co-change companions — files with no static edge that historically ship in the same commits (stylesheets, docs, e2e tests, i18n). Call before editing shared config/schema files or any widely-imported module. Codebase graphs only.",
+		Description: "Blast radius of modifying ANY node — a file (including JSON/YAML/SQL/CSS data files), function, or type. Superset of impact: walks transitive callers, file importers, REFERENCES, and forward GENERATES edges (outputs regenerated from the target); warns when the target is itself generated; lists same-basename copies flagged [identical]/[diverged] by content hash; shows git co-change companions — files with no static edge that historically ship in the same commits (stylesheets, docs, e2e tests, i18n); and, for a function target, any shared mutable state it reads/writes and who else touches it (heuristic, JS/TS/JSX only, v1). Call before editing shared config/schema files or any widely-imported module. Codebase graphs only.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in blastIn) (*mcp.CallToolResult, any, error) {
 		note := s.autoRefreshCodebase(ctx)
 		e, err := s.requireEngine()
@@ -223,7 +243,7 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "doc_drift",
-		Description: "Which documentation lies: markdown docs whose inline code references (`funcName`, `path/file.ts`) either no longer resolve in the graph (broken) or point at code that changed after the doc's last commit (stale). Run before trusting a doc, and after refactors to list docs needing an update. Codebase graphs only; staleness needs git history.",
+		Description: "Which documentation lies: markdown docs whose inline code references (`funcName`, `path/file.ts`) either no longer resolve in the graph (broken) or point at code that changed after the doc's last commit (stale). Run before trusting a doc, and after refactors to list docs needing an update. Staleness compares git COMMIT dates, not working-tree mtimes — an uncommitted rewrite of the doc itself still looks stale against committed code until you commit it. `broken` can include non-symbol prose in backticks (table/queue names, env vars, HTTP verbs, external packages) that was never meant to resolve — use judgment. Codebase graphs only; staleness needs git history.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in docDriftIn) (*mcp.CallToolResult, any, error) {
 		note := s.autoRefreshCodebase(ctx)
 		e, err := s.requireEngine()
@@ -231,6 +251,70 @@ func (s *Server) register() {
 			return nil, nil, err
 		}
 		out, err := e.DocDrift(in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "grep",
+		Description: "Exhaustive literal (or regex) search across EVERY file in the codebase root, using the same skip rules as extraction (.git, node_modules, vendor, hidden dirs). Unlike find_entities, which is fuzzy/semantic and only ranks top-N nodes already in the graph, this is a full walk: a zero-match answer is a reliable proof that a string does not occur anywhere in the codebase. Use it to confirm absence, or to find literal text find_entities might rank low (raw strings, log messages, config keys). Codebase graphs only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in grepIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Grep(in.Pattern, in.Regex, in.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "tree",
+		Description: "Directory tree of the codebase, one file per line, annotated with each file's doc summary (its leading file/package comment, a markdown doc's title, or its earliest function's doc). The graph has no directory nodes, so this is synthesized from file paths. Use before ls+Read-ing a directory by hand to get oriented on structure. Codebase graphs only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in treeIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Tree(in.Path, in.Depth)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "routes",
+		Description: "Every HTTP route detected in the codebase: method, path, handler (with file:line), and middleware chain in order. Detects Express-style JS/TS/JSX router/app.get|post|put|delete|patch|all|use(...) registrations — v1 scope, no Go/Python route frameworks yet. Codebase graphs only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in routesIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Routes(in.File)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "code_diff",
+		Description: "Structural diff of the working tree against a git ref (default HEAD): added/removed/changed/renamed/moved functions and types, detected by matching signatures across two extractions — NOT a textual diff. For anything changed/renamed/moved, also lists its current callers so you know who needs to review the change. Use to answer 'what changed structurally since HEAD/a commit' without reasoning through `git log -p` by hand. Codebase graphs only; needs a git checkout.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in codeDiffIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.CodeDiff(ctx, in.Ref, in.Limit)
 		if err != nil {
 			return nil, nil, err
 		}

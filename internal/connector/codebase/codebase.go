@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -18,6 +19,7 @@ import (
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
+	"github.com/smacker/go-tree-sitter/javascript"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/rust"
 	"github.com/smacker/go-tree-sitter/typescript/typescript"
@@ -34,6 +36,17 @@ type Connector struct {
 	// pendingMentions collects code tokens found in each parsed markdown doc,
 	// resolved against the finished graph by wireMentions.
 	pendingMentions []docMentions
+	// pendingRoutes collects HTTP route registrations found while parsing,
+	// resolved against the finished function index by wireRoutes.
+	pendingRoutes []routeInfo
+	// gitFiles caches the git-ls-files-based non-ignored file set (relative
+	// paths, gatt's own .gatt/gatt-out always excluded regardless of the
+	// target repo's own .gitignore) — see gitFileSet. Computed lazily, once
+	// per Connector; gitFilesOK is false when c.dir isn't a git checkout (or
+	// the command failed), meaning callers fall back to SkipDir-only walking.
+	gitFiles      map[string]bool
+	gitFilesOK    bool
+	gitFilesKnown bool
 }
 
 // docMentions holds the candidate code references extracted from one doc.
@@ -61,7 +74,8 @@ func New(dir string) *Connector {
 
 // parseableExts are the file extensions the extractor understands.
 var parseableExts = map[string]bool{
-	".go": true, ".ts": true, ".tsx": true, ".py": true, ".rs": true, ".md": true,
+	".go": true, ".ts": true, ".tsx": true, ".js": true, ".jsx": true,
+	".py": true, ".rs": true, ".md": true,
 }
 
 // dataExts are data/config/style files indexed as plain file nodes (no
@@ -99,11 +113,11 @@ func (c *Connector) Name() string { return "codebase" }
 type funcInfo struct {
 	id          string
 	name        string
-	file        string  // relative path
+	file        string // relative path
 	lineStart   int
 	lineEnd     int
 	signature   string
-	receiverDef string  // definition node id this is a method of (Go), or ""
+	receiverDef string   // definition node id this is a method of (Go), or ""
 	calls       []string // raw called names (resolved in second pass)
 }
 
@@ -117,6 +131,7 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	funcs, funcsByName := c.parseFiles(ctx, g)
 	resolveAndWire(g, funcs, funcsByName)
 	c.wireMentions(g)
+	c.wireRoutes(g, funcsByName)
 	c.mineGitCoChanges(ctx, g)
 
 	return g, nil
@@ -124,16 +139,19 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 
 // scanFiles walks the tree with the same skip rules as parseFiles and returns
 // relPath → mtime (UnixNano) for every parseable file. Cheap: stat only.
+// When c.dir is a git checkout, gitignored files/directories are additionally
+// excluded via gitFileSet (SkipDir alone only knows a fixed list of common
+// build-output names — dist, build, node_modules, ... — while a repo's own
+// .gitignore is the authoritative, project-specific answer).
 func (c *Connector) scanFiles() map[string]string {
+	gitFiles, gitOK := c.gitFileSet()
 	out := map[string]string{}
 	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			isHidden := strings.HasPrefix(name, ".") && path != c.dir
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
+			if graph.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -142,6 +160,9 @@ func (c *Connector) scanFiles() map[string]string {
 			return nil
 		}
 		rel, _ := filepath.Rel(c.dir, path)
+		if gitOK && !gitFiles[rel] {
+			return nil
+		}
 		if info, err := d.Info(); err == nil {
 			out[rel] = fmt.Sprint(info.ModTime().UnixNano())
 		}
@@ -302,6 +323,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	}
 	resolveAndWire(prev, newFuncs, funcsByName)
 	c.wireMentions(prev)
+	c.wireRoutes(prev, funcsByName)
 
 	// Calls from *unchanged* files may now have a target that didn't exist at
 	// their extract time: re-resolve their persisted raw call names against
@@ -476,23 +498,29 @@ func (c *Connector) generatesPairs() [][2]string {
 
 // detectProjects walks the repo looking for project manifest files.
 func (c *Connector) detectProjects(g *graph.Graph) {
+	gitFiles, gitOK := c.gitFileSet()
+	tracked := func(dir, manifest string) bool {
+		if !gitOK {
+			return true
+		}
+		rel, _ := filepath.Rel(c.dir, filepath.Join(dir, manifest))
+		return gitFiles[rel]
+	}
 	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			isHidden := strings.HasPrefix(name, ".") && path != c.dir
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
+			if graph.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
-			if _, e := os.Stat(filepath.Join(path, "go.mod")); e == nil {
+			if _, e := os.Stat(filepath.Join(path, "go.mod")); e == nil && tracked(path, "go.mod") {
 				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Go)"})
-			} else if _, e := os.Stat(filepath.Join(path, "package.json")); e == nil {
+			} else if _, e := os.Stat(filepath.Join(path, "package.json")); e == nil && tracked(path, "package.json") {
 				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (NPM)"})
-			} else if _, e := os.Stat(filepath.Join(path, "pyproject.toml")); e == nil {
+			} else if _, e := os.Stat(filepath.Join(path, "pyproject.toml")); e == nil && tracked(path, "pyproject.toml") {
 				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Python)"})
-			} else if _, e := os.Stat(filepath.Join(path, "Cargo.toml")); e == nil {
+			} else if _, e := os.Stat(filepath.Join(path, "Cargo.toml")); e == nil && tracked(path, "Cargo.toml") {
 				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Rust)"})
 			}
 		}
@@ -504,7 +532,7 @@ func (c *Connector) detectProjects(g *graph.Graph) {
 }
 
 type langConfig struct {
-	lang     *sitter.Language
+	lang *sitter.Language
 	// queryStr captures: def.name, func.name, call.func, import.path, method.receiver
 	// Line ranges come from navigating cap.Node.Parent() to the declaration node.
 	queryStr string
@@ -525,6 +553,7 @@ func langFor(ext string) *langConfig {
 			(call_expression function: (identifier) @call.func)
 			(call_expression function: (selector_expression field: (field_identifier) @call.sel))
 			(import_spec path: (interpreted_string_literal) @import.path)
+			(comment) @loose.comment
 			`,
 		}
 	case ".ts", ".tsx":
@@ -539,6 +568,96 @@ func langFor(ext string) *langConfig {
 			(call_expression function: (identifier) @call.func)
 			(call_expression function: (member_expression property: (property_identifier) @call.sel))
 			(import_statement source: (string) @import.path)
+			(comment) @loose.comment
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @route.obj
+			    property: (property_identifier) @route.method)
+			  arguments: (arguments . (string) @route.path)) @route.call
+			(import_statement
+			  (import_clause
+			    (named_imports
+			      (import_specifier name: (identifier) @state.import_name)))
+			  source: (string) @state.import_src)
+			(variable_declarator
+			  name: (identifier) @state.import_name
+			  value: (call_expression
+			    function: (identifier) @state.require_fn
+			    arguments: (arguments (string) @state.import_src)))
+			(assignment_expression
+			  left: (member_expression
+			    object: (identifier) @state.write_obj
+			    property: (property_identifier) @state.write_prop)) @state.write
+			(assignment_expression
+			  left: (member_expression
+			    object: (member_expression
+			      object: (identifier) @state.write2_obj
+			      property: (property_identifier) @state.write2_prop)
+			    property: (property_identifier) @state.write2_sub)) @state.write2
+			(member_expression
+			  object: (identifier) @state.read_obj
+			  property: (property_identifier) @state.read_prop) @state.read
+			(variable_declarator name: (identifier) @const.name) @const.decl
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @oa.obj
+			    property: (property_identifier) @oa.prop)
+			  arguments: (arguments
+			    . (member_expression
+			        object: (identifier) @state.oa_target_obj
+			        property: (property_identifier) @state.oa_target_prop))) @oa.call
+			`,
+		}
+	case ".js", ".jsx":
+		return &langConfig{
+			lang: javascript.GetLanguage(),
+			queryStr: `
+			(class_declaration name: (identifier) @def.name)
+			(function_declaration name: (identifier) @func.name)
+			(method_definition name: (property_identifier) @func.name)
+			(variable_declarator name: (identifier) @func.name value: (arrow_function))
+			(variable_declarator name: (identifier) @func.name value: (function_expression))
+			(call_expression function: (identifier) @call.func)
+			(call_expression function: (member_expression property: (property_identifier) @call.sel))
+			(import_statement source: (string) @import.path)
+			(comment) @loose.comment
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @route.obj
+			    property: (property_identifier) @route.method)
+			  arguments: (arguments . (string) @route.path)) @route.call
+			(import_statement
+			  (import_clause
+			    (named_imports
+			      (import_specifier name: (identifier) @state.import_name)))
+			  source: (string) @state.import_src)
+			(variable_declarator
+			  name: (identifier) @state.import_name
+			  value: (call_expression
+			    function: (identifier) @state.require_fn
+			    arguments: (arguments (string) @state.import_src)))
+			(assignment_expression
+			  left: (member_expression
+			    object: (identifier) @state.write_obj
+			    property: (property_identifier) @state.write_prop)) @state.write
+			(assignment_expression
+			  left: (member_expression
+			    object: (member_expression
+			      object: (identifier) @state.write2_obj
+			      property: (property_identifier) @state.write2_prop)
+			    property: (property_identifier) @state.write2_sub)) @state.write2
+			(member_expression
+			  object: (identifier) @state.read_obj
+			  property: (property_identifier) @state.read_prop) @state.read
+			(variable_declarator name: (identifier) @const.name) @const.decl
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @oa.obj
+			    property: (property_identifier) @oa.prop)
+			  arguments: (arguments
+			    . (member_expression
+			        object: (identifier) @state.oa_target_obj
+			        property: (property_identifier) @state.oa_target_prop))) @oa.call
 			`,
 		}
 	case ".py":
@@ -551,6 +670,7 @@ func langFor(ext string) *langConfig {
 			(call function: (attribute attribute: (identifier) @call.sel))
 			(import_statement name: (dotted_name) @import.path)
 			(import_from_statement module_name: (dotted_name) @import.path)
+			(comment) @loose.comment
 			`,
 		}
 	case ".rs":
@@ -562,10 +682,36 @@ func langFor(ext string) *langConfig {
 			(call_expression function: (identifier) @call.func)
 			(call_expression function: (field_expression field: (field_identifier) @call.sel))
 			(use_declaration argument: (scoped_identifier) @import.path)
+			(line_comment) @loose.comment
+			(block_comment) @loose.comment
 			`,
 		}
 	}
 	return nil
+}
+
+// isTopLevelDeclarator reports whether a variable_declarator sits directly
+// in a module-scope declaration — `const x = ...` (optionally exported) at
+// the top of the file, not nested in any function/block. This is what keeps
+// the const.decl capture (see langFor's TS/JS queryStr) from flooding the
+// graph with every local variable in every function — only module-level
+// bindings (config objects, lookup tables, queue/route definitions) become
+// nodes.
+func isTopLevelDeclarator(n *sitter.Node) bool {
+	decl := n.Parent()
+	if decl == nil {
+		return false
+	}
+	switch decl.Type() {
+	case "lexical_declaration", "variable_declaration":
+	default:
+		return false
+	}
+	p := decl.Parent()
+	if p != nil && p.Type() == "export_statement" {
+		p = p.Parent()
+	}
+	return p != nil && p.Type() == "program"
 }
 
 // declarationRange returns the (lineStart, lineEnd) of the declaration that
@@ -632,13 +778,20 @@ func buildSignature(name string, nameNode *sitter.Node, src []byte) string {
 // docComment returns the comment block immediately preceding the declaration
 // that contains nameNode (Go/TS/Rust style), or the leading docstring for
 // Python function bodies. Trimmed to 300 chars — used for semantic embedding.
-func docComment(nameNode *sitter.Node, src []byte) string {
+// Every source line it consumes (the comment block itself; a Python
+// docstring isn't a comment node so nothing to mark there) is recorded in
+// consumed so the loose-comment pass doesn't re-emit it as a floating
+// comment; consumed may be nil to skip tracking.
+func docComment(nameNode *sitter.Node, src []byte, consumed map[int]bool) string {
 	decl := nameNode.Parent()
 	for decl != nil {
 		switch decl.Type() {
 		case "function_declaration", "method_declaration", "type_declaration",
 			"function_definition", "fn_item", "method_definition", "method",
-			"class_declaration", "class_definition", "struct_item":
+			"class_declaration", "class_definition", "struct_item",
+			// const x = () => {…} / export const x = {…}: the doc comment
+			// precedes the declarator, same as any other declaration.
+			"variable_declarator":
 		default:
 			decl = decl.Parent()
 			continue
@@ -668,11 +821,8 @@ func docComment(nameNode *sitter.Node, src []byte) string {
 			if below.StartPoint().Row-sib.EndPoint().Row > 1 {
 				break
 			}
-			text := sib.Content(src)
-			text = strings.TrimPrefix(text, "//")
-			text = strings.TrimPrefix(text, "/*")
-			text = strings.TrimSuffix(text, "*/")
-			lines = append([]string{strings.TrimSpace(text)}, lines...)
+			lines = append([]string{stripCommentMarkers(sib.Content(src))}, lines...)
+			markConsumedLines(sib, consumed)
 			below = sib
 		}
 	}
@@ -682,6 +832,152 @@ func docComment(nameNode *sitter.Node, src []byte) string {
 		doc = doc[:300]
 	}
 	return doc
+}
+
+// stripCommentMarkers removes the // or /* */ delimiters from a comment
+// node's raw content, leaving the trimmed text.
+func stripCommentMarkers(text string) string {
+	text = strings.TrimPrefix(text, "//")
+	text = strings.TrimPrefix(text, "/*")
+	text = strings.TrimSuffix(text, "*/")
+	return strings.TrimSpace(text)
+}
+
+// markConsumedLines records every source line (1-indexed, inclusive) node
+// spans into consumed. Used to tell the loose-comment pass "this comment was
+// already surfaced as a declaration's doc — don't emit it again". consumed
+// may be nil, in which case this is a no-op.
+func markConsumedLines(node *sitter.Node, consumed map[int]bool) {
+	if consumed == nil {
+		return
+	}
+	for row := int(node.StartPoint().Row) + 1; row <= int(node.EndPoint().Row)+1; row++ {
+		consumed[row] = true
+	}
+}
+
+// leadingFileDoc returns the file-level doc comment: a comment block at the
+// very top of the file (Go package comment, JS/TS/Rust file header) or, for
+// Python, the module docstring (a bare string as the file's first
+// statement). Trimmed to 300 chars, same cap as docComment. Used to annotate
+// `gatt tree` output when a file has no other summary to show. consumed
+// tracks which lines it consumed, same contract as docComment.
+func leadingFileDoc(root *sitter.Node, src []byte, consumed map[int]bool) string {
+	if root == nil || root.NamedChildCount() == 0 {
+		return ""
+	}
+	first := root.NamedChild(0)
+
+	if first.Type() == "expression_statement" {
+		if s := first.NamedChild(0); s != nil && s.Type() == "string" {
+			doc := strings.Trim(s.Content(src), "\"' \n")
+			if len(doc) > 300 {
+				doc = doc[:300]
+			}
+			return doc
+		}
+	}
+
+	if !strings.Contains(first.Type(), "comment") {
+		return ""
+	}
+	var lines []string
+	for node := first; node != nil && strings.Contains(node.Type(), "comment"); node = node.NextNamedSibling() {
+		lines = append(lines, stripCommentMarkers(node.Content(src)))
+		markConsumedLines(node, consumed)
+	}
+	doc := strings.TrimSpace(strings.Join(lines, " "))
+	if len(doc) > 300 {
+		doc = doc[:300]
+	}
+	return doc
+}
+
+// looseCommentMinChars is the minimum trimmed length a floating comment
+// needs to be worth its own graph node — filters `// TODO` and similar
+// one-word markers, keeping the substantive "why" blocks.
+const looseCommentMinChars = 30
+
+// emitLooseComments adds a NodeComment for every substantive comment in
+// comments that docComment/leadingFileDoc didn't already consume as a
+// declaration's or the file's doc. Contiguous single-line (`//`) comments —
+// each its own AST node — are merged into one logical block first, the same
+// way docComment merges a leading comment run; a block comment (`/* */`) is
+// already a single node. Each comment is attributed to its enclosing
+// function by line range (funcs, same technique as call-site attribution)
+// when it falls inside one.
+func emitLooseComments(g *graph.Graph, comments []*sitter.Node, consumed map[int]bool, funcs []funcInfo, relPath, fileID string, src []byte) {
+	if len(comments) == 0 {
+		return
+	}
+	sort.Slice(comments, func(i, j int) bool {
+		return comments[i].StartPoint().Row < comments[j].StartPoint().Row
+	})
+
+	type block struct {
+		startLine, endLine int
+		text               string
+	}
+	var blocks []block
+	for _, cn := range comments {
+		startLine := int(cn.StartPoint().Row) + 1
+		endLine := int(cn.EndPoint().Row) + 1
+		alreadyConsumed := false
+		for l := startLine; l <= endLine; l++ {
+			if consumed[l] {
+				alreadyConsumed = true
+				break
+			}
+		}
+		if alreadyConsumed {
+			continue
+		}
+		text := stripCommentMarkers(cn.Content(src))
+		if last := len(blocks) - 1; last >= 0 && startLine-blocks[last].endLine <= 1 {
+			blocks[last].text += " " + text
+			blocks[last].endLine = endLine
+		} else {
+			blocks = append(blocks, block{startLine, endLine, text})
+		}
+	}
+
+	for _, bl := range blocks {
+		text := strings.TrimSpace(bl.text)
+		if len(text) < looseCommentMinChars {
+			continue
+		}
+		if len(text) > 400 {
+			text = text[:400]
+		}
+		name := text
+		if len(name) > 60 {
+			name = name[:60] + "…"
+		}
+		id := fmt.Sprintf("comment:%s:%d", relPath, bl.startLine)
+		g.AddNode(&graph.Node{
+			ID:   id,
+			Type: graph.NodeComment,
+			Name: name,
+			Attrs: map[string]string{
+				"file": relPath,
+				"line": fmt.Sprint(bl.startLine),
+				"text": text,
+			},
+		})
+		g.AddEdge(id, fileID, graph.EdgeBelongsTo, nil)
+
+		bestIdx := -1
+		for i := range funcs {
+			if funcs[i].file == relPath && funcs[i].lineStart <= bl.startLine {
+				if bestIdx == -1 || funcs[i].lineStart > funcs[bestIdx].lineStart {
+					bestIdx = i
+				}
+			}
+		}
+		if bestIdx >= 0 && funcs[bestIdx].lineEnd >= bl.startLine {
+			g.AddEdge(id, funcs[bestIdx].id, graph.EdgeBelongsTo, nil)
+		}
+	}
 }
 
 // isGenerated reports whether the source carries a generated-code marker in
@@ -732,30 +1028,30 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	// Pre-compile queries for all supported extensions once.
 	// NewQuery is not safe to call in a tight loop inside WalkDir callbacks.
 	compiledLangs := map[string]*langConfig{}
-	for _, ext := range []string{".go", ".ts", ".tsx", ".py", ".rs"} {
+	for _, ext := range []string{".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs"} {
 		lc := langFor(ext)
 		if lc == nil {
 			continue
 		}
 		q, err := sitter.NewQuery([]byte(lc.queryStr), lc.lang)
 		if err != nil {
-			// Log and skip this language.
+			// A bad query silently produces an empty graph for this whole
+			// language otherwise (every file of this ext is then skipped by
+			// `lc := compiledLangs[ext]; if lc == nil { return nil }` below)
+			// — surface it instead of failing quiet.
+			fmt.Fprintf(os.Stderr, "gatt: %s query failed to compile, skipping: %v\n", ext, err)
 			continue
 		}
 		lc.query = q
 		compiledLangs[ext] = lc
 	}
 
+	gitFiles, gitOK := c.gitFileSet()
+
 	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
-			if d != nil && d.IsDir() {
-				name := d.Name()
-				// Skip hidden dirs, but NOT the root dir itself (which may be "." when
-				// invoked as `gatt extract codebase .`).
-				isHidden := strings.HasPrefix(name, ".") && path != c.dir
-				if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
-					return filepath.SkipDir
-				}
+			if d != nil && d.IsDir() && graph.SkipDir(d.Name(), path == c.dir) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
@@ -763,6 +1059,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		ext := filepath.Ext(d.Name())
 		relPath, _ := filepath.Rel(c.dir, path)
 		if c.only != nil && !c.only[relPath] {
+			return nil
+		}
+		if gitOK && !gitFiles[relPath] {
 			return nil
 		}
 		projID := findProject(g, path, c.dir)
@@ -833,6 +1132,18 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			return nil
 		}
 
+		// consumed tracks which source lines were already surfaced as a
+		// declaration's doc comment (or the file's leading doc), so the
+		// loose-comment pass below doesn't re-emit them as floating comments.
+		consumed := map[int]bool{}
+
+		// fileAttrs is the same map the file node's Attrs already points at
+		// (AddNode stores it by reference), so this mutation is visible on
+		// the node already committed to the graph above.
+		if doc := leadingFileDoc(tree.RootNode(), data, consumed); doc != "" {
+			fileAttrs["file_doc"] = doc
+		}
+
 		qc := sitter.NewQueryCursor()
 		qc.Exec(lc.query, tree.RootNode())
 
@@ -842,6 +1153,20 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// pendingReceiver: for Go, receiver arrives in the same match as func.name
 		// via the method.receiver capture.
 		pendingReceiver := ""
+
+		// looseComments is deferred until the whole file has been walked: a
+		// comment's own query match can be yielded before the declaration
+		// match that consumes it (they're separate patterns in the same
+		// query), so `consumed` isn't complete until the loop below ends.
+		var looseComments []*sitter.Node
+
+		// singletons maps a named-import binding to its resolved target file
+		// id (JS/TS/JSX only — see state.* captures in langFor), populated as
+		// import.state matches are seen; stateAccesses is deferred the same
+		// way looseComments is, since an access may be matched before the
+		// import statement that resolves its binding.
+		singletons := map[string]string{}
+		var stateAccesses []stateAccessRaw
 
 		for {
 			m, ok := qc.NextMatch()
@@ -869,7 +1194,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					"file":       relPath,
 					"line_start": fmt.Sprint(lineStart),
 				}
-				if doc := docComment(defNode, data); doc != "" {
+				if doc := docComment(defNode, data, consumed); doc != "" {
 					attrs["doc"] = doc
 				}
 				if gen {
@@ -882,6 +1207,44 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					Attrs: attrs,
 				})
 				g.AddEdge(nodeID, fileID, graph.EdgeBelongsTo, nil)
+			}
+
+			// ── Top-level const/exported binding (JS/TS/JSX) ───────────────────
+			// A module-scope `const x = {...}`/`export const x = [...]` (config
+			// objects, lookup tables, queue/route definitions) — anything whose
+			// value isn't a function (those are already function nodes via
+			// func.name) and that isn't nested in some function/block.
+			if nameNode, ok := caps["const.name"]; ok {
+				if declNode, ok := caps["const.decl"]; ok && isTopLevelDeclarator(declNode) {
+					valType := ""
+					if v := declNode.ChildByFieldName("value"); v != nil {
+						valType = v.Type()
+					}
+					if valType != "arrow_function" && valType != "function_expression" {
+						name := nameNode.Content(data)
+						nodeID := "def:" + relPath + ":" + name
+						if g.Nodes[nodeID] == nil {
+							lineStart := int(declNode.StartPoint().Row) + 1
+							attrs := map[string]string{
+								"file":       relPath,
+								"line_start": fmt.Sprint(lineStart),
+							}
+							if doc := docComment(nameNode, data, consumed); doc != "" {
+								attrs["doc"] = doc
+							}
+							if gen {
+								attrs["generated"] = "true"
+							}
+							g.AddNode(&graph.Node{
+								ID:    nodeID,
+								Type:  graph.NodeDefinition,
+								Name:  name,
+								Attrs: attrs,
+							})
+							g.AddEdge(nodeID, fileID, graph.EdgeBelongsTo, nil)
+						}
+					}
+				}
 			}
 
 			// ── Method receiver (Go) ───────────────────────────────────────────
@@ -928,7 +1291,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					"line_end":   fmt.Sprint(lineEnd),
 					"signature":  sig,
 				}
-				if doc := docComment(funcNameNode, data); doc != "" {
+				if doc := docComment(funcNameNode, data, consumed); doc != "" {
 					attrs["doc"] = doc
 				}
 				if gen {
@@ -1006,7 +1369,77 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					g.AddEdge(fileID, importID, graph.EdgeImports, nil)
 				}
 			}
+
+			// ── Loose comment ────────────────────────────────────────────────
+			// Deferred, not emitted here: `consumed` isn't complete until every
+			// def/func match in this file has been processed.
+			if cmt, ok := caps["loose.comment"]; ok {
+				looseComments = append(looseComments, cmt)
+			}
+
+			// ── HTTP route (Express-style) ─────────────────────────────────────
+			if _, ok := caps["route.call"]; ok {
+				c.detectRoute(g, caps, relPath, fileID, data, srcLines, gen, &funcs)
+			}
+
+			// ── Shared-state singleton tracking (JS/TS/JSX) ─────────────────────
+			// Two binding shapes: ES `import { x } from '...'` and CommonJS
+			// `const x = require('...')` — the latter is how most real
+			// Express codebases actually import a config/state module.
+			if srcNode, ok := caps["state.import_src"]; ok {
+				if nameNode, ok := caps["state.import_name"]; ok {
+					isRequire := caps["state.require_fn"] != nil
+					if !isRequire || caps["state.require_fn"].Content(data) == "require" {
+						spec := strings.Trim(srcNode.Content(data), `"'`)
+						if local := c.resolveLocalImport(path, spec); local != "" {
+							singletons[nameNode.Content(data)] = "file:" + local
+						}
+					}
+				}
+			}
+			if _, ok := caps["state.write2"]; ok {
+				objN, propN, subN := caps["state.write2_obj"], caps["state.write2_prop"], caps["state.write2_sub"]
+				if objN != nil && propN != nil && subN != nil {
+					stateAccesses = append(stateAccesses, stateAccessRaw{
+						kind: "write", obj: objN.Content(data),
+						prop: propN.Content(data) + "." + subN.Content(data),
+						line: int(objN.StartPoint().Row) + 1,
+					})
+				}
+			} else if writeNode, ok := caps["state.write"]; ok {
+				objN, propN := caps["state.write_obj"], caps["state.write_prop"]
+				if objN != nil && propN != nil {
+					stateAccesses = append(stateAccesses, stateAccessRaw{
+						kind: "write", obj: objN.Content(data), prop: propN.Content(data),
+						line: int(writeNode.StartPoint().Row) + 1,
+					})
+				}
+			} else if callNode, ok := caps["oa.call"]; ok {
+				// Object.assign(x.prop, {...}) mutates x.prop in place —
+				// tracked as a write, the same as a direct assignment.
+				if oaObj, oaProp := caps["oa.obj"], caps["oa.prop"]; oaObj != nil && oaProp != nil &&
+					oaObj.Content(data) == "Object" && oaProp.Content(data) == "assign" {
+					objN, propN := caps["state.oa_target_obj"], caps["state.oa_target_prop"]
+					if objN != nil && propN != nil {
+						stateAccesses = append(stateAccesses, stateAccessRaw{
+							kind: "write", obj: objN.Content(data), prop: propN.Content(data),
+							line: int(callNode.StartPoint().Row) + 1,
+						})
+					}
+				}
+			} else if readNode, ok := caps["state.read"]; ok {
+				objN, propN := caps["state.read_obj"], caps["state.read_prop"]
+				if objN != nil && propN != nil && !isStateWriteLHS(readNode) && !isCallCallee(readNode) && !isObjectAssignTarget(readNode, data) {
+					stateAccesses = append(stateAccesses, stateAccessRaw{
+						kind: "read", obj: objN.Content(data), prop: propN.Content(data),
+						line: int(readNode.StartPoint().Row) + 1,
+					})
+				}
+			}
 		}
+
+		emitLooseComments(g, looseComments, consumed, funcs, relPath, fileID, data)
+		emitStateAccess(g, stateAccesses, singletons, funcs, relPath)
 
 		return nil
 	})
@@ -1022,9 +1455,9 @@ func (c *Connector) parseMarkdown(g *graph.Graph, path, relPath, fileID, projID,
 		return
 	}
 	g.AddNode(&graph.Node{
-		ID:   fileID,
-		Type: graph.NodeFile,
-		Name: relPath,
+		ID:    fileID,
+		Type:  graph.NodeFile,
+		Name:  relPath,
 		Attrs: map[string]string{"path": path, "doc": "true", "mtime": mtime},
 	})
 	if projID != "" {
@@ -1057,7 +1490,7 @@ func (c *Connector) parseMarkdown(g *graph.Graph, path, relPath, fileID, projID,
 		}
 		for _, m := range inlineCodeRe.FindAllStringSubmatch(line, -1) {
 			tok := strings.TrimSuffix(strings.TrimSpace(m[1]), "()")
-			if len(tok) >= 3 && identLikeRe.MatchString(tok) {
+			if len(tok) >= 3 && identLikeRe.MatchString(tok) && !isLikelyNonSymbolToken(tok) {
 				tokens = append(tokens, tok)
 			}
 		}
@@ -1088,6 +1521,33 @@ var (
 	identLikeRe  = regexp.MustCompile(`^[A-Za-z_][\w./-]*$`)
 )
 
+// httpVerbTokens are backtick-quoted HTTP methods in prose ("call `PUT
+// /users/:id`"), never a code symbol — excluded from mention mining.
+var httpVerbTokens = map[string]bool{
+	"GET": true, "POST": true, "PUT": true, "DELETE": true,
+	"PATCH": true, "HEAD": true, "OPTIONS": true,
+}
+
+// isLikelyNonSymbolToken reports whether an identifier-shaped backtick token
+// is prose that was never meant to resolve to a graph entity — a directory
+// path ("webApp/"), an HTTP verb, or a SCREAMING_SNAKE_CASE env var/constant
+// literal — so mining doesn't manufacture "broken reference" noise out of
+// it. This can't be perfect (a table name like `settings_app` or an external
+// package like `otplib` looks identical to a real code symbol syntactically)
+// — it only catches the mechanically-detectable cases.
+func isLikelyNonSymbolToken(tok string) bool {
+	if strings.HasSuffix(tok, "/") {
+		return true
+	}
+	if httpVerbTokens[tok] {
+		return true
+	}
+	if strings.Contains(tok, "_") && tok == strings.ToUpper(tok) {
+		return true
+	}
+	return false
+}
+
 // wireMentions resolves the code tokens mined from markdown docs against the
 // finished graph: paths match file nodes, names match definitions then
 // functions. Each hit becomes a MENTIONS edge, and the doc node records the
@@ -1110,6 +1570,18 @@ func (c *Connector) wireMentions(g *graph.Graph) {
 			fileByName[n.Name] = id
 		}
 	}
+	// methodOf indexes HAS_METHOD edges (defID + method name -> funcID) so a
+	// "Class.method" doc token resolves to the actual method instead of
+	// failing to match as either a file path or a flat name.
+	methodOf := map[string]string{}
+	for _, e := range g.Edges {
+		if e.Type != graph.EdgeHasMethod {
+			continue
+		}
+		if fn := g.Nodes[e.To]; fn != nil {
+			methodOf[e.From+"\x00"+fn.Name] = e.To
+		}
+	}
 	for _, dm := range c.pendingMentions {
 		doc := g.Nodes[dm.docID]
 		if doc == nil {
@@ -1122,7 +1594,7 @@ func (c *Connector) wireMentions(g *graph.Graph) {
 				continue
 			}
 			seen[tok] = true
-			ids := resolveMention(tok, fileByName, defIDs, funcIDs)
+			ids := resolveMention(tok, fileByName, defIDs, funcIDs, methodOf)
 			if len(ids) == 0 || len(ids) > 3 {
 				continue
 			}
@@ -1139,10 +1611,109 @@ func (c *Connector) wireMentions(g *graph.Graph) {
 	c.pendingMentions = nil
 }
 
+// mineGitCoChanges adds CO_CHANGED edges between file nodes that carry no
+// IMPORTS edge between them yet frequently change together in the same
+// commit — the "you'll also have to touch these" signal for stylesheets,
+// docs, e2e tests, and i18n bundles that no static edge would ever catch.
+// Pure git history, so it only runs at full extract (see HasDrift/Update):
+// there's no incremental delta to mine between refreshes.
+func (c *Connector) mineGitCoChanges(ctx context.Context, g *graph.Graph) {
+	if _, err := os.Stat(filepath.Join(c.dir, ".git")); err != nil {
+		return
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", c.dir, "log", "--no-renames", "--name-only", "--pretty=format:%x00", "--max-count=2000")
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	// Pairs already linked by a static IMPORTS edge don't need a co-change
+	// callout; the graph already explains why they move together.
+	imported := map[[2]string]bool{}
+	for _, e := range g.Edges {
+		if e.Type != graph.EdgeImports {
+			continue
+		}
+		from, to := g.Nodes[e.From], g.Nodes[e.To]
+		if from == nil || to == nil || from.Type != graph.NodeFile || to.Type != graph.NodeFile {
+			continue
+		}
+		imported[pairKey(e.From, e.To)] = true
+	}
+
+	pairCounts := map[[2]string]int{}
+	fileCounts := map[string]int{}
+	for _, commit := range strings.Split(string(out), "\x00") {
+		seen := map[string]bool{}
+		var files []string
+		for _, l := range strings.Split(commit, "\n") {
+			l = strings.TrimSpace(l)
+			if l == "" {
+				continue
+			}
+			id := "file:" + filepath.Join(c.dir, l)
+			if g.Nodes[id] == nil || seen[id] {
+				continue
+			}
+			seen[id] = true
+			files = append(files, id)
+		}
+		// Skip commits touching too few (no pair) or too many files (mass
+		// reformats, vendor bumps): huge commits co-touch everything and
+		// would swamp real signal with noise.
+		if len(files) < 2 || len(files) > 20 {
+			continue
+		}
+		sort.Strings(files)
+		for _, f := range files {
+			fileCounts[f]++
+		}
+		for i := 0; i < len(files); i++ {
+			for j := i + 1; j < len(files); j++ {
+				pairCounts[pairKey(files[i], files[j])]++
+			}
+		}
+	}
+
+	const minCount = 3
+	for pair, cnt := range pairCounts {
+		if cnt < minCount || imported[pair] {
+			continue
+		}
+		a, b := pair[0], pair[1]
+		total := fileCounts[a]
+		if fileCounts[b] < total {
+			total = fileCounts[b]
+		}
+		ratio := float64(cnt) / float64(total)
+		confidence := "low"
+		switch {
+		case cnt >= 5 && ratio >= 0.7:
+			confidence = "high"
+		case ratio >= 0.4:
+			confidence = "medium"
+		}
+		g.AddEdge(a, b, graph.EdgeCoChanged, map[string]string{
+			"count":      fmt.Sprint(cnt),
+			"confidence": confidence,
+		})
+	}
+}
+
+// pairKey returns a stable, order-independent key for a pair of node ids.
+func pairKey(a, b string) [2]string {
+	if a > b {
+		a, b = b, a
+	}
+	return [2]string{a, b}
+}
+
 // resolveMention maps one doc token to graph node ids: path-looking tokens
-// try file nodes (exact then suffix), bare names try definitions then
+// try file nodes (exact then suffix), a "Class.method" shape (single dot, no
+// slash) tries the method via methodOf, bare names try definitions then
 // functions. Shared by wireMentions and the doc-drift re-check.
-func resolveMention(tok string, fileByName map[string]string, defIDs, funcIDs map[string][]string) []string {
+func resolveMention(tok string, fileByName map[string]string, defIDs, funcIDs map[string][]string, methodOf map[string]string) []string {
 	if strings.ContainsAny(tok, "/.") {
 		if id := fileByName[tok]; id != "" {
 			return []string{id}
@@ -1156,6 +1727,15 @@ func resolveMention(tok string, fileByName map[string]string, defIDs, funcIDs ma
 		if len(ids) > 0 {
 			sort.Strings(ids)
 			return ids
+		}
+		if !strings.Contains(tok, "/") {
+			if left, right, ok := strings.Cut(tok, "."); ok && right != "" && !strings.Contains(right, ".") {
+				if defs := defIDs[left]; len(defs) == 1 {
+					if fid := methodOf[defs[0]+"\x00"+right]; fid != "" {
+						return []string{fid}
+					}
+				}
+			}
 		}
 	}
 	if ids := defIDs[tok]; len(ids) > 0 {
@@ -1222,8 +1802,11 @@ func resolveCall(g *graph.Graph, fromFile, raw string, funcsByName map[string][]
 // an existing indexable file, following TS/JS resolution (bare, .ts/.tsx,
 // /index, .js → .ts). Returns "" when nothing matches.
 func probeIndexable(base string) string {
-	cands := []string{base, base + ".ts", base + ".tsx",
-		filepath.Join(base, "index.ts"), filepath.Join(base, "index.tsx")}
+	cands := []string{
+		base, base + ".ts", base + ".tsx", base + ".js", base + ".jsx",
+		filepath.Join(base, "index.ts"), filepath.Join(base, "index.tsx"),
+		filepath.Join(base, "index.js"), filepath.Join(base, "index.jsx"),
+	}
 	if strings.HasSuffix(base, ".js") {
 		cands = append(cands, strings.TrimSuffix(base, ".js")+".ts")
 	}
@@ -1275,20 +1858,22 @@ func (c *Connector) resolveLocalImport(fromPath, spec string) string {
 // baseUrl+paths alias mappings, deepest directory first. tsconfig is JSONC:
 // line comments and trailing commas are stripped before parsing.
 func (c *Connector) loadTSConfigs() {
+	gitFiles, gitOK := c.gitFileSet()
 	c.tsconfigs = []tsPathsConfig{}
 	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			isHidden := strings.HasPrefix(name, ".") && path != c.dir
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".gatt" || name == "gatt-out" || isHidden {
+			if graph.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if d.Name() != "tsconfig.json" {
+			return nil
+		}
+		if rel, _ := filepath.Rel(c.dir, path); gitOK && !gitFiles[rel] {
 			return nil
 		}
 		data, err := os.ReadFile(path)

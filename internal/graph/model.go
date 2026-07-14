@@ -36,6 +36,10 @@ const (
 	NodeProject    = "project"
 	NodeFile       = "file"
 	NodeFunction   = "function"
+
+	NodeRoute   = "route"   // an HTTP route registration found in code (e.g. Express router.get)
+	NodeComment = "comment" // a floating comment not attached to any declaration's doc
+	NodeState   = "state"   // a tracked property slot on a shared cross-file singleton
 )
 
 // Edge types.
@@ -48,6 +52,11 @@ const (
 	EdgeGenerates  = "GENERATES"  // file -> file (source regenerates target; overlay-declared)
 	EdgeCoChanged  = "CO_CHANGED" // file -> file (frequently change in the same git commit)
 	EdgeMentions   = "MENTIONS"   // doc -> function/definition/file it references
+
+	EdgeHandledBy      = "HANDLED_BY"      // route -> function (the terminal handler)
+	EdgeUsesMiddleware = "USES_MIDDLEWARE" // route -> function (middleware in chain order)
+	EdgeReadsState     = "READS"           // function -> state
+	EdgeWritesState    = "WRITES"          // function -> state
 
 	EdgeHasTable   = "HAS_TABLE"
 	EdgeHasColumn  = "HAS_COLUMN"
@@ -122,6 +131,29 @@ func (g *Graph) JournalAddedNodeIDs() []string {
 
 func New(source string) *Graph {
 	return &Graph{Source: source, Nodes: map[string]*Node{}}
+}
+
+// SkipDir reports whether a directory named name should be excluded from a
+// codebase walk: VCS/dependency/gatt-output/build-output directories, and
+// any hidden directory other than the walk root itself (isRoot lets a hidden
+// root, e.g. invoking the walk from within a dotfile-named directory, still
+// be walked). Shared by the codebase connector's file walks and the grep
+// engine command.
+//
+// dist/build/out matter as much as node_modules: before JS/JSX parsing was
+// added, a compiled bundle's .js was silently invisible (only .ts/.tsx were
+// parsed), so an un-excluded dist/ was harmless by accident. Once .js is
+// parsed, a bundled/minified copy of every exported function competes with
+// its real source definition — 5-7 same-named candidates instead of one —
+// making every name-based lookup (find_entities, impact, blast, doc-drift's
+// mention matching) less confident, not more.
+func SkipDir(name string, isRoot bool) bool {
+	switch name {
+	case ".git", "node_modules", "vendor", ".gatt", "gatt-out",
+		"dist", "build", "out", "target", "__pycache__":
+		return true
+	}
+	return strings.HasPrefix(name, ".") && !isRoot
 }
 
 // Dialect returns the SQL dialect implied by the source, so agents write
@@ -403,7 +435,21 @@ func (g *Graph) NodeText(id string) string {
 		}
 		fmt.Fprintf(&b, " %s", body)
 	}
+	// Route/comment/state enrichment: these carry their essential meaning in
+	// attrs rather than in relationships, so render it directly here instead
+	// of relying on the generic edge walk below.
+	if n.Type == NodeRoute {
+		if m, p := n.Attrs["method"], n.Attrs["path"]; m != "" || p != "" {
+			fmt.Fprintf(&b, " %s %s.", m, p)
+		}
+	}
+	if n.Type == NodeComment {
+		if t := n.Attrs["text"]; t != "" {
+			fmt.Fprintf(&b, " %s", t)
+		}
+	}
 	var cols, refs, refBy, accepts, returns, usedBy, methods, calledBy []string
+	var handledBy, middleware, writesState, readsState, writtenBy, readBy []string
 	for _, e := range g.EdgesOf(id) {
 		other := e.To
 		if other == id {
@@ -430,6 +476,18 @@ func (g *Graph) NodeText(id string) string {
 			methods = append(methods, on.Name)
 		case e.Type == EdgeCalls && e.To == id:
 			calledBy = append(calledBy, on.Name)
+		case e.Type == EdgeHandledBy && e.From == id:
+			handledBy = append(handledBy, on.Name)
+		case e.Type == EdgeUsesMiddleware && e.From == id:
+			middleware = append(middleware, on.Name)
+		case e.Type == EdgeWritesState && e.From == id:
+			writesState = append(writesState, on.Name)
+		case e.Type == EdgeReadsState && e.From == id:
+			readsState = append(readsState, on.Name)
+		case e.Type == EdgeWritesState && e.To == id:
+			writtenBy = append(writtenBy, on.Name)
+		case e.Type == EdgeReadsState && e.To == id:
+			readBy = append(readBy, on.Name)
 		}
 	}
 	if len(cols) > 0 {
@@ -444,6 +502,24 @@ func (g *Graph) NodeText(id string) string {
 	}
 	if len(calledBy) > 0 {
 		fmt.Fprintf(&b, " Called by: %s.", strings.Join(calledBy, ", "))
+	}
+	if len(handledBy) > 0 {
+		fmt.Fprintf(&b, " Handled by: %s.", strings.Join(handledBy, ", "))
+	}
+	if len(middleware) > 0 {
+		fmt.Fprintf(&b, " Middleware: %s.", strings.Join(middleware, ", "))
+	}
+	if len(writesState) > 0 {
+		fmt.Fprintf(&b, " Writes: %s.", strings.Join(writesState, ", "))
+	}
+	if len(readsState) > 0 {
+		fmt.Fprintf(&b, " Reads: %s.", strings.Join(readsState, ", "))
+	}
+	if len(writtenBy) > 0 {
+		fmt.Fprintf(&b, " Written by: %s.", strings.Join(writtenBy, ", "))
+	}
+	if len(readBy) > 0 {
+		fmt.Fprintf(&b, " Read by: %s.", strings.Join(readBy, ", "))
 	}
 	if len(accepts) > 0 {
 		fmt.Fprintf(&b, " Accepts: %s.", strings.Join(accepts, ", "))

@@ -58,6 +58,15 @@ gatt blast <file-or-func-or-id>     # blast radius of ANY node, incl. JSON/YAML/
                                     # ALWAYS before signature/behavior changes;
                                     # [test] tags show affected tests
 gatt search "<text>" [--type function|definition|file]   # locate by name/keyword/semantics
+gatt grep <pattern> [--regex]       # exhaustive literal/regex scan of every file — a
+                                    # zero-result answer is proof of absence; search
+                                    # above is semantic/top-N and is NOT exhaustive
+gatt tree [path] [--depth N]        # directory tree annotated with each file's doc summary
+gatt routes [--file substr]         # HTTP routes found in code (Express JS/TS/JSX):
+                                    # method, path, handler, middleware chain
+gatt diff [ref] [--limit N]         # structural diff vs a git ref (default HEAD):
+                                    # added/removed/changed/renamed/moved functions & types,
+                                    # plus current callers of anything that changed
 gatt explain <node-id>              # one node in full: attrs + every edge
 gatt overview                       # node counts, project shape
 ```
@@ -81,8 +90,21 @@ All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
   `graph auto-refreshed: …` stderr line means the graph just caught up with your edits.
 - Generated code (protobuf, ANTLR, minified) is excluded from context packs but
   still findable via `gatt search`.
-- No hits ≠ doesn't exist: names invisible to tree-sitter queries (dynamic dispatch,
-  reflection) won't be in the call graph. Fall back to Grep for those.
+- No hits on `search` ≠ doesn't exist — it's semantic/top-N, not exhaustive. To prove
+  a string occurs nowhere in the codebase (or find dynamic-dispatch/reflection names
+  invisible to tree-sitter queries), use `gatt grep` instead of an ad hoc Grep call —
+  same exclusion rules as extraction (including the repo's own `.gitignore` when it's
+  a git checkout), and it walks every remaining file, not just indexed ones.
+- In a git checkout, extraction respects the repo's own `.gitignore`, not just a fixed
+  list of common build-output names — a project-specific output directory doesn't
+  flood the graph with ambiguous bundled/minified copies of every real function.
+- Functions carry a `shares mutable state:` section in `impact`/`blast` when they
+  read/write a property on a cross-file singleton (e.g. `config.session` set in one
+  file, read in another) — a data-flow signal CALLS can't see. Heuristic, JS/TS/JSX
+  only, one hop (not transitive).
+- Substantive floating comments (the "why" next to a block, not attached to any
+  function/type) are their own `comment` node — findable via `search`/`code_context`,
+  not just doc comments on declarations.
 - `blast` regenerated outputs come from `"generates"` declarations in
   `.gatt/relations.json` (`[{"from": "path", "to": "path"}]`) — when you discover a
   script that copies/generates files, declare the pipeline there so future blasts see it.
@@ -95,6 +117,6 @@ All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
 ## MCP alternative
 
 If the `gatt` MCP server is installed in the client (`mcp__gatt__*` tools visible),
-`code_context`, `impact`, `blast`, `find_entities`, `describe_entity` mirror the commands
-above with the engine resident in memory (faster on huge repos). Prefer whichever
-is already available; functionality is identical.
+`code_context`, `impact`, `blast`, `find_entities`, `describe_entity`, `grep`, `tree`,
+`routes`, `code_diff` mirror the commands above with the engine resident in memory
+(faster on huge repos). Prefer whichever is already available; functionality is identical.
