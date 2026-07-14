@@ -37,24 +37,25 @@ Requires: Go 1.24+ and Ollama on `:11434` with `nomic-embed-text` pulled (option
 ```bash
 go build -o gatt ./cmd/gatt
 
-./gatt extract sqlite path/to/db.sqlite     # → gatt-out/graph.json
-./gatt extract postgres "postgres://user:pass@host:5432/db?sslmode=disable"
-./gatt index                                # embed nodes → gatt-out/vectors.json
-./gatt search "user login timestamps"       # sanity-check semantic search
-./gatt mcp                                  # MCP stdio server
+go build -o ~/.local/bin/gatt ./cmd/gatt
+
+gatt extract sqlite path/to/db.sqlite     # → gatt-out/graph.json
+gatt extract postgres "postgres://user:pass@host:5432/db?sslmode=disable"
+gatt index                                # embed nodes → gatt-out/vectors.json
+gatt install                              # register MCP server in Claude Code
 ```
 
-Register in Claude Code (`.mcp.json` in any project):
+`gatt install` uses `claude mcp add` when the CLI is available (`--scope project|user`), otherwise merges into `./.mcp.json` directly.
 
-```json
-{
-  "mcpServers": {
-    "gatt": {
-      "command": "/path/to/gatt",
-      "args": ["mcp", "--graph", "/path/to/gatt-out/graph.json"]
-    }
-  }
-}
+Query from the terminal (same operations the MCP tools expose):
+
+```bash
+gatt query "how many messages did each client send this month"
+                                          # context pack: tables, columns, enums, joins
+gatt search "user login timestamps"       # semantic search over all nodes
+gatt path clients conversation_messages   # FK join path with exact columns
+gatt explain messages                     # one node: attrs + relationships
+gatt overview                             # all tables, counts, references
 ```
 
 ## MCP tools
@@ -99,7 +100,8 @@ Emit nodes/edges with the model in `internal/graph/model.go`, wire into `cmd/gat
 ## Layout
 
 ```
-cmd/gatt/                 CLI: extract | index | search | mcp
+cmd/gatt/                 CLI: extract | index | query | search | path | explain | overview | mcp | install
+internal/engine/          query operations shared by CLI and MCP
 internal/graph/           graph model, traversal, persistence
 internal/connector/       Connector interface + sqlite/ and postgres/ implementations
 internal/embed/           Ollama embedding client
