@@ -40,6 +40,7 @@ const (
 	NodeRoute   = "route"   // an HTTP route registration found in code (e.g. Express router.get)
 	NodeComment = "comment" // a floating comment not attached to any declaration's doc
 	NodeState   = "state"   // a tracked property slot on a shared cross-file singleton
+	NodeModel   = "model"   // an ORM model found in code (e.g. Sequelize Model.init / sequelize.define)
 )
 
 // Edge types.
@@ -446,6 +447,14 @@ func (g *Graph) NodeText(id string) string {
 	if n.Type == NodeComment {
 		if t := n.Attrs["text"]; t != "" {
 			fmt.Fprintf(&b, " %s", t)
+		}
+	}
+	if n.Type == NodeModel {
+		if t := n.Attrs["table"]; t != "" {
+			fmt.Fprintf(&b, " table %s.", t)
+		}
+		if f := n.Attrs["fields"]; f != "" {
+			fmt.Fprintf(&b, " Fields: %s.", f)
 		}
 	}
 	var cols, refs, refBy, accepts, returns, usedBy, methods, calledBy []string

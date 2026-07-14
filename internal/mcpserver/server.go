@@ -165,6 +165,10 @@ type routesIn struct {
 	File string `json:"file,omitempty" jsonschema:"only routes in files whose path contains this substring"`
 }
 
+type modelsIn struct {
+	File string `json:"file,omitempty" jsonschema:"only models in files whose path contains this substring"`
+}
+
 type codeDiffIn struct {
 	Ref   string `json:"ref,omitempty" jsonschema:"git ref to diff against, default HEAD"`
 	Limit int    `json:"limit,omitempty" jsonschema:"max changes to display, default 30"`
@@ -302,6 +306,22 @@ func (s *Server) register() {
 			return nil, nil, err
 		}
 		out, err := e.Routes(in.File)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "models",
+		Description: "Every ORM model detected in the codebase: name, DB table, field→column renames (the mapping SQL greps miss), and the association graph (hasMany/belongsTo/hasOne/belongsToMany with as/foreignKey). Statically detects Sequelize-style Model.init / sequelize.define in JS/TS/JSX, associations resolved even when declared in a central setupAssociations file. The data layer without a live database — pair with join-style questions or blast on a model file. Codebase graphs only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in modelsIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.Models(in.File)
 		if err != nil {
 			return nil, nil, err
 		}

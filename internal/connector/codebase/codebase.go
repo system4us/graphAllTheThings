@@ -36,6 +36,12 @@ type Connector struct {
 	// pendingMentions collects code tokens found in each parsed markdown doc,
 	// resolved against the finished graph by wireMentions.
 	pendingMentions []docMentions
+	// pendingAssocs collects ORM association calls found while parsing,
+	// resolved against the finished model registry by wireModels.
+	pendingAssocs []modelAssoc
+	// modelBases is the inheritance-marker set identifying ORM model classes
+	// (defaults + .gatt/models.json base_classes). Loaded lazily.
+	modelBases map[string]bool
 	// pendingRoutes collects HTTP route registrations found while parsing,
 	// resolved against the finished function index by wireRoutes.
 	pendingRoutes []routeInfo
@@ -132,6 +138,7 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	resolveAndWire(g, funcs, funcsByName)
 	c.wireMentions(g)
 	c.wireRoutes(g, funcsByName)
+	c.wireModels(g)
 	c.mineGitCoChanges(ctx, g)
 
 	return g, nil
@@ -290,6 +297,16 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 				(tn.Type == graph.NodeFile && dirty[tn.Name]) {
 				fileEdgeRelinks = append(fileEdgeRelinks, e)
 			}
+		case graph.EdgeReferences:
+			// Model association declared in a third file (setupAssociations
+			// pattern): model ids are path-stable, so re-add verbatim when an
+			// endpoint's file re-parses. A dirty declaring file re-emits its
+			// own associations, so those are skipped here.
+			if fn.Type == graph.NodeModel && tn.Type == graph.NodeModel &&
+				!dirty[e.Attrs["declared_in"]] &&
+				(dirty[fn.Attrs["file"]] || dirty[tn.Attrs["file"]]) {
+				fileEdgeRelinks = append(fileEdgeRelinks, e)
+			}
 		}
 	}
 
@@ -324,6 +341,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	resolveAndWire(prev, newFuncs, funcsByName)
 	c.wireMentions(prev)
 	c.wireRoutes(prev, funcsByName)
+	c.wireModels(prev)
 
 	// Calls from *unchanged* files may now have a target that didn't exist at
 	// their extract time: re-resolve their persisted raw call names against
@@ -548,6 +566,9 @@ func langFor(ext string) *langConfig {
 			// call.sel  = selector field (pkg.Func or obj.Method — skip local resolution)
 			queryStr: `
 			(type_declaration (type_spec name: (type_identifier) @def.name))
+			(type_declaration (type_spec
+			  name: (type_identifier) @gomodel.name
+			  type: (struct_type) @gomodel.struct))
 			(function_declaration name: (identifier) @func.name)
 			(method_declaration receiver: (parameter_list) @method.receiver name: (field_identifier) @func.name)
 			(call_expression function: (identifier) @call.func)
@@ -574,6 +595,24 @@ func langFor(ext string) *langConfig {
 			    object: (identifier) @route.obj
 			    property: (property_identifier) @route.method)
 			  arguments: (arguments . (string) @route.path)) @route.call
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @model.obj
+			    property: (property_identifier) @model.method)
+			  arguments: (arguments . (object) @model.fields)) @model.call
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @modeldef.obj
+			    property: (property_identifier) @modeldef.method)
+			  arguments: (arguments . (string) @modeldef.name (object) @modeldef.fields)) @modeldef.call
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @assoc.obj
+			    property: (property_identifier) @assoc.method)
+			  arguments: (arguments . (identifier) @assoc.target)) @assoc.call
+			(class_declaration
+			  name: (_) @clsmodel.name
+			  (class_heritage) @clsmodel.heritage) @clsmodel.class
 			(import_statement
 			  (import_clause
 			    (named_imports
@@ -626,6 +665,24 @@ func langFor(ext string) *langConfig {
 			    object: (identifier) @route.obj
 			    property: (property_identifier) @route.method)
 			  arguments: (arguments . (string) @route.path)) @route.call
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @model.obj
+			    property: (property_identifier) @model.method)
+			  arguments: (arguments . (object) @model.fields)) @model.call
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @modeldef.obj
+			    property: (property_identifier) @modeldef.method)
+			  arguments: (arguments . (string) @modeldef.name (object) @modeldef.fields)) @modeldef.call
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @assoc.obj
+			    property: (property_identifier) @assoc.method)
+			  arguments: (arguments . (identifier) @assoc.target)) @assoc.call
+			(class_declaration
+			  name: (_) @clsmodel.name
+			  (class_heritage) @clsmodel.heritage) @clsmodel.class
 			(import_statement
 			  (import_clause
 			    (named_imports
@@ -665,6 +722,10 @@ func langFor(ext string) *langConfig {
 			lang: python.GetLanguage(),
 			queryStr: `
 			(class_definition name: (identifier) @def.name)
+			(class_definition
+			  name: (identifier) @pymodel.name
+			  superclasses: (argument_list) @pymodel.bases
+			  body: (block) @pymodel.body) @pymodel.class
 			(function_definition name: (identifier) @func.name)
 			(call function: (identifier) @call.func)
 			(call function: (attribute attribute: (identifier) @call.sel))
@@ -1380,6 +1441,30 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			// ── HTTP route (Express-style) ─────────────────────────────────────
 			if _, ok := caps["route.call"]; ok {
 				c.detectRoute(g, caps, relPath, fileID, data, srcLines, gen, &funcs)
+			}
+
+			// ── ORM model (layered, language-agnostic) ─────────────────────────
+			// Call-shape detectors (Sequelize init/define + associations),
+			// inheritance detectors (TS/JS class heritage, Python bases),
+			// struct-tag detector (Go). Unknown ORMs: declare base classes in
+			// .gatt/models.json or tag entities via annotate_entity model_table.
+			if _, ok := caps["model.call"]; ok {
+				c.detectModelInit(g, caps, relPath, fileID, data)
+			}
+			if _, ok := caps["modeldef.call"]; ok {
+				c.detectModelDefine(g, caps, relPath, fileID, data)
+			}
+			if _, ok := caps["assoc.call"]; ok {
+				c.detectAssoc(caps, relPath, data)
+			}
+			if _, ok := caps["clsmodel.class"]; ok {
+				c.detectClassModel(g, caps, relPath, fileID, data)
+			}
+			if _, ok := caps["pymodel.class"]; ok {
+				c.detectPyModel(g, caps, relPath, fileID, data)
+			}
+			if _, ok := caps["gomodel.struct"]; ok {
+				c.detectGoModel(g, caps, relPath, fileID, data)
 			}
 
 			// ── Shared-state singleton tracking (JS/TS/JSX) ─────────────────────

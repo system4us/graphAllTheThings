@@ -79,6 +79,8 @@ func main() {
 		err = cmdTree(ctx, os.Args[2:])
 	case "routes":
 		err = cmdRoutes(ctx, os.Args[2:])
+	case "models":
+		err = cmdModels(ctx, os.Args[2:])
 	case "diff":
 		err = cmdDiff(ctx, os.Args[2:])
 	case "code-query", "codequery":
@@ -136,6 +138,7 @@ query it (graphify-style):
   gatt grep <pattern>              exhaustive literal search across every file — a proof of absence, not top-N [--regex] [--limit N]
   gatt tree [path]                 directory tree annotated with each file's doc summary [--depth N]
   gatt routes [--file substr]      HTTP routes detected in code (Express-style JS/TS): method, path, handler, middleware
+  gatt models [--file substr]      ORM models detected in code (Sequelize JS/TS): table, field→column renames, associations
   gatt diff [ref]                  structural diff vs a git ref (default HEAD): added/removed/changed/renamed/moved functions & types, plus current callers [--limit N]
   gatt path <tableA> <tableB>      cheapest FK join path with exact columns
   gatt explain <table|column>      one node in full: attrs + relationships
@@ -1041,6 +1044,28 @@ func cmdRoutes(ctx context.Context, args []string) error {
 		return err
 	}
 	out, err := e.Routes(*file)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// cmdModels prints the ORM models detected in code: name, table, field →
+// column renames, and associations — the data layer without a live database.
+func cmdModels(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("models", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	file := fs.String("file", "", "only models in files whose path contains this substring")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.Models(*file)
 	if err != nil {
 		return err
 	}

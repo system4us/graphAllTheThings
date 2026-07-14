@@ -64,6 +64,14 @@ gatt grep <pattern> [--regex]       # exhaustive literal/regex scan of every fil
 gatt tree [path] [--depth N]        # directory tree annotated with each file's doc summary
 gatt routes [--file substr]         # HTTP routes found in code (Express JS/TS/JSX):
                                     # method, path, handler, middleware chain
+gatt models [--file substr]         # ORM models found in code: name, DB table,
+                                    # field→column renames, associations. Detects
+                                    # Sequelize init/define, TypeORM decorators, Go
+                                    # DB struct tags, Django/SQLAlchemy classes;
+                                    # *_id/…Id fields infer REFERENCES edges in any
+                                    # language. Unknown ORM base classes: declare in
+                                    # .gatt/models.json {"base_classes": [...]}, or
+                                    # tag a type via annotate model_table=<table>
 gatt diff [ref] [--limit N]         # structural diff vs a git ref (default HEAD):
                                     # added/removed/changed/renamed/moved functions & types,
                                     # plus current callers of anything that changed
@@ -118,5 +126,5 @@ All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
 
 If the `gatt` MCP server is installed in the client (`mcp__gatt__*` tools visible),
 `code_context`, `impact`, `blast`, `find_entities`, `describe_entity`, `grep`, `tree`,
-`routes`, `code_diff` mirror the commands above with the engine resident in memory
-(faster on huge repos). Prefer whichever is already available; functionality is identical.
+`routes`, `models`, `code_diff` mirror the commands above with the engine resident in
+memory (faster on huge repos). Prefer whichever is already available; functionality is identical.
