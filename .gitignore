@@ -1,0 +1,8 @@
+# built binary
+/gatt
+
+# extracted graphs + vector indexes (contain private schema metadata)
+gatt-out/
+
+# machine-local MCP registration (absolute paths)
+.mcp.json
