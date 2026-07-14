@@ -658,6 +658,9 @@ func (g *Graph) applyAnnotations(path string) error {
 	for id, attrs := range ann {
 		n := g.Nodes[id]
 		if n == nil {
+			n = g.ResolveRelinkedFunc(id) // line number shifted since the annotation was written
+		}
+		if n == nil {
 			continue // annotation for a node that no longer exists; ignore
 		}
 		if n.Attrs == nil {
@@ -666,4 +669,35 @@ func (g *Graph) applyAnnotations(path string) error {
 		maps.Copy(n.Attrs, attrs)
 	}
 	return nil
+}
+
+// ResolveRelinkedFunc re-resolves a stale function-node annotation id whose
+// embedded line number no longer matches (an edit elsewhere in the same file
+// shifted it) by looking up the current function with the same file+name —
+// the same same-file tiebreak the CALLS resolver uses, so an ambiguous match
+// (more than one live function of that name in the file) is skipped rather
+// than guessed. id is expected in the "func:<file>:<name>:<line>" shape
+// emitted by the codebase connector; anything else returns nil. Exported so
+// callers computing orphaned-annotation warnings (e.g. the CLI's extract
+// command) can tell a truly orphaned annotation from one that will still
+// apply after applyAnnotations' own fallback.
+func (g *Graph) ResolveRelinkedFunc(id string) *Node {
+	parts := strings.Split(id, ":")
+	if len(parts) != 4 || parts[0] != "func" {
+		return nil
+	}
+	file, name := parts[1], parts[2]
+	var match *Node
+	for _, n := range g.Nodes {
+		if n.Type != NodeFunction || n.Attrs["external"] == "true" {
+			continue
+		}
+		if n.Attrs["file"] == file && n.Name == name {
+			if match != nil {
+				return nil // ambiguous: more than one live match, no edge beats a wrong one
+			}
+			match = n
+		}
+	}
+	return match
 }

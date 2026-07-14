@@ -8,16 +8,24 @@ import (
 	"graphallthethings/internal/graph"
 )
 
-// Routes lists every HTTP route detected in the codebase (Express-style
-// router/app.METHOD registrations — see internal/connector/codebase/routes.go),
-// grouped by file: method, path, handler with file:line, and the middleware
-// chain in order. fileSubstr filters to files whose path contains it ("" =
-// all).
+// Routes lists every HTTP route detected in the codebase: statically-detected
+// Express-style router/app.METHOD registrations (see
+// internal/connector/codebase/routes.go), plus any function annotated with
+// route_method/route_path/route_framework via annotate_entity — the way to
+// cover routes in other languages/frameworks/styles the static detector
+// doesn't recognize. Grouped by file: method, path, handler with file:line,
+// and the middleware chain in order (agent-tagged entries have no middleware
+// chain). fileSubstr filters to files whose path contains it ("" = all).
 func (e *Engine) Routes(fileSubstr string) (string, error) {
 	if !e.IsCodebase() {
 		return "", fmt.Errorf("routes needs a codebase graph")
 	}
 	routes := e.G.NodesByType(graph.NodeRoute)
+	for _, n := range e.G.NodesByType(graph.NodeFunction) {
+		if n.Attrs["route_method"] != "" {
+			routes = append(routes, n)
+		}
+	}
 	if fileSubstr != "" {
 		filtered := routes[:0]
 		for _, n := range routes {
@@ -28,7 +36,7 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 		routes = filtered
 	}
 	if len(routes) == 0 {
-		return "no HTTP routes detected (Express-style JS/TS/JSX only, v1)\n", nil
+		return "no HTTP routes detected (static: Express-style JS/TS/JSX; tag others via annotate_entity's route_method/route_path/route_framework)\n", nil
 	}
 
 	sort.Slice(routes, func(i, j int) bool {
@@ -49,6 +57,16 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 			fmt.Fprintf(&b, "%s\n", f)
 			lastFile = f
 		}
+		if n.Type == graph.NodeFunction {
+			line := fmt.Sprintf("  :%s  %s %s  → %s (%s:%s)  [agent", n.Attrs["line_start"],
+				n.Attrs["route_method"], n.Attrs["route_path"], n.Name, n.Attrs["file"], n.Attrs["line_start"])
+			if fw := n.Attrs["route_framework"]; fw != "" {
+				line += ": " + fw
+			}
+			b.WriteString(line + "]\n")
+			continue
+		}
+
 		var handler string
 		var middleware []string
 		for _, ed := range e.G.EdgesOf(n.ID) {

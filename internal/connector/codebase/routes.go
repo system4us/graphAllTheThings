@@ -41,7 +41,11 @@ type routeInfo struct {
 // detectRoute inspects one route.call match for the Express shape
 // `<obj>.<method>("/path", ...middleware, handler)`. Scoped to JS/TS/JSX
 // (the only langConfigs whose queryStr captures route.call); Go/Python/Rust
-// route frameworks are a different grammar shape each and out of scope.
+// route frameworks are a different grammar shape each and out of scope here —
+// for those (or any Express call this shape misses), tag the handler function
+// node directly via the annotate_entity MCP tool's route_method/route_path/
+// route_framework fields (internal/mcpserver/server.go), surfaced by
+// Engine.Routes alongside these statically-detected ones.
 func (c *Connector) detectRoute(g *graph.Graph, caps map[string]*sitter.Node, relPath, fileID string, data []byte, srcLines []string, gen bool, funcs *[]funcInfo) {
 	callNode, ok := caps["route.call"]
 	if !ok {

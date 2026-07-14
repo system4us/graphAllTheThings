@@ -222,7 +222,7 @@ func cmdExtract(ctx context.Context, args []string) error {
 	if old, err := graph.LoadRaw(*out); err == nil {
 		d := graph.DiffGraphs(old, g)
 		printDiff(d, old)
-		warnOrphanAnnotations(*out, d.RemovedNodes)
+		warnOrphanAnnotations(*out, d.RemovedNodes, g)
 		if *check {
 			return nil // drift reported; leave the graph untouched
 		}
@@ -296,8 +296,11 @@ func printDiff(d *graph.Diff, old *graph.Graph) {
 }
 
 // warnOrphanAnnotations flags curated annotations whose target node no longer
-// exists after re-extraction, so the operator can fix or clear them.
-func warnOrphanAnnotations(graphPath string, removed []string) {
+// exists after re-extraction, so the operator can fix or clear them. A
+// function-node annotation that will still apply via ng.ResolveRelinkedFunc
+// (its line number shifted but the function survives under the same
+// file+name) is not an orphan, so it's skipped.
+func warnOrphanAnnotations(graphPath string, removed []string, ng *graph.Graph) {
 	if len(removed) == 0 {
 		return
 	}
@@ -311,7 +314,7 @@ func warnOrphanAnnotations(graphPath string, removed []string) {
 		gone[id] = true
 	}
 	for id := range ann {
-		if gone[id] {
+		if gone[id] && ng.ResolveRelinkedFunc(id) == nil {
 			fmt.Fprintf(os.Stderr, "warning: annotation for removed node %q will be ignored (gatt annotate %s --clear to remove)\n", id, id)
 		}
 	}

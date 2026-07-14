@@ -171,10 +171,13 @@ type codeDiffIn struct {
 }
 
 type annotateIn struct {
-	Node          string `json:"node" jsonschema:"table/column/schema name or node id to annotate"`
-	EntityNote    string `json:"entity_note,omitempty" jsonschema:"free-text business definition of the entity (what it canonically means, edge cases)"`
-	DefaultFilter string `json:"default_filter,omitempty" jsonschema:"a canonical WHERE clause always applied for this entity, e.g. 'enabled = true'"`
-	Clear         bool   `json:"clear,omitempty" jsonschema:"remove all annotations from the node instead of setting them"`
+	Node           string `json:"node" jsonschema:"table/column/schema name or node id to annotate"`
+	EntityNote     string `json:"entity_note,omitempty" jsonschema:"free-text business definition of the entity (what it canonically means, edge cases)"`
+	DefaultFilter  string `json:"default_filter,omitempty" jsonschema:"a canonical WHERE clause always applied for this entity, e.g. 'enabled = true'"`
+	RouteMethod    string `json:"route_method,omitempty" jsonschema:"HTTP method (GET, POST, ...) — tag a function node as an HTTP route handler the static detector didn't recognize (any language/framework/style)"`
+	RoutePath      string `json:"route_path,omitempty" jsonschema:"route path, e.g. '/users/{id}' — pairs with route_method"`
+	RouteFramework string `json:"route_framework,omitempty" jsonschema:"web framework the route belongs to, e.g. flask, fastapi, spring, gin — pairs with route_method"`
+	Clear          bool   `json:"clear,omitempty" jsonschema:"remove all annotations from the node instead of setting them"`
 }
 
 func (s *Server) register() {
@@ -291,7 +294,7 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "routes",
-		Description: "Every HTTP route detected in the codebase: method, path, handler (with file:line), and middleware chain in order. Detects Express-style JS/TS/JSX router/app.get|post|put|delete|patch|all|use(...) registrations — v1 scope, no Go/Python route frameworks yet. Codebase graphs only.",
+		Description: "Every HTTP route detected in the codebase: method, path, handler (with file:line), and middleware chain in order. Statically detects Express-style JS/TS/JSX router/app.get|post|put|delete|patch|all|use(...) registrations, plus any function tagged via annotate_entity's route_method/route_path/route_framework fields — the way to cover other languages, frameworks, or coding styles the static detector doesn't recognize. Codebase graphs only.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in routesIn) (*mcp.CallToolResult, any, error) {
 		note := s.autoRefreshCodebase(ctx)
 		e, err := s.requireEngine()
@@ -375,7 +378,7 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "annotate_entity",
-		Description: "Persist business knowledge you've learned onto a table/column/schema so every later sql_context and describe_entity carries it. entity_note is a free-text definition; default_filter is a canonical WHERE clause (e.g. 'enabled = true') that gets rendered like a soft-delete filter. Survives re-extraction. Use this instead of re-explaining the same caveat each session; use clear=true to remove.",
+		Description: "Persist business knowledge you've learned onto a table/column/schema so every later sql_context and describe_entity carries it. entity_note is a free-text definition; default_filter is a canonical WHERE clause (e.g. 'enabled = true') that gets rendered like a soft-delete filter. On a codebase graph, also use route_method/route_path/route_framework to tag any function node as an HTTP route handler the static detector missed — it only recognizes Express-style JS/TS calls, so this is the way to record routes for any other language, framework, or coding style; tagged routes then show up in the routes tool. Survives re-extraction and line-number drift. Use this instead of re-explaining the same caveat each session; use clear=true to remove.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in annotateIn) (*mcp.CallToolResult, any, error) {
 		return s.annotate(in)
 	})
@@ -430,6 +433,15 @@ func (s *Server) annotate(in annotateIn) (*mcp.CallToolResult, any, error) {
 	}
 	if in.DefaultFilter != "" {
 		set["default_filter"] = in.DefaultFilter
+	}
+	if in.RouteMethod != "" {
+		set["route_method"] = in.RouteMethod
+	}
+	if in.RoutePath != "" {
+		set["route_path"] = in.RoutePath
+	}
+	if in.RouteFramework != "" {
+		set["route_framework"] = in.RouteFramework
 	}
 	if !in.Clear && len(set) == 0 {
 		return nil, nil, fmt.Errorf("nothing to do: set entity_note/default_filter or pass clear=true")
