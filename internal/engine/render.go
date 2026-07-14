@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -1194,64 +1193,9 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	return b.String(), nil
 }
 
-// docInlineCodeRe, docIdentLikeRe and docHTTPVerbTokens mirror the mining
-// regexes/filters the codebase connector uses to extract inline-code
-// references from markdown (see codebase.parseMarkdown / isLikelyNonSymbolToken);
-// duplicated here so DocDrift can re-mine a doc's current text without the
-// engine package depending on tree-sitter.
-var (
-	docInlineCodeRe  = regexp.MustCompile("`([^`\n]{1,80})`")
-	docIdentLikeRe   = regexp.MustCompile(`^[A-Za-z_][\w./-]*$`)
-	docHTTPVerbToken = map[string]bool{
-		"GET": true, "POST": true, "PUT": true, "DELETE": true,
-		"PATCH": true, "HEAD": true, "OPTIONS": true,
-	}
-)
-
-// docLikelyNonSymbolToken mirrors codebase.isLikelyNonSymbolToken: excludes
-// directory paths, HTTP verbs, and SCREAMING_SNAKE_CASE env vars/constants
-// from being treated as a candidate symbol reference — prose in backticks
-// that was never meant to resolve, not an actual broken reference.
-func docLikelyNonSymbolToken(tok string) bool {
-	if strings.HasSuffix(tok, "/") {
-		return true
-	}
-	if docHTTPVerbToken[tok] {
-		return true
-	}
-	if strings.Contains(tok, "_") && tok == strings.ToUpper(tok) {
-		return true
-	}
-	return false
-}
-
-// mineDocTokens re-extracts the inline-code tokens a doc currently contains,
-// skipping fenced code blocks, the same way the codebase connector does at
-// extract time. Used to detect tokens that no longer resolve to anything.
-func mineDocTokens(data []byte) []string {
-	var tokens []string
-	inFence := false
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "```") {
-			inFence = !inFence
-			continue
-		}
-		if inFence || len(tokens) >= 100 {
-			continue
-		}
-		for _, m := range docInlineCodeRe.FindAllStringSubmatch(line, -1) {
-			tok := strings.TrimSuffix(strings.TrimSpace(m[1]), "()")
-			if len(tok) >= 3 && docIdentLikeRe.MatchString(tok) && !docLikelyNonSymbolToken(tok) {
-				tokens = append(tokens, tok)
-			}
-		}
-	}
-	return tokens
-}
-
 // DocDrift reports markdown docs whose inline-code references either no
-// longer resolve in the graph (broken — the connector's mining/resolution
-// pass, mirrored by mineDocTokens, dropped them) or resolve to code that was
+// longer resolve in the graph (broken — the symbol resolved when the doc was
+// extracted and has since been deleted or renamed) or resolve to code that was
 // last touched, per git, after the doc itself was (stale). Staleness needs a
 // git checkout; outside one, only broken references are reported.
 func (e *Engine) DocDrift(limit int) (string, error) {
@@ -1290,6 +1234,53 @@ func (e *Engine) DocDrift(limit int) (string, error) {
 	}
 	var drifted []drift
 
+	// Re-resolution indexes, mirroring the connector's wireMentions rules.
+	// broken means "resolved at extract time, resolves to nothing now" — a
+	// deleted/renamed symbol. Tokens that never resolved (prose, flags, header
+	// names) are not code references and are never reported.
+	fileByName := map[string]bool{}
+	defIDs := map[string][]string{}
+	funcNames := map[string]bool{}
+	for nid, nn := range e.G.Nodes {
+		switch {
+		case nn.Type == graph.NodeFile && !strings.HasPrefix(nid, "doc:"):
+			fileByName[nn.Name] = true
+		case nn.Type == graph.NodeDefinition:
+			defIDs[nn.Name] = append(defIDs[nn.Name], nid)
+		case nn.Type == graph.NodeFunction && nn.Attrs["external"] != "true":
+			funcNames[nn.Name] = true
+		}
+	}
+	methodOf := map[string]bool{}
+	for _, ed := range e.G.Edges {
+		if ed.Type != graph.EdgeHasMethod {
+			continue
+		}
+		if fn := e.G.Nodes[ed.To]; fn != nil {
+			methodOf[ed.From+"\x00"+fn.Name] = true
+		}
+	}
+	resolvesNow := func(tok string) bool {
+		if strings.ContainsAny(tok, "/.") {
+			if fileByName[tok] {
+				return true
+			}
+			for name := range fileByName {
+				if strings.HasSuffix(name, "/"+tok) {
+					return true
+				}
+			}
+			if !strings.Contains(tok, "/") {
+				if left, right, ok := strings.Cut(tok, "."); ok && right != "" && !strings.Contains(right, ".") {
+					if ids := defIDs[left]; len(ids) == 1 && methodOf[ids[0]+"\x00"+right] {
+						return true
+					}
+				}
+			}
+		}
+		return len(defIDs[tok]) > 0 || funcNames[tok]
+	}
+
 	for id, n := range e.G.Nodes {
 		if !strings.HasPrefix(id, "doc:") {
 			continue
@@ -1298,24 +1289,11 @@ func (e *Engine) DocDrift(limit int) (string, error) {
 		if relPath == "" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, relPath))
-		if err != nil {
-			continue
-		}
-		resolved := map[string]bool{}
-		for _, tok := range strings.Fields(n.Attrs["mentions_resolved"]) {
-			resolved[tok] = true
-		}
 
 		var d drift
 		d.name = relPath
-		seen := map[string]bool{}
-		for _, tok := range mineDocTokens(data) {
-			if seen[tok] {
-				continue
-			}
-			seen[tok] = true
-			if !resolved[tok] {
+		for _, tok := range strings.Fields(n.Attrs["mentions_resolved"]) {
+			if !resolvesNow(tok) {
 				d.broken = append(d.broken, tok)
 			}
 		}
