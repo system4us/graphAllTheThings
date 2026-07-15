@@ -1,0 +1,10 @@
+{
+  "version": "1.0",
+  "project": "graphAllTheThings",
+  "namespaces": ["cli", "engine", "graph", "connector", "store", "mcpserver"],
+  "manifests": {
+    "definitions": "./definitions.json",
+    "relations": "./relations.json",
+    "contracts": "./contracts.json"
+  }
+}

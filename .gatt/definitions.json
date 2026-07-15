@@ -1,0 +1,23 @@
+{
+  "entities": {
+    "Graph": {
+      "description": "The central semantic network. Stores nodes and edges in memory. Source of truth for structural relationships.",
+      "critical_rules": ["Cannot be directly modified during query execution. Built entirely by Connectors."]
+    },
+    "Node": {
+      "description": "An entity from a source. E.g., 'table', 'column', 'endpoint', 'schema'. Carries attributes and relationships."
+    },
+    "Edge": {
+      "description": "A relationship between two nodes. E.g., 'FOREIGN_KEY', 'HAS_COLUMN', 'REFERS_TO'."
+    },
+    "Connector": {
+      "description": "Adapter that reads a specific source (Postgres, SQLite, OpenAPI) and turns its metadata into a Graph."
+    },
+    "Engine": {
+      "description": "The query engine that traverses the Graph and VectorStore to resolve questions, paths, and contexts."
+    },
+    "VectorStore": {
+      "description": "Storage for node embeddings. Used for semantic search. Can be local (in-process) or external (Qdrant)."
+    }
+  }
+}

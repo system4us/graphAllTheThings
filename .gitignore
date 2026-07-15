@@ -8,3 +8,11 @@ gatt-out/
 .mcp.json
 swagger.json
 gatt.exe
+
+# release artifacts
+dist/
+
+# local scratch / private dumps
+test_ts.go
+gen_graph.py
+whatsappCRM_schema.sql

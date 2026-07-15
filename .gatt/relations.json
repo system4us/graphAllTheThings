@@ -1,0 +1,35 @@
+{
+  "features": [
+    {
+      "name": "Extraction",
+      "entry_point": "cmdExtract (main.go)",
+      "core_logic": "internal/connector",
+      "outputs": ["gatt-out/graph.json"]
+    },
+    {
+      "name": "Indexing",
+      "entry_point": "cmdIndex (main.go)",
+      "core_logic": "internal/indexer",
+      "dependencies": ["internal/embed", "internal/store"],
+      "outputs": ["gatt-out/vectors.json"]
+    },
+    {
+      "name": "Semantic Search",
+      "entry_point": "engine.Find (internal/engine)",
+      "dependencies": ["internal/store", "internal/embed"],
+      "triggers": ["MCP find_entities", "CLI search"]
+    },
+    {
+      "name": "Context Pack Assembly",
+      "entry_point": "engine.ContextPack (internal/engine)",
+      "dependencies": ["internal/graph", "internal/engine.Find"],
+      "triggers": ["MCP sql_context", "CLI query"]
+    },
+    {
+      "name": "MCP Server",
+      "entry_point": "mcpserver.New (internal/mcpserver)",
+      "dependencies": ["internal/engine"],
+      "triggers": ["CLI mcp"]
+    }
+  ]
+}

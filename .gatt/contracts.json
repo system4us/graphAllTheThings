@@ -1,0 +1,24 @@
+{
+  "api": {
+    "mcp_tools": [
+      "graph_overview",
+      "find_entities",
+      "describe_entity",
+      "join_path",
+      "sql_context",
+      "annotate_entity",
+      "reload_graph",
+      "check_drift",
+      "refresh_graph"
+    ]
+  },
+  "database": {
+    "graph_format": "gatt-out/graph.json",
+    "vector_format": "gatt-out/vectors.json",
+    "annotations_format": "gatt-out/annotations.json"
+  },
+  "interfaces": {
+    "Connector": "internal/connector/connector.go",
+    "VectorStore": "internal/store/store.go"
+  }
+}
