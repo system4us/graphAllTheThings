@@ -1041,6 +1041,14 @@ func langFor(ext string) *langConfig {
 			(comment) @loose.comment
 			(method_declaration (attribute_list (attribute (identifier) @cattr.name (attribute_argument_list)? @cattr.args)) name: (identifier) @cattr.method)
 			(class_declaration (attribute_list (attribute (identifier) @ccls.name (attribute_argument_list) @ccls.args)) name: (identifier) @ccls.class)
+			(class_declaration
+			  name: (identifier) @csmodel.name
+			  (base_list) @csmodel.bases
+			  body: (declaration_list) @csmodel.body) @csmodel.class
+			(class_declaration
+			  (attribute_list (attribute name: (identifier) @csmodel.ann (attribute_argument_list)? @csmodel.annargs))
+			  name: (identifier) @csmodel.name
+			  body: (declaration_list) @csmodel.body) @csmodel.class
 			`,
 		}
 	}
@@ -2060,6 +2068,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 			if n := caps["ccls.name"]; n != nil {
 				c.handleAnnotation(&anns, n.Content(data), annArgs("ccls.args"), nil, caps["ccls.class"], relPath, data)
+			}
+			if _, ok := caps["csmodel.class"]; ok {
+				c.detectCSharpModel(g, caps, relPath, fileID, data)
 			}
 			if n := caps["kann.name"]; n != nil {
 				c.handleAnnotation(&anns, n.Content(data), annArgs("kann.args"), caps["kann.method"], nil, relPath, data)

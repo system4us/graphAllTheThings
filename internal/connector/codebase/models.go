@@ -399,6 +399,124 @@ func kotlinAnnotationStringArg(argsNode *sitter.Node, data []byte, key string) s
 	return ""
 }
 
+// detectCSharpModel handles two independent EF Core signals: a class whose
+// base list matches a configured model base (weak defaults "Base"/"Model",
+// or a project-specific name like "BaseEntity" via .gatt/models.json — C#
+// projects that map entities by pure convention, no attributes anywhere,
+// have no *other* signal available at all, so this is the only path in for
+// them), and DataAnnotations attributes ([Table("...")]/[Column("...")]),
+// which — unlike a project's own base-class name — are a universal,
+// safe-to-auto-detect signal the same way JPA's @Entity is.
+// [NotMapped] excludes a field the same way JPA's @Transient does.
+func (c *Connector) detectCSharpModel(g *graph.Graph, caps map[string]*sitter.Node, relPath, fileID string, data []byte) {
+	if c.modelBases == nil {
+		c.loadModelBases()
+	}
+	nameNode := caps["csmodel.name"]
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(data)
+
+	strongBase, weakBase := false, false
+	if basesNode := caps["csmodel.bases"]; basesNode != nil {
+		for _, tok := range baseTokens(basesNode.Content(data)) {
+			if c.modelBases[tok] {
+				strongBase = true
+			} else if weakModelBases[tok] {
+				weakBase = true
+			}
+		}
+	}
+
+	table := ""
+	if annNode := caps["csmodel.ann"]; annNode != nil {
+		switch ann := annNode.Content(data); ann {
+		case "Table":
+			strongBase = true
+			if argsNode := caps["csmodel.annargs"]; argsNode != nil {
+				table = csharpAttributeFirstString(argsNode, data)
+			}
+		case "Column":
+			strongBase = true
+		}
+	}
+	if !strongBase && !weakBase {
+		return
+	}
+
+	var fields []string
+	if body := caps["csmodel.body"]; body != nil {
+		for i := 0; i < int(body.NamedChildCount()); i++ {
+			prop := body.NamedChild(i)
+			if prop.Type() != "property_declaration" {
+				continue
+			}
+			propNameNode := prop.ChildByFieldName("name")
+			if propNameNode == nil {
+				continue
+			}
+			transient, colName := false, ""
+			for j := 0; j < int(prop.NamedChildCount()); j++ {
+				al := prop.NamedChild(j)
+				if al.Type() != "attribute_list" {
+					continue
+				}
+				for k := 0; k < int(al.NamedChildCount()); k++ {
+					a := al.NamedChild(k)
+					if a.Type() != "attribute" {
+						continue
+					}
+					anameNode := a.ChildByFieldName("name")
+					if anameNode == nil {
+						continue
+					}
+					switch aname := anameNode.Content(data); aname {
+					case "NotMapped":
+						transient = true
+					case "Column":
+						if a.NamedChildCount() > 1 {
+							if s := csharpAttributeFirstString(a.NamedChild(1), data); s != "" {
+								colName = s
+							}
+						}
+					}
+				}
+			}
+			if transient {
+				continue
+			}
+			fname := propNameNode.Content(data)
+			entry := fname
+			if colName != "" && colName != fname {
+				entry += "→" + colName
+			}
+			fields = append(fields, entry)
+		}
+	}
+	if !strongBase && table == "" && len(fields) == 0 {
+		return // weak base with no ORM evidence: not a model
+	}
+	c.emitModelFields(g, name, table, fields, relPath, fileID, int(nameNode.StartPoint().Row)+1)
+}
+
+// csharpAttributeFirstString returns the first positional string-literal
+// argument of a C# attribute_argument_list — e.g. "Products" in
+// [Table("Products")]. attribute_argument has no named "value" field for
+// its inner literal in this grammar, hence positional (NamedChild(0)).
+func csharpAttributeFirstString(argsNode *sitter.Node, data []byte) string {
+	for i := 0; i < int(argsNode.NamedChildCount()); i++ {
+		arg := argsNode.NamedChild(i)
+		if arg.Type() != "attribute_argument" || arg.NamedChildCount() == 0 {
+			continue
+		}
+		if v := arg.NamedChild(0); v.Type() == "string_literal" {
+			return strings.Trim(v.Content(data), "\"")
+		}
+	}
+	return ""
+}
+
 // detectClassModel handles TS/JS class declarations: TypeORM-style decorated
 // classes (@Entity/@Table on the class, @Column({name}) on fields) and any
 // class extending a configured base. A weak base (Model, Base) alone is not
