@@ -604,9 +604,97 @@ func (e *Engine) RenderFunction(id string) (string, error) {
 	return b.String(), nil
 }
 
+// coverageSampleCap bounds how many raw hits coverageNote pulls back to
+// count distinct files from. Below this, every occurrence in the repo was
+// actually seen, so the file count is exact; at or above it, some
+// occurrences were never fetched and the count degrades to "at least this
+// many, uncorrected" — expected for a very common bare name, where the
+// coverage note is the least useful anyway (mostly unrelated identifiers).
+const coverageSampleCap = 400
+
+// coverageNote is Impact/Blast's completeness signal: it compares
+// directWired (the direct call/handler/middleware edges already found for a
+// function — one per *source*, already deduped) against how many distinct
+// *files* mention that function's bare name as raw text anywhere in the
+// codebase. A gap between the two means some file that mentions the name
+// has no wired edge to it at all — computed member access,
+// .bind()/.call()/.apply() indirection, a dispatch idiom the extractor
+// doesn't special-case — and "no callers found" or "N callers" would
+// otherwise read as complete when it might not be. This is exactly the
+// kind of miss that let two real bugs (a middleware reference, a
+// namespace-export re-export) sit unnoticed until an actual grep
+// cross-check caught them — the check that used to live in the person
+// running gatt's head now runs on every query instead.
+//
+// Counting distinct files rather than raw line matches matters: a route
+// file that calls requirePermission(...) nine times with nine different
+// permission strings gets exactly one CALLS edge (same source, same
+// target — wiring nine identical edges would just be noise), so comparing
+// wired-edge count against raw *occurrence* count is a false mismatch
+// baked into any caller that invokes the same target more than once, which
+// permission/validation/logging helpers do constantly. Per-file dedup
+// fixes that: nine call sites in one file is still one file.
+//
+// Over-flagging is fine (a same-named identifier, a comment, a string that
+// happens to contain the word): the cost of a false alarm is one glance;
+// the cost of silence was two shipped false negatives.
+func (e *Engine) coverageNote(name string, directWired int) string {
+	hits, total, _, err := e.grepScan(name, false, coverageSampleCap)
+	if err != nil || total == 0 {
+		return ""
+	}
+	filesWithHit := map[string]bool{}
+	var sample []GrepHit
+	for _, h := range hits {
+		t := strings.TrimSpace(h.Text)
+		if strings.HasPrefix(t, "import ") || strings.HasPrefix(t, "import(") || strings.HasPrefix(t, "from ") {
+			continue // structural noise: every wired call site has one too
+		}
+		if !filesWithHit[h.Path] {
+			filesWithHit[h.Path] = true
+			sample = append(sample, h)
+		}
+	}
+	fileCount := len(filesWithHit)
+	degraded := total >= coverageSampleCap // some occurrences were never fetched
+	extra := fileCount - directWired
+	if extra <= 0 {
+		return ""
+	}
+	if len(sample) > 3 {
+		sample = sample[:3]
+	}
+	truncNote := ""
+	if degraded {
+		truncNote = ", sample truncated — could be more"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n⚠ coverage: %q shows up in %d more file(s) (%d file(s) total, import lines excluded%s) than the %d edge(s) above account for",
+		name, extra, fileCount, truncNote, directWired)
+	b.WriteString(" — could be an indirect call this analysis can't see (computed member access, .bind()/.call()/.apply(), " +
+		"an unhandled dispatch pattern), or just a same-named identifier/comment/string with no relation to this one. " +
+		"Worth a quick look before treating this as complete:\n")
+	for _, h := range sample {
+		fmt.Fprintf(&b, "    %s:%d: %s\n", h.Path, h.Line, h.Text)
+	}
+	return b.String()
+}
+
 // modelMatches returns the ids of every NodeModel node with the given name.
 // Shared by Impact (to tell "not a function, it's a model" apart from "not
 // found at all") and Blast (as its model-by-name fallback).
+// callerFileKey returns the file a caller node lives in, for grouping
+// direct-caller counts by file: a function/route node's own "file" attr
+// for everything except a file node itself, which (since it *is* the file)
+// carries the path under "path" instead — using n.Attrs["file"] on a file
+// node returns "", collapsing every file-sourced caller into one bucket.
+func callerFileKey(n *graph.Node) string {
+	if n.Type == graph.NodeFile {
+		return n.Attrs["path"]
+	}
+	return n.Attrs["file"]
+}
+
 func (e *Engine) modelMatches(name string) []string {
 	var matches []string
 	for id, nn := range e.G.Nodes {
@@ -661,6 +749,7 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 	visited := map[string]bool{id: true}
 	level := []string{id}
 	total := 0
+	directCount := 0
 	for d := 1; d <= depth && len(level) > 0; d++ {
 		var next []string
 		for _, cur := range level {
@@ -674,6 +763,22 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 		}
 		if len(next) == 0 {
 			break
+		}
+		if d == 1 {
+			// Distinct files, not edge count: coverageNote compares this
+			// against a distinct-file grep count, and a single file can
+			// legitimately source many direct edges (several routes in one
+			// routes.ts all using the same middleware) without that being
+			// several files' worth of "coverage" — counting edges here
+			// would make well-covered targets look under-covered by the
+			// file-based comparison and mask real gaps in the noise.
+			directFiles := map[string]bool{}
+			for _, cid := range next {
+				if cn := e.G.Nodes[cid]; cn != nil {
+					directFiles[callerFileKey(cn)] = true
+				}
+			}
+			directCount = len(directFiles)
 		}
 		label := "direct callers"
 		if d > 1 {
@@ -725,6 +830,7 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 	} else {
 		fmt.Fprintf(&b, "\ntotal affected: %d function(s) within depth %d\n", total, depth)
 	}
+	b.WriteString(e.coverageNote(n.Name, directCount))
 	b.WriteString(e.sharedStateText(id))
 	return b.String(), nil
 }
@@ -1073,6 +1179,19 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 		fmt.Fprintf(&b, "\ntotal affected: %d node(s) within depth %d\n", total, depth)
 	}
 	if n.Type == graph.NodeFunction {
+		// Distinct files, not edge count — see Impact's directFiles for why:
+		// one file can legitimately source many direct edges (several
+		// routes in one routes.ts using the same middleware) without that
+		// being several files' worth of coverage.
+		directFiles := map[string]bool{}
+		for _, edgeType := range [...]string{graph.EdgeCalls, graph.EdgeHandledBy, graph.EdgeUsesMiddleware} {
+			for _, h := range byEdge[edgeType] {
+				if h.depth == 1 {
+					directFiles[callerFileKey(h.node)] = true
+				}
+			}
+		}
+		b.WriteString(e.coverageNote(n.Name, len(directFiles)))
 		b.WriteString(e.sharedStateText(n.ID))
 	}
 	return b.String(), nil

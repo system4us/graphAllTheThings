@@ -108,6 +108,78 @@ type Connector struct {
 	// tree is parsed.
 	pendingDispatchAssocs   []dispatchAssoc
 	pendingDispatchTriggers []dispatchTrigger
+	// namedImports maps file path -> imported local binding name -> resolved
+	// target file id ("file:...") — every `import { x } from '...'` binding
+	// in that file (JS/TS/JSX), not just the state-tracking subset (see
+	// `singletons` in parseFiles: same query captures, this is the
+	// connector-wide copy so a re-export chain can look up "what does `x`
+	// refer to in this other file" after every file has been parsed).
+	// nsImports is the same idea for `import * as NS from '...'`: file path
+	// -> namespace-imported local binding name -> resolved target file id.
+	namedImports map[string]map[string]string
+	nsImports    map[string]map[string]string
+	// pendingExportSpecs collects every `export { x as y }` re-export
+	// specifier found while parsing (JS/TS/JSX only; no `source` — a
+	// re-export of something already imported/defined in this same file).
+	// `export { x } from './other'` barrel re-exports are a separate,
+	// harder case (would need chasing into another file's own export map)
+	// and are out of scope for v1. Resolved against namedImports + the
+	// finished function index by resolveExports after the whole tree is
+	// parsed.
+	pendingExportSpecs []exportSpecRaw
+	// pendingStarExports collects every bare `export * from './other'`
+	// found while parsing, resolved by resolveExports alongside
+	// pendingExportSpecs.
+	pendingStarExports []starExportRaw
+	// pendingTopLevelCalls collects every file's module-scope call names
+	// (see topLevelCallsRaw), resolved by resolveTopLevelCalls after the
+	// whole tree is parsed — same timing as pendingExportSpecs, for the
+	// same reason (needs every file's functions and imports known first).
+	pendingTopLevelCalls []topLevelCallsRaw
+	// fileExports maps a file id -> exported name -> the function node it
+	// actually refers to, built by resolveExports. Lets a namespace-import
+	// member call (`saleService.create(...)` where `saleService` is
+	// `import * as saleService from '../services'`) resolve through the
+	// facade's own `export { createSale as create }` instead of dead-ending
+	// at "no local binding named create" — the gap that made `gatt impact`/
+	// `blast` report false "no callers" for a common service-facade
+	// pattern.
+	fileExports map[string]map[string]string
+}
+
+// exportSpecRaw is one `export { local as exported }` specifier queued
+// during parseFiles, resolved by resolveExports once the whole tree — and
+// therefore every file's own functions and imports — is known.
+type exportSpecRaw struct {
+	file         string // relPath: matches funcInfo.file and namedImports' key
+	fileID       string // "file:"+path: matches nsImports' values
+	localName    string
+	exportedName string
+	// sourceFileID is "" for `export { x as y }` (x lives in, or was
+	// imported into, this same file) and the resolved target file id for
+	// `export { x as y } from './other'` (x lives over there instead).
+	sourceFileID string
+}
+
+// starExportRaw is a bare `export * from './other'` — every name that
+// file exports becomes visible under the same name in this one. The other
+// half of the saleController.ts -> saleService.ts -> services/index.ts
+// chain that motivated this whole feature: saleService.ts is nothing but
+// `export * from './types'; export * from './index'`.
+type starExportRaw struct {
+	fileID       string
+	targetFileID string
+}
+
+// topLevelCallsRaw is one file's worth of call names collected at module
+// scope — no enclosing function to attribute them to, e.g. a route
+// registration like `router.get('/', requirePermission('x'), handler)`
+// sitting directly in a routes.ts file. Resolved by resolveTopLevelCalls,
+// wired from the file node instead of a function node.
+type topLevelCallsRaw struct {
+	fileID string
+	file   string // relPath — for resolveCall's same-file tiebreak and nsImports lookup
+	calls  []string
 }
 
 // csharpRoot pairs a project directory with its root namespace, for
@@ -201,7 +273,8 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	c.detectProjects(g)
 
 	funcs, funcsByName := c.parseFiles(ctx, g)
-	resolveAndWire(g, funcs, funcsByName)
+	c.resolveExports(g)
+	c.resolveAndWire(g, funcs, funcsByName)
 	c.wireMentions(g)
 	c.wireRoutes(g, funcsByName)
 	c.wireModels(g)
@@ -418,7 +491,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 			funcsByName[n.Name] = append(funcsByName[n.Name], id)
 		}
 	}
-	resolveAndWire(prev, newFuncs, funcsByName)
+	c.resolveAndWire(prev, newFuncs, funcsByName)
 	c.wireMentions(prev)
 	c.wireRoutes(prev, funcsByName)
 	c.wireModels(prev)
@@ -738,6 +811,15 @@ func langFor(ext string) *langConfig {
 			    . (member_expression
 			        object: (identifier) @state.oa_target_obj
 			        property: (property_identifier) @state.oa_target_prop))) @oa.call
+			(import_statement
+			  (import_clause (namespace_import (identifier) @nsimport.name))
+			  source: (string) @nsimport.src)
+			(export_statement (export_clause (export_specifier) @export.spec)) @export.stmt
+			(export_statement source: (string) @exportstar.src) @exportstar.stmt
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @nsref.obj
+			    property: (property_identifier) @nsref.method)) @nsref.call
 			`,
 		}
 	case ".js", ".jsx":
@@ -811,6 +893,15 @@ func langFor(ext string) *langConfig {
 			    . (member_expression
 			        object: (identifier) @state.oa_target_obj
 			        property: (property_identifier) @state.oa_target_prop))) @oa.call
+			(import_statement
+			  (import_clause (namespace_import (identifier) @nsimport.name))
+			  source: (string) @nsimport.src)
+			(export_statement (export_clause (export_specifier) @export.spec)) @export.stmt
+			(export_statement source: (string) @exportstar.src) @exportstar.stmt
+			(call_expression
+			  function: (member_expression
+			    object: (identifier) @nsref.obj
+			    property: (property_identifier) @nsref.method)) @nsref.call
 			`,
 		}
 	case ".py":
@@ -1359,6 +1450,8 @@ func receiverTypeName(recvNode *sitter.Node, src []byte) string {
 func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo, map[string][]string) {
 	var funcs []funcInfo
 	funcsByName := map[string][]string{}
+	c.namedImports = map[string]map[string]string{}
+	c.nsImports = map[string]map[string]string{}
 
 	if c.tsconfigs == nil {
 		c.loadTSConfigs()
@@ -1565,6 +1658,16 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// import statement that resolves its binding.
 		singletons := map[string]string{}
 		var stateAccesses []stateAccessRaw
+		// topLevelCalls collects call names whose site has no enclosing
+		// function at all — module-scope code, most commonly a route
+		// registration (`router.get('/', requirePermission('x'), handler)`
+		// sitting directly in a routes.ts file, never inside a named
+		// function). The per-function attribution loop below has nowhere to
+		// put these, so without this they're silently dropped: the call
+		// happens, but never becomes a CALLS edge from anything. Resolved
+		// the same way as any function's calls, but wired from the file
+		// node instead — see resolveTopLevelCalls.
+		var topLevelCalls []string
 
 		for {
 			m, ok := qc.NextMatch()
@@ -1764,6 +1867,8 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if bestIdx >= 0 && funcs[bestIdx].lineEnd >= callLine {
 					funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
 					callerFuncID = funcs[bestIdx].id
+				} else {
+					topLevelCalls = append(topLevelCalls, callName)
 				}
 				// Same capture doubles as the native-route probe (Go/Python
 				// registrations, routes_native.go) and, when that declines,
@@ -1902,6 +2007,99 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					}
 				}
 			}
+
+			// ── Namespace import (JS/TS/JSX): `import * as NS from '...'` ───────
+			// Feeds the nsref.* resolution below — `NS.method(...)` can't resolve
+			// to anything without first knowing which file NS came from.
+			if srcNode, ok := caps["nsimport.src"]; ok {
+				if nameNode, ok := caps["nsimport.name"]; ok {
+					spec := strings.Trim(srcNode.Content(data), `"'`)
+					if local := c.resolveLocalImport(path, spec); local != "" {
+						if c.nsImports[relPath] == nil {
+							c.nsImports[relPath] = map[string]string{}
+						}
+						c.nsImports[relPath][nameNode.Content(data)] = "file:" + local
+					}
+				}
+			}
+
+			// ── Re-export specifier (JS/TS/JSX): `export { x as y }` and ────────
+			// `export { x as y } from './other'`. Queued raw; resolveExports
+			// needs every file's functions and imports known first, which
+			// isn't true until parseFiles returns.
+			if specNode, ok := caps["export.spec"]; ok {
+				if stmtNode := caps["export.stmt"]; stmtNode != nil {
+					if nameNode := specNode.ChildByFieldName("name"); nameNode != nil {
+						localName := nameNode.Content(data)
+						exportedName := localName
+						if aliasNode := specNode.ChildByFieldName("alias"); aliasNode != nil {
+							exportedName = aliasNode.Content(data)
+						}
+						sourceFileID := ""
+						if srcNode := stmtNode.ChildByFieldName("source"); srcNode != nil {
+							spec := strings.Trim(srcNode.Content(data), `"'`)
+							if local := c.resolveLocalImport(path, spec); local != "" {
+								sourceFileID = "file:" + local
+							}
+						}
+						c.pendingExportSpecs = append(c.pendingExportSpecs, exportSpecRaw{
+							file: relPath, fileID: fileID, localName: localName, exportedName: exportedName,
+							sourceFileID: sourceFileID,
+						})
+					}
+				}
+			}
+
+			// ── Star re-export (JS/TS/JSX): bare `export * from './other'` ──────
+			// (Distinct from `export { x } from './other'`, handled above — a
+			// star export has a source but no export_clause child at all.)
+			if srcNode, ok := caps["exportstar.src"]; ok {
+				if stmtNode := caps["exportstar.stmt"]; stmtNode != nil {
+					hasClause := false
+					for i := range int(stmtNode.NamedChildCount()) {
+						if stmtNode.NamedChild(i).Type() == "export_clause" {
+							hasClause = true
+							break
+						}
+					}
+					if !hasClause {
+						spec := strings.Trim(srcNode.Content(data), `"'`)
+						if local := c.resolveLocalImport(path, spec); local != "" {
+							c.pendingStarExports = append(c.pendingStarExports, starExportRaw{
+								fileID: fileID, targetFileID: "file:" + local,
+							})
+						}
+					}
+				}
+			}
+
+			// ── Namespace-qualified call reference (JS/TS/JSX): `NS.method(...)` ─
+			// call.sel already fires on this same call_expression and captures
+			// just the property name — harmless duplication (see resolveAndWire:
+			// a bare, unresolvable "." selector is skipped, no stub created).
+			// This capture additionally keeps the object, so a namespace-import
+			// member call can resolve through nsImports + fileExports instead of
+			// only ever matching a same-file function that happens to share the
+			// property's bare name.
+			if objNode, ok := caps["nsref.obj"]; ok {
+				if methodNode := caps["nsref.method"]; methodNode != nil {
+					callLine := int(objNode.StartPoint().Row) + 1
+					bestIdx := -1
+					for i := range funcs {
+						if funcs[i].file == relPath && funcs[i].lineStart <= callLine {
+							if bestIdx == -1 || funcs[i].lineStart > funcs[bestIdx].lineStart {
+								bestIdx = i
+							}
+						}
+					}
+					nsCall := "#" + objNode.Content(data) + "." + methodNode.Content(data)
+					if bestIdx >= 0 && funcs[bestIdx].lineEnd >= callLine {
+						funcs[bestIdx].calls = append(funcs[bestIdx].calls, nsCall)
+					} else {
+						topLevelCalls = append(topLevelCalls, nsCall)
+					}
+				}
+			}
 			if _, ok := caps["state.write2"]; ok {
 				objN, propN, subN := caps["state.write2_obj"], caps["state.write2_prop"], caps["state.write2_sub"]
 				if objN != nil && propN != nil && subN != nil {
@@ -1946,6 +2144,14 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		emitLooseComments(g, looseComments, consumed, funcs, relPath, fileID, data)
 		c.emitAnnotationRoutes(g, &anns, relPath, fileID)
 		emitStateAccess(g, stateAccesses, singletons, funcs, relPath)
+		if len(singletons) > 0 {
+			c.namedImports[relPath] = singletons
+		}
+		if len(topLevelCalls) > 0 {
+			c.pendingTopLevelCalls = append(c.pendingTopLevelCalls, topLevelCallsRaw{
+				fileID: fileID, file: relPath, calls: topLevelCalls,
+			})
+		}
 
 		if goPkgName != "" {
 			c.wireGoPackage(g, fileID, relPath, goPkgName)
@@ -2941,7 +3147,90 @@ func stripJSONC(data []byte) []byte {
 	return out
 }
 
-func resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
+// resolveExports turns each queued `export { x as y }` specifier into a
+// fileExports entry: exported name -> the function node it actually refers
+// to, chasing at most one import hop (the specifier's local name is either
+// defined in the same file, or was itself imported from elsewhere — e.g. a
+// service-facade file that does `import { createSale } from
+// './handlers/createSale'; export { createSale as create };`). Resolves via
+// BELONGS_TO edges rather than reconstructing path strings, so it doesn't
+// need to know whether nsImports' file-id values share path.Rel's exact
+// string form with the ids parseFiles assigned. Ambiguous or unresolved
+// specifiers are dropped — same "no edge beats a wrong edge" discipline as
+// resolveCall below.
+func (c *Connector) resolveExports(g *graph.Graph) {
+	c.fileExports = map[string]map[string]string{}
+	set := func(fileID, name, target string) bool {
+		if c.fileExports[fileID] == nil {
+			c.fileExports[fileID] = map[string]string{}
+		}
+		if _, exists := c.fileExports[fileID][name]; exists {
+			return false
+		}
+		c.fileExports[fileID][name] = target
+		return true
+	}
+	funcInFile := func(fileID, name string) string {
+		for _, ed := range g.EdgesOf(fileID) {
+			if ed.Type != graph.EdgeBelongsTo || ed.To != fileID {
+				continue
+			}
+			if nn := g.Nodes[ed.From]; nn != nil && nn.Type == graph.NodeFunction && nn.Name == name {
+				return ed.From
+			}
+		}
+		return ""
+	}
+	// Fixed-point over both queues: a barrel file's own exports may depend
+	// on another barrel file that hasn't been resolved yet (saleService.ts
+	// exports * from services/index.ts, which itself exports named
+	// aliases), and pendingExportSpecs/pendingStarExports aren't in
+	// dependency order — they're queued in file-walk order. A handful of
+	// passes settles any realistic facade depth without needing a real
+	// topological sort; a pass that changes nothing means every reachable
+	// chain has already been followed as far as it goes.
+	for range 5 {
+		changed := false
+		for _, spec := range c.pendingExportSpecs {
+			var target string
+			if spec.sourceFileID != "" {
+				// `export { x as y } from './other'` — x is defined in, or
+				// itself re-exported by, the OTHER file.
+				target = funcInFile(spec.sourceFileID, spec.localName)
+				if target == "" {
+					target = c.fileExports[spec.sourceFileID][spec.localName]
+				}
+			} else {
+				target = funcInFile(spec.fileID, spec.localName)
+				if target == "" {
+					if imported, ok := c.namedImports[spec.file][spec.localName]; ok {
+						target = funcInFile(imported, spec.localName)
+					}
+				}
+			}
+			if target == "" {
+				continue
+			}
+			if set(spec.fileID, spec.exportedName, target) {
+				changed = true
+			}
+		}
+		for _, se := range c.pendingStarExports {
+			for name, target := range c.fileExports[se.targetFileID] {
+				if set(se.fileID, name, target) {
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	c.pendingExportSpecs = nil
+	c.pendingStarExports = nil
+}
+
+func (c *Connector) resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
 	for i := range funcs {
 		fi := &funcs[i]
 
@@ -2965,42 +3254,89 @@ func resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]s
 			}
 		}
 
-		// Resolve CALLS edges.
-		seen := map[string]bool{}
-		for _, calledName := range fi.calls {
-			if seen[calledName] {
-				continue
-			}
-			seen[calledName] = true
-
-			if target := resolveCall(g, fi.file, calledName, funcsByName); target != "" {
-				g.AddEdge(fi.id, target, graph.EdgeCalls, nil)
-				continue
-			}
-			bareName := strings.TrimPrefix(calledName, ".")
-			if strings.HasPrefix(calledName, ".") || builtinNames[bareName] {
-				// External selector (stdlib/method) or language builtin:
-				// stubs for these are pure noise in the graph.
-				continue
-			}
-			if len(funcsByName[bareName]) > 1 {
-				// Ambiguous cross-file name (e.g. dozens of "append" defs in a
-				// monorepo): wiring to all targets creates quadratic false
-				// edges. Skip — better no edge than thousands of wrong ones.
-				continue
-			}
-			stubID := "call:" + bareName
-			if g.Nodes[stubID] == nil {
-				g.AddNode(&graph.Node{
-					ID:    stubID,
-					Type:  graph.NodeFunction,
-					Name:  bareName,
-					Attrs: map[string]string{"external": "true"},
-				})
-			}
-			g.AddEdge(fi.id, stubID, graph.EdgeCalls, nil)
-		}
+		c.resolveCallsFrom(g, fi.id, fi.file, fi.calls, funcsByName)
 	}
+	c.resolveTopLevelCalls(g, funcsByName)
+}
+
+// resolveCallsFrom wires CALLS edges from callerID (a function node, or —
+// for module-scope calls with no enclosing function, see
+// resolveTopLevelCalls — a file node) for each raw call name. callerFile is
+// the relPath calls was collected from, used for resolveCall's same-file
+// tiebreak and for the namespace-export lookup. The resolution rules
+// themselves don't care which kind of node callerID is; a route
+// registration in a file's top-level code "calls" requirePermission(...)
+// in exactly the same sense a function's body does.
+func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string, calls []string, funcsByName map[string][]string) {
+	seen := map[string]bool{}
+	for _, calledName := range calls {
+		if seen[calledName] {
+			continue
+		}
+		seen[calledName] = true
+
+		if rest, ok := strings.CutPrefix(calledName, "#"); ok {
+			// Namespace-import member call (NS.method(...)): resolve NS
+			// against this file's nsImports, then method against that
+			// target file's fileExports. Either miss just means "no
+			// namespace-export edge for this one" — call.sel's own,
+			// separate capture on the same call site may still have
+			// resolved it the ordinary same-file way.
+			if obj, method, ok := strings.Cut(rest, "."); ok {
+				if targetFile, ok := c.nsImports[callerFile][obj]; ok {
+					if target, ok := c.fileExports[targetFile][method]; ok {
+						g.AddEdge(callerID, target, graph.EdgeCalls, map[string]string{"inferred": "true", "via": "namespace-export"})
+					}
+				}
+			}
+			continue
+		}
+
+		if target := resolveCall(g, callerFile, calledName, funcsByName); target != "" {
+			g.AddEdge(callerID, target, graph.EdgeCalls, nil)
+			continue
+		}
+		bareName := strings.TrimPrefix(calledName, ".")
+		if strings.HasPrefix(calledName, ".") || builtinNames[bareName] {
+			// External selector (stdlib/method) or language builtin:
+			// stubs for these are pure noise in the graph.
+			continue
+		}
+		if len(funcsByName[bareName]) > 1 {
+			// Ambiguous cross-file name (e.g. dozens of "append" defs in a
+			// monorepo): wiring to all targets creates quadratic false
+			// edges. Skip — better no edge than thousands of wrong ones.
+			continue
+		}
+		stubID := "call:" + bareName
+		if g.Nodes[stubID] == nil {
+			g.AddNode(&graph.Node{
+				ID:    stubID,
+				Type:  graph.NodeFunction,
+				Name:  bareName,
+				Attrs: map[string]string{"external": "true"},
+			})
+		}
+		g.AddEdge(callerID, stubID, graph.EdgeCalls, nil)
+	}
+}
+
+// resolveTopLevelCalls wires CALLS edges for every call collected at module
+// scope (topLevelCallsRaw — see parseFiles), from the file node itself: a
+// route registration sitting directly in a routes.ts file (never inside a
+// named function) has no function to be "the caller", but the file that
+// runs that code at import time is exactly as real a caller as any
+// function is. Same resolution rules as function calls (resolveCallsFrom);
+// same "calls_raw" persistence for incremental re-resolution as functions
+// get (see resolveAndWire).
+func (c *Connector) resolveTopLevelCalls(g *graph.Graph, funcsByName map[string][]string) {
+	for _, tc := range c.pendingTopLevelCalls {
+		if n := g.Nodes[tc.fileID]; n != nil && len(tc.calls) > 0 {
+			n.Attrs["top_level_calls_raw"] = strings.Join(tc.calls, " ")
+		}
+		c.resolveCallsFrom(g, tc.fileID, tc.file, tc.calls, funcsByName)
+	}
+	c.pendingTopLevelCalls = nil
 }
 
 func findProject(g *graph.Graph, path string, root string) string {

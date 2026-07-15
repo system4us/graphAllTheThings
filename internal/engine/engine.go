@@ -18,6 +18,13 @@ type Engine struct {
 	G   *graph.Graph
 	VS  store.VectorStore // nil disables semantic search
 	Emb *embed.Client
+	// Chat is an optional local chat model used to expand a query into a
+	// couple of alternate phrasings before embedding, so a conceptual query
+	// phrased in the user's words ("prevent a duplicate request") has a shot
+	// at matching code that only ever says it in implementation vocabulary
+	// ("idempotency key"). nil disables expansion — Find behaves exactly as
+	// it did before Chat existed.
+	Chat *embed.ChatClient
 	// FTS is an optional indexed keyword search (SQLite FTS5) returning node
 	// ids best-first. keywordFind uses it instead of scanning every NodeText
 	// in memory; nil or an empty result falls back to the scan.
@@ -27,6 +34,11 @@ type Engine struct {
 func New(g *graph.Graph, vs store.VectorStore, emb *embed.Client) *Engine {
 	return &Engine{G: g, VS: vs, Emb: emb}
 }
+
+// queryExpansions is how many alternate phrasings Chat is asked for. Kept
+// small: each extra variant is a full embed-and-search pass, and expansion
+// exists to bridge one vocabulary gap, not to brute-force every synonym.
+const queryExpansions = 2
 
 type Overview struct {
 	Source     string            `json:"source"`
@@ -184,67 +196,124 @@ func (e *Engine) Find(ctx context.Context, query, nodeType string, limit int) (F
 		}
 	}
 	if e.VS != nil && e.Emb != nil {
-		vecs, err := e.Emb.Embed(ctx, []string{query})
+		method, hits, err := e.semanticSearch(ctx, query, nodeType, limit)
 		if err == nil {
-			hits, err := e.VS.Search(ctx, vecs[0], limit, nodeType)
-			if err == nil {
-				out := FindResult{Method: "semantic"}
-				seen := map[string]bool{}
-				for _, h := range hits {
-					// Skip vectors for nodes no longer in the graph (stale index).
-					if e.G.Nodes[h.NodeID] == nil {
-						continue
-					}
-					seen[h.NodeID] = true
-					out.Hits = append(out.Hits, FindHit{
-						ID: h.NodeID, Type: h.Type, Name: h.Name,
-						Score: h.Score, Text: e.G.NodeText(h.NodeID),
-					})
+			out := FindResult{Method: method}
+			seen := map[string]bool{}
+			for _, h := range hits {
+				// Skip vectors for nodes no longer in the graph (stale index).
+				if e.G.Nodes[h.NodeID] == nil {
+					continue
 				}
-				// Hybrid: nodes added after the last index run have no vector,
-				// so a pure semantic answer silently misses them. Merge keyword
-				// hits — a query term matching the node *name* is high-signal
-				// and may evict the semantic tail; others only fill spare slots.
-				var nameHits, textHits []FindHit
-				terms := strings.Fields(strings.ToLower(query))
-				for _, kh := range e.keywordFind(query, nodeType, limit).Hits {
-					if seen[kh.ID] {
-						continue
-					}
-					lname := strings.ToLower(kh.Name)
-					matched := false
-					for _, t := range terms {
-						if strings.Contains(lname, t) {
-							matched = true
-							break
-						}
-					}
-					if matched {
-						nameHits = append(nameHits, kh)
-					} else {
-						textHits = append(textHits, kh)
-					}
+				seen[h.NodeID] = true
+				out.Hits = append(out.Hits, FindHit{
+					ID: h.NodeID, Type: h.Type, Name: h.Name,
+					Score: h.Score, Text: e.G.NodeText(h.NodeID),
+				})
+			}
+			// Hybrid: nodes added after the last index run have no vector,
+			// so a pure semantic answer silently misses them. Merge keyword
+			// hits — a query term matching the node *name* is high-signal
+			// and may evict the semantic tail; others only fill spare slots.
+			var nameHits, textHits []FindHit
+			terms := strings.Fields(strings.ToLower(query))
+			for _, kh := range e.keywordFind(query, nodeType, limit).Hits {
+				if seen[kh.ID] {
+					continue
 				}
-				if reserve := min(len(nameHits), 3); len(out.Hits) > limit-reserve {
-					out.Hits = out.Hits[:limit-reserve]
-				}
-				merged := false
-				for _, kh := range append(nameHits, textHits...) {
-					if len(out.Hits) >= limit {
+				lname := strings.ToLower(kh.Name)
+				matched := false
+				for _, t := range terms {
+					if strings.Contains(lname, t) {
+						matched = true
 						break
 					}
-					out.Hits = append(out.Hits, kh)
-					merged = true
 				}
-				if merged {
-					out.Method = "hybrid"
+				if matched {
+					nameHits = append(nameHits, kh)
+				} else {
+					textHits = append(textHits, kh)
 				}
-				return out, nil
 			}
+			if reserve := min(len(nameHits), 3); len(out.Hits) > limit-reserve {
+				out.Hits = out.Hits[:limit-reserve]
+			}
+			merged := false
+			for _, kh := range append(nameHits, textHits...) {
+				if len(out.Hits) >= limit {
+					break
+				}
+				out.Hits = append(out.Hits, kh)
+				merged = true
+			}
+			// "hybrid" replaces "semantic", but must not erase "+expanded" —
+			// that tag is what tells a caller "some of these hits came from
+			// a paraphrase, not your literal words," which stays true
+			// whether or not keyword hits also got merged in.
+			if merged {
+				out.Method = strings.Replace(out.Method, "semantic", "hybrid", 1)
+			}
+			return out, nil
 		}
 		// fall through to keyword on any semantic failure
 	}
 	return e.keywordFind(query, nodeType, limit), nil
+}
+
+// semanticSearch embeds query (expanded into a couple of alternate
+// phrasings first when e.Chat is set) and returns the union of every
+// variant's hits, deduped by node id keeping each node's best score, sorted
+// and capped to limit. Method is "semantic" when only the original query
+// was used, "semantic+expanded" when at least one alternate phrasing
+// contributed a hit that wasn't already found by the original.
+func (e *Engine) semanticSearch(ctx context.Context, query, nodeType string, limit int) (string, []store.Hit, error) {
+	variants := []string{query}
+	if e.Chat != nil {
+		variants = e.Chat.Expand(ctx, query, queryExpansions)
+	}
+	vecs, err := e.Emb.Embed(ctx, variants)
+	if err != nil {
+		return "", nil, err
+	}
+	best := map[string]store.Hit{}
+	expandedContributed := false
+	var lastSearchErr error
+	for i, vec := range vecs {
+		hits, searchErr := e.VS.Search(ctx, vec, limit, nodeType)
+		if searchErr != nil {
+			lastSearchErr = searchErr
+			continue
+		}
+		for _, h := range hits {
+			prev, ok := best[h.NodeID]
+			if i > 0 && !ok {
+				expandedContributed = true
+			}
+			if !ok || h.Score > prev.Score {
+				best[h.NodeID] = h
+			}
+		}
+	}
+	if len(best) == 0 {
+		// Every variant's search failed outright (not "no matches" — an
+		// actual error, e.g. the store is unreachable): surface it instead
+		// of silently returning an empty result set. A variant that merely
+		// found zero hits isn't an error and isn't distinguished here.
+		return "", nil, lastSearchErr
+	}
+	out := make([]store.Hit, 0, len(best))
+	for _, h := range best {
+		out = append(out, h)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	method := "semantic"
+	if expandedContributed {
+		method = "semantic+expanded"
+	}
+	return method, out, nil
 }
 
 func (e *Engine) keywordFind(query, typ string, limit int) FindResult {

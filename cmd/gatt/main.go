@@ -341,6 +341,23 @@ func indexFlags(fs *flag.FlagSet) (graphPath, qdURL, coll, embURL, embModel *str
 	return
 }
 
+// chatFlag registers --chat-model, opt-in query expansion for semantic
+// search: a couple of alternate phrasings in implementation vocabulary,
+// embedded and searched alongside the original query. Off by default (empty
+// string) since it's an extra chat round-trip per search — a quality lever
+// to reach for on a query you suspect is phrased too abstractly for the
+// index to match literally, not a default-on cost for every lookup.
+func chatFlag(fs *flag.FlagSet) *string {
+	return fs.String("chat-model", "", "ollama chat model for query expansion (e.g. llama3.2:1b — small and fast is enough, this only names a pattern); empty disables expansion")
+}
+
+// withChat wires --chat-model into an already-open engine, if given.
+func withChat(e *engine.Engine, embURL, chatModel string) {
+	if chatModel != "" {
+		e.Chat = embed.NewChat(embURL, chatModel)
+	}
+}
+
 // resolveModel picks the embedding model: explicit flag > model recorded in
 // the local index > default. Prevents silent dimension mismatches between
 // index time and query time.
@@ -470,6 +487,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 	query := args[0]
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	chatModel := chatFlag(fs)
 	typ := fs.String("type", "", "filter by node type")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -478,9 +496,13 @@ func cmdSearch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	withChat(e, *embURL, *chatModel)
 	res, err := e.Find(ctx, query, *typ, 10)
 	if err != nil {
 		return err
+	}
+	if strings.Contains(res.Method, "expanded") {
+		fmt.Println("(query expanded — some hits below came from an alternate phrasing, not the query as typed)")
 	}
 	for _, h := range res.Hits {
 		fmt.Printf("%.3f  %-8s %s\n       %s\n", h.Score, h.Type, h.ID, h.Text)
@@ -495,6 +517,7 @@ func cmdQuery(ctx context.Context, args []string) error {
 	question := args[0]
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	chatModel := chatFlag(fs)
 	limit := fs.Int("limit", 4, "max tables in context")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -503,6 +526,7 @@ func cmdQuery(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	withChat(e, *embURL, *chatModel)
 	out, err := e.ContextPack(ctx, question, *limit)
 	if err != nil {
 		return err
@@ -1214,6 +1238,7 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 	question := args[0]
 	fs := flag.NewFlagSet("code-query", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	chatModel := chatFlag(fs)
 	limit := fs.Int("limit", 6, "max entities in context")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -1223,6 +1248,7 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	withChat(e, *embURL, *chatModel)
 	out, err := e.CodeContextPack(ctx, question, *limit)
 	if err != nil {
 		return err

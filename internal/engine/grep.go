@@ -42,6 +42,38 @@ func (e *Engine) Grep(pattern string, useRegex bool, limit int) (string, error) 
 	if limit <= 0 {
 		limit = 50
 	}
+	hits, total, filesScanned, err := e.grepScan(pattern, useRegex, limit)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "exhaustive scan: %d file(s) scanned, %d match(es)\n", filesScanned, total)
+	if total == 0 {
+		b.WriteString("no matches — this string/pattern does not occur anywhere in the codebase\n")
+		return b.String(), nil
+	}
+	if total > len(hits) {
+		fmt.Fprintf(&b, "(showing first %d of %d)\n", len(hits), total)
+	}
+	for _, h := range hits {
+		fmt.Fprintf(&b, "%s:%d: %s\n", h.Path, h.Line, h.Text)
+	}
+	return b.String(), nil
+}
+
+// grepScan is Grep's exhaustive walk-and-match core, split out so a caller
+// that only needs a count (coverageNote, below) doesn't have to pay for
+// building and parsing the formatted report Grep returns. Returns up to
+// limit sample hits, the true total match count (uncapped), and how many
+// files were scanned.
+func (e *Engine) grepScan(pattern string, useRegex bool, limit int) ([]GrepHit, int, int, error) {
+	if !e.IsCodebase() {
+		return nil, 0, 0, fmt.Errorf("grep needs a codebase graph")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
 	dir := strings.TrimPrefix(e.G.Source, "codebase:")
 	gitFiles, gitOK := codebase.GitFileSet(dir)
 
@@ -50,7 +82,7 @@ func (e *Engine) Grep(pattern string, useRegex bool, limit int) (string, error) 
 	if useRegex {
 		compiled, err := regexp.Compile("(?i)" + pattern)
 		if err != nil {
-			return "", fmt.Errorf("invalid regex: %w", err)
+			return nil, 0, 0, fmt.Errorf("invalid regex: %w", err)
 		}
 		re = compiled
 	} else {
@@ -120,7 +152,7 @@ func (e *Engine) Grep(pattern string, useRegex bool, limit int) (string, error) 
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return nil, 0, 0, err
 	}
 
 	sort.Slice(hits, func(i, j int) bool {
@@ -129,20 +161,7 @@ func (e *Engine) Grep(pattern string, useRegex bool, limit int) (string, error) 
 		}
 		return hits[i].Line < hits[j].Line
 	})
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "exhaustive scan: %d file(s) scanned, %d match(es)\n", filesScanned, total)
-	if total == 0 {
-		b.WriteString("no matches — this string/pattern does not occur anywhere in the codebase\n")
-		return b.String(), nil
-	}
-	if total > len(hits) {
-		fmt.Fprintf(&b, "(showing first %d of %d)\n", len(hits), total)
-	}
-	for _, h := range hits {
-		fmt.Fprintf(&b, "%s:%d: %s\n", h.Path, h.Line, h.Text)
-	}
-	return b.String(), nil
+	return hits, total, filesScanned, nil
 }
 
 // isBinary applies the same heuristic as most greps: a NUL byte anywhere in
