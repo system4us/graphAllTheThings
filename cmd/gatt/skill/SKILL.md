@@ -36,7 +36,7 @@ ls gatt-out/graph.db gatt-out/graph.json 2>/dev/null   # graph exists?
 - No graph but repo is medium/large → offer to build one (do not build unasked
   on huge repos; extraction can take minutes):
   ```bash
-  gatt extract codebase . --out gatt-out/graph.db   # .db = SQLite + FTS5, preferred
+  gatt extract codebase .                           # → gatt-out/graph.db (SQLite + FTS5, default)
   gatt index                                        # optional: semantic search (needs local embedder)
   ```
 

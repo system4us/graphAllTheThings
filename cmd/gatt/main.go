@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -36,15 +38,18 @@ import (
 //go:embed skill/SKILL.md
 var skillMD string
 
-// defaultGraph prefers an existing SQLite graph (created via
-// `extract --out gatt-out/graph.db`) over the JSON default: the format is
-// chosen at first extract and stays sticky for every later command.
-var defaultGraph = "gatt-out/graph.json"
+// defaultGraph is gatt-out/graph.db for a fresh project: SQLite's journaled
+// save is what makes incremental refresh (autoRefreshCodebase, --update)
+// cheap, so a first extract with no --out should land there. An existing
+// project that already extracted to the legacy JSON default keeps using it —
+// the format is chosen at first extract and stays sticky for every later
+// command, never silently switched underneath an existing graph.
+var defaultGraph = "gatt-out/graph.db"
 
 func init() {
 	if _, err := os.Stat(defaultGraph); err != nil {
-		if _, err := os.Stat("gatt-out/graph.db"); err == nil {
-			defaultGraph = "gatt-out/graph.db"
+		if _, err := os.Stat("gatt-out/graph.json"); err == nil {
+			defaultGraph = "gatt-out/graph.json"
 		}
 	}
 }
@@ -117,7 +122,7 @@ func usage() {
 build the graph:
   gatt init                        scaffold an agent-native .gatt/ config for codebase contextualization
   gatt extract codebase <dir>      parse a repo (tree-sitter) into a code graph; merges the .gatt/ overlay if present
-  gatt extract sqlite <db-file> [--out gatt-out/graph.json] [--check]
+  gatt extract sqlite <db-file> [--out gatt-out/graph.db] [--check]
   gatt extract postgres "postgres://user:pass@host:port/db?sslmode=disable" [--out PATH] [--check]
   gatt extract openapi <spec.json|spec.yaml|http://host:8000/openapi.json> [--out PATH] [--check] [--code REPO_ROOT]
       re-extract reports schema drift vs the existing graph; --check reports it without writing
@@ -126,6 +131,7 @@ build the graph:
       re-link an existing graph to its Go source without re-extracting (the cheap post-code-edit update)
   gatt index  [--graph PATH] [--embed-url URL] [--embed-model NAME] [--qdrant URL] [--full]
       only re-embeds nodes whose text changed since the last index; --full forces a full re-embed
+      prints a live "embedding D/T nodes..." progress line to stderr while it runs
 
 query it (graphify-style):
   gatt query "<question>"          context pack: relevant tables, columns, joins
@@ -154,9 +160,10 @@ serve it:
   gatt mcp     [--graph PATH] [--no-semantic] [--qdrant URL] [--source-kind KIND --source SRC]
       --source-kind/--source wire the live source into the check_drift + refresh_graph MCP tools
   gatt install [--graph PATH] [--scope project|user|agy] [--source-kind KIND --source SRC]
-      register MCP server in Claude Code or Antigravity (a passed source is stored in the MCP config)
+      register MCP server in Claude Code or Antigravity (a passed source is stored in the MCP config);
+      scope auto-detects between claude/agy when not given, and the gatt binary is added to PATH
 
-all query/serve commands take --graph (default gatt-out/graph.json).
+all query/serve commands take --graph (default gatt-out/graph.db).
 vectors live in-process (vectors.json next to the graph); --qdrant URL opts into Qdrant.
 `)
 }
@@ -431,11 +438,15 @@ func cmdIndex(ctx context.Context, args []string) error {
 	model := resolveModel(*embModel, vs)
 	emb := embed.New(*embURL, model)
 
-	res, err := indexer.Reindex(ctx, g, vs, emb, model, *full)
+	progress := func(done, total int) {
+		fmt.Fprintf(os.Stderr, "\rembedding %d/%d nodes...", done, total)
+	}
+	res, err := indexer.Reindex(ctx, g, vs, emb, model, *full, progress)
 	if err != nil {
 		return err
 	}
 	if res.Embedded > 0 {
+		fmt.Fprintln(os.Stderr)
 		fmt.Printf("embedded %d nodes with %s (%d reused from cache)\n", res.Embedded, model, res.Reused)
 	} else {
 		fmt.Printf("all %d nodes already current with %s\n", res.Reused, model)
@@ -732,11 +743,32 @@ func cmdInstall(ctx context.Context, args []string) error {
 	src := fs.String("source", "", "source the connector reads (file/DSN/URL); note a DB DSN is stored in the MCP config")
 	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source on refresh")
 	skill := fs.Bool("skill", true, "also install the Claude Code skill into ~/.claude/skills/gatt/")
+	addPath := fs.Bool("path", true, "copy the gatt binary to ~/.local/bin and add it to PATH if `gatt` isn't already resolvable")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if (*srcKind == "") != (*src == "") {
 		return fmt.Errorf("--source-kind and --source must be given together")
+	}
+
+	// --scope wasn't passed explicitly: pick claude when it's on PATH (today's
+	// default), otherwise fall back to agy if that's what's actually installed.
+	// Without this, a machine with only Antigravity's `agy` CLI (common on a
+	// fresh Windows setup where `claude` may not be on PATH yet) would silently
+	// fall through to writing a project ./.mcp.json that agy never reads.
+	resolvedScope := *scope
+	scopeExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "scope" {
+			scopeExplicit = true
+		}
+	})
+	if !scopeExplicit {
+		if _, err := exec.LookPath("claude"); err != nil {
+			if _, err := exec.LookPath("agy"); err == nil {
+				resolvedScope = "agy"
+			}
+		}
 	}
 
 	if *skill {
@@ -763,6 +795,14 @@ func cmdInstall(ctx context.Context, args []string) error {
 		return fmt.Errorf("running via `go run`; build a stable binary first: go build -o ~/.local/bin/gatt ./cmd/gatt")
 	}
 
+	if *addPath {
+		if newExe, err := ensureBinaryOnPath(exe); err != nil {
+			fmt.Printf("warning: could not add gatt to PATH: %v\n", err)
+		} else {
+			exe = newExe
+		}
+	}
+
 	// The args the registered server launches with; a configured source enables
 	// the drift/refresh tools.
 	mcpArgs := []string{"mcp", "--graph", absGraph}
@@ -777,37 +817,97 @@ func cmdInstall(ctx context.Context, args []string) error {
 		mcpArgs = append(mcpArgs, "--code", absCode)
 	}
 
-	if *scope == "agy" {
+	if resolvedScope == "agy" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return fmt.Errorf("could not find home dir: %w", err)
 		}
-		configPath := filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json")
+		// Confirmed against the `agy` binary's own embedded docs ("Global
+		// Configuration: ~/.gemini/config/mcp_config.json (applies to all
+		// sessions)") — antigravity-cli/mcp_config.json, used here previously,
+		// is never read by the CLI.
+		configPath := filepath.Join(home, ".gemini", "config", "mcp_config.json")
 		return updateMCPConfig(configPath, *name, exe, mcpArgs)
 	}
 
-	if claude, err := exec.LookPath("claude"); err == nil {
-		cmd := exec.CommandContext(ctx, claude, append([]string{"mcp", "add", "--scope", *scope, *name, "--", exe}, mcpArgs...)...)
+	if claudePath, err := exec.LookPath("claude"); err == nil {
+		claudeArgs := append([]string{"mcp", "add", "--scope", resolvedScope, *name, "--", exe}, mcpArgs...)
+		// On Windows a PATH-installed `claude` usually resolves to the
+		// claude.cmd shim npm leaves behind; CreateProcess can't launch a
+		// .cmd/.bat directly, only cmd.exe knows how to interpret one.
+		execName, execArgs := wrapForShellExec(claudePath, claudeArgs)
+		cmd := exec.CommandContext(ctx, execName, execArgs...)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("claude mcp add failed: %w", err)
 		}
-		fmt.Printf("registered MCP server %q (scope %s) → %s %s\n", *name, *scope, exe, strings.Join(mcpArgs, " "))
+		fmt.Printf("registered MCP server %q (scope %s) → %s %s\n", *name, resolvedScope, exe, strings.Join(mcpArgs, " "))
 		return nil
 	}
 
 	// no claude CLI: merge into ./.mcp.json
-	if *scope != "project" {
+	if resolvedScope != "project" {
 		return fmt.Errorf("claude CLI not found; only --scope project or agy supported")
 	}
 	return updateMCPConfig(".mcp.json", *name, exe, mcpArgs)
 }
 
+// ensureBinaryOnPath copies exe to ~/.local/bin (creating it if needed) and
+// adds that directory to the user's PATH, unless `gatt` already resolves via
+// PATH to this same binary. Returns the path the caller should register as
+// the MCP server's command — the copy's path when one was made, exe
+// unchanged otherwise. Platform-specific PATH mutation (shell rc file on
+// Unix, HKCU\Environment on Windows) lives in path_unix.go / path_windows.go.
+func ensureBinaryOnPath(exe string) (string, error) {
+	if p, err := exec.LookPath(binaryName()); err == nil {
+		if resolved, err := filepath.EvalSymlinks(p); err == nil && resolved == exe {
+			return exe, nil
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return exe, err
+	}
+	binDir := filepath.Join(home, ".local", "bin")
+	target := filepath.Join(binDir, binaryName())
+	if target != exe {
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			return exe, fmt.Errorf("create %s: %w", binDir, err)
+		}
+		data, err := os.ReadFile(exe)
+		if err != nil {
+			return exe, fmt.Errorf("read %s: %w", exe, err)
+		}
+		if err := os.WriteFile(target, data, 0o755); err != nil {
+			return exe, fmt.Errorf("write %s: %w", target, err)
+		}
+		fmt.Printf("copied binary → %s\n", target)
+		exe = target
+	}
+	if err := addToUserPath(binDir); err != nil {
+		return exe, fmt.Errorf("add %s to PATH: %w", binDir, err)
+	}
+	fmt.Printf("%s is on PATH (open a new shell for it to take effect)\n", binDir)
+	return exe, nil
+}
+
+func binaryName() string {
+	if runtime.GOOS == "windows" {
+		return "gatt.exe"
+	}
+	return "gatt"
+}
+
 func updateMCPConfig(configPath, name, exe string, mcpArgs []string) error {
 	cfg := map[string]any{}
 	if data, err := os.ReadFile(configPath); err == nil {
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return fmt.Errorf("%s exists but is invalid JSON: %w", configPath, err)
+		// Antigravity/agy leaves this file zero-length as a placeholder before
+		// anything's ever registered — treat that the same as "doesn't exist
+		// yet" rather than failing on the empty-input JSON parse error.
+		if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 {
+			if err := json.Unmarshal(trimmed, &cfg); err != nil {
+				return fmt.Errorf("%s exists but is invalid JSON: %w", configPath, err)
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		return err

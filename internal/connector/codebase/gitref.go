@@ -61,8 +61,14 @@ func GitChangedFiles(ctx context.Context, dir, ref string) ([]graph.FilePair, er
 // under dir — tracked files plus untracked-but-not-ignored ones — using
 // git's own .gitignore/.git/info/exclude/core.excludesfile resolution
 // instead of reimplementing gitignore glob semantics. ok is false when dir
-// isn't a git checkout (or the command fails), telling callers to fall back
-// to a plain SkipDir-based walk.
+// isn't inside a git work tree (or the command fails), telling callers to
+// fall back to a plain SkipDir-based walk.
+//
+// No .git-directory pre-check: `git -C dir` resolves the repo root by
+// walking up from dir like git itself does, so this also works when dir is a
+// subdirectory of a repo (e.g. `gatt extract codebase ./backend` in a
+// monorepo) rather than only the checkout root — a bare os.Stat(dir/.git)
+// would silently miss that case and disable gitignore filtering entirely.
 //
 // gatt's own `.gatt`/`gatt-out` are excluded from the result even when the
 // target repo hasn't gitignored them — those are gatt-specific output, not
@@ -71,9 +77,6 @@ func GitChangedFiles(ctx context.Context, dir, ref string) ([]graph.FilePair, er
 // engine's exhaustive `grep`) apply the same exclusion without duplicating
 // the git plumbing.
 func GitFileSet(dir string) (map[string]bool, bool) {
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
-		return nil, false
-	}
 	out, err := exec.Command("git", "-C", dir, "ls-files", "-co", "--exclude-standard").Output()
 	if err != nil {
 		return nil, false

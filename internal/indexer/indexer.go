@@ -64,8 +64,12 @@ func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb
 
 // Reindex embeds every graph node (except the source root) into vs using emb
 // with the given model. When full is false and the store already holds vectors
-// from the same model, unchanged nodes reuse their cached vector.
-func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, full bool) (Result, error) {
+// from the same model, unchanged nodes reuse their cached vector. progress, if
+// non-nil, is called after each embedded batch with the running count of
+// embedded nodes and the total to embed (excludes reused/cached nodes) — a
+// large graph can take many sequential HTTP round-trips to the embedder, so
+// the CLI uses this to print a progress indicator.
+func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, full bool, progress func(done, total int)) (Result, error) {
 	// Reuse vectors for nodes whose embedding text is unchanged. Only the local
 	// store exposes a cache, and only vectors from the same model are
 	// comparable. Set the store's model last: reading the cache loads the file
@@ -107,6 +111,9 @@ func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *emb
 			points = append(points, store.Point{
 				NodeID: todoIDs[i+j], Type: n.Type, Name: n.Name, Text: todoTexts[i+j], Vector: v,
 			})
+		}
+		if progress != nil {
+			progress(end, len(todoIDs))
 		}
 	}
 

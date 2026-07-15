@@ -635,7 +635,7 @@ func (s *Server) refresh(ctx context.Context, in sourceIn) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		res, err := indexer.Reindex(ctx, g, s.cfg.OpenStore(), s.cfg.Embedder, s.cfg.EmbModel, false)
+		res, err := indexer.Reindex(ctx, g, s.cfg.OpenStore(), s.cfg.Embedder, s.cfg.EmbModel, false, nil)
 		if err != nil {
 			return "", fmt.Errorf("reindex: %w", err)
 		}

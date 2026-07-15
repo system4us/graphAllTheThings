@@ -21,7 +21,7 @@ source (sqlite | postgres | openapi | codebase)
         │  extract (once; incremental after that)
         ▼
   gatt-out/graph.db        ← source of truth: typed nodes + edges (SQLite + FTS5,
-        │                    preferred) — or graph.json (portable, versionable)
+        │                    default) — or graph.json (portable, versionable, via --out)
         │  index
         ▼
   gatt-out/vectors.json    ← semantic layer: node embeddings (Ollama bge-m3, multilingual),
@@ -30,7 +30,7 @@ source (sqlite | postgres | openapi | codebase)
   MCP stdio server         ← agents call tools; zero live introspection
 ```
 
-- **Graph structure** (nodes, edges, join paths) lives in `graph.db` (SQLite with an FTS5 full-text index, incremental delta writes) or `graph.json` (portable, diff-able). All commands auto-detect whichever exists; `--graph PATH` overrides.
+- **Graph structure** (nodes, edges, join paths) lives in `graph.db` by default (SQLite with an FTS5 full-text index, incremental delta writes) or `graph.json` (portable, diff-able) if you pass `--out gatt-out/graph.json` on the first extract. All commands auto-detect whichever exists; `--graph PATH` overrides.
 - **Search is hybrid**: FTS5 bm25 (when the graph is SQLite) + semantic embeddings, so results are good even before indexing. If the vector index or Ollama is unavailable, `find_entities` falls back to keyword matching.
 - **Vector index is in-process by default.** Metadata graphs are small (hundreds to a few thousand nodes), so brute-force cosine takes microseconds — no vector database required. Pass `--qdrant URL` to `index`/`search`/`mcp` to opt into a Qdrant server (useful for very large or shared indexes).
 
@@ -58,16 +58,16 @@ Measured on a real 113-table CRM: answering one data question costs **~2.3k toke
 ```bash
 go build -o ~/.local/bin/gatt ./cmd/gatt
 
-gatt extract sqlite path/to/db.sqlite     # → gatt-out/graph.json
+gatt extract sqlite path/to/db.sqlite     # → gatt-out/graph.db
 gatt extract postgres "postgres://user:pass@host:5432/db?sslmode=disable"
 gatt extract openapi http://localhost:8000/openapi.json   # live FastAPI spec (or a .json/.yaml file; OpenAPI 3.x or Swagger 2.0)
-gatt extract codebase . --out gatt-out/graph.db           # parse a repo (SQLite graph preferred for code)
+gatt extract codebase .                                   # parse a repo → gatt-out/graph.db (pass --out ...json for a portable/diffable graph)
 gatt index                                # embed nodes → gatt-out/vectors.json
 gatt install                              # register MCP server in Claude Code
 gatt install --scope agy                  # register MCP server in Antigravity CLI
 ```
 
-`gatt install` uses `claude mcp add` when the CLI is available (`--scope project|user`), otherwise merges into `./.mcp.json` directly. Use `--scope agy` to register in `~/.gemini/antigravity-cli/mcp_config.json`.
+`gatt install` uses `claude mcp add` when the CLI is available (`--scope project|user`), otherwise merges into `./.mcp.json` directly. Use `--scope agy` to register in `~/.gemini/config/mcp_config.json` (Antigravity's global MCP config, per the `agy` CLI's own embedded docs). `--scope` auto-detects when omitted: it prefers `claude` if that's on PATH, and falls back to `agy` if only that one is — useful on a fresh Windows setup where `claude` may not be on PATH yet. `gatt install` also copies its own binary to `~/.local/bin` and adds that to PATH if `gatt` isn't already resolvable (shell rc file on macOS/Linux, `HKCU\Environment` on Windows); pass `--path=false` to skip that.
 
 Query from the terminal (same operations the MCP tools expose):
 
