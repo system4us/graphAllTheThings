@@ -820,6 +820,18 @@ func langFor(ext string) *langConfig {
 			  function: (member_expression
 			    object: (identifier) @nsref.obj
 			    property: (property_identifier) @nsref.method)) @nsref.call
+			(assignment_expression
+			  left: (member_expression
+			    object: (identifier) @cjsexport.obj
+			    property: (property_identifier) @cjsexport.name)
+			  right: [(arrow_function) (function_expression)])
+			(assignment_expression
+			  left: (member_expression
+			    object: (member_expression
+			      object: (identifier) @cjsexport.modobj
+			      property: (property_identifier) @cjsexport.exportsprop)
+			    property: (property_identifier) @cjsexport.name)
+			  right: [(arrow_function) (function_expression)])
 			`,
 		}
 	case ".js", ".jsx":
@@ -902,6 +914,18 @@ func langFor(ext string) *langConfig {
 			  function: (member_expression
 			    object: (identifier) @nsref.obj
 			    property: (property_identifier) @nsref.method)) @nsref.call
+			(assignment_expression
+			  left: (member_expression
+			    object: (identifier) @cjsexport.obj
+			    property: (property_identifier) @cjsexport.name)
+			  right: [(arrow_function) (function_expression)])
+			(assignment_expression
+			  left: (member_expression
+			    object: (member_expression
+			      object: (identifier) @cjsexport.modobj
+			      property: (property_identifier) @cjsexport.exportsprop)
+			    property: (property_identifier) @cjsexport.name)
+			  right: [(arrow_function) (function_expression)])
 			`,
 		}
 	case ".py":
@@ -1044,7 +1068,12 @@ func declarationRange(nameNode *sitter.Node) (int, int) {
 			"method_definition", "method",
 			"constructor_declaration", "local_function_statement",
 			// const x = () => {…}: the declarator spans name + arrow body.
-			"variable_declarator":
+			"variable_declarator",
+			// exports.x = () => {…} / module.exports.x = function(){…}: same
+			// idea, the assignment spans name + function body. The walk
+			// passes through the member_expression (unmatched) on the way
+			// up to this.
+			"assignment_expression":
 			return int(n.StartPoint().Row) + 1, int(n.EndPoint().Row) + 1
 		}
 		n = n.Parent()
@@ -1063,7 +1092,7 @@ func buildSignature(name string, nameNode *sitter.Node, src []byte) string {
 			t == "function_definition" || t == "fn_item" ||
 			t == "method_definition" || t == "method" ||
 			t == "constructor_declaration" || t == "local_function_statement" ||
-			t == "variable_declarator" {
+			t == "variable_declarator" || t == "assignment_expression" {
 			break
 		}
 		decl = decl.Parent()
@@ -1074,6 +1103,12 @@ func buildSignature(name string, nameNode *sitter.Node, src []byte) string {
 	// const x = () => {…}: parameters/return type live on the arrow value.
 	if decl.Type() == "variable_declarator" {
 		if v := decl.ChildByFieldName("value"); v != nil {
+			decl = v
+		}
+	}
+	// exports.x = () => {…}: same idea, the value is the "right" operand.
+	if decl.Type() == "assignment_expression" {
+		if v := decl.ChildByFieldName("right"); v != nil {
 			decl = v
 		}
 	}
@@ -1771,7 +1806,26 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 
 			// ── Function / method ──────────────────────────────────────────────
-			if funcNameNode, ok := caps["func.name"]; ok {
+			// CommonJS `exports.x = fn` / `module.exports.x = fn` (JS/TS/JSX)
+			// route into the same handling as func.name: without this, a
+			// handler declared this way never becomes a real function node
+			// at all (only ever an external stub from the *call* side, at
+			// wherever it's registered as a route handler) — impact/blast by
+			// bare name hard-error "not found" instead of degrading, since
+			// name resolution deliberately excludes external stubs.
+			funcNameNode, ok := caps["func.name"]
+			if !ok {
+				if nameNode, hasName := caps["cjsexport.name"]; hasName {
+					if objNode, hasObj := caps["cjsexport.obj"]; hasObj && objNode.Content(data) == "exports" {
+						funcNameNode, ok = nameNode, true
+					} else if modNode, hasMod := caps["cjsexport.modobj"]; hasMod && modNode.Content(data) == "module" {
+						if expNode, hasExp := caps["cjsexport.exportsprop"]; hasExp && expNode.Content(data) == "exports" {
+							funcNameNode, ok = nameNode, true
+						}
+					}
+				}
+			}
+			if ok {
 				name := funcNameNode.Content(data)
 				lineStart, lineEnd := declarationRange(funcNameNode)
 
