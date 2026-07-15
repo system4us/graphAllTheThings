@@ -695,6 +695,21 @@ func callerFileKey(n *graph.Node) string {
 	return n.Attrs["file"]
 }
 
+// externalStub returns "call:<name>"'s node if it exists — a target that
+// was only ever seen as a *reference* (called, or named as a route
+// handler), never as a definition. Its most common cause: a handler
+// declared in a shape the extractor doesn't parse as a function at all
+// (an unusual export/assignment pattern) — same root cause as the
+// CommonJS `exports.x = fn` gap, before that got its own capture. Lets
+// Impact/Blast tell that apart from "genuinely doesn't exist anywhere,"
+// which get a different, more useful error.
+func (e *Engine) externalStub(name string) *graph.Node {
+	if n := e.G.Nodes["call:"+name]; n != nil && n.Type == graph.NodeFunction && n.Attrs["external"] == "true" {
+		return n
+	}
+	return nil
+}
+
 func (e *Engine) modelMatches(name string) []string {
 	var matches []string
 	for id, nn := range e.G.Nodes {
@@ -722,6 +737,11 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 		case 0:
 			if len(e.modelMatches(id)) > 0 {
 				return "", fmt.Errorf("%q is a model, not a function — impact only walks the call graph; use `gatt blast %s` for its associations and route usage", id, id)
+			}
+			if e.externalStub(id) != nil {
+				return "", fmt.Errorf("%q was only ever seen as a reference (called, or named as a route handler), never as a definition — "+
+					"this usually means it's declared in a way the extractor doesn't recognize as a function (an unusual export/assignment pattern). "+
+					"Try `gatt grep %q` to find where it's actually defined", id, id)
 			}
 			return "", fmt.Errorf("function %q not found; use find_entities to locate it", id)
 		case 1:
@@ -946,6 +966,11 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 		}
 		switch len(matches) {
 		case 0:
+			if e.externalStub(target) != nil {
+				return "", fmt.Errorf("%q was only ever seen as a reference (called, or named as a route handler), never as a definition — "+
+					"this usually means it's declared in a way the extractor doesn't recognize as a function (an unusual export/assignment pattern). "+
+					"Try `gatt grep %q` to find where it's actually defined", target, target)
+			}
 			return "", fmt.Errorf("%q not found as file, function, or model; use search to locate it", target)
 		case 1:
 			n = e.G.Nodes[matches[0]]
