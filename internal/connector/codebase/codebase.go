@@ -2,6 +2,7 @@ package codebase
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -18,10 +19,14 @@ import (
 	"graphallthethings/internal/graph"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/smacker/go-tree-sitter/csharp"
 	"github.com/smacker/go-tree-sitter/golang"
+	"github.com/smacker/go-tree-sitter/java"
 	"github.com/smacker/go-tree-sitter/javascript"
+	"github.com/smacker/go-tree-sitter/kotlin"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/rust"
+	"github.com/smacker/go-tree-sitter/swift"
 	"github.com/smacker/go-tree-sitter/typescript/typescript"
 )
 
@@ -45,6 +50,12 @@ type Connector struct {
 	// pendingClientCalls collects client-side HTTP call sites, wired to
 	// their matching route nodes by wireClientCalls.
 	pendingClientCalls []clientCall
+	// clientWrappers maps in-house HTTP wrapper names (.gatt/clients.json)
+	// to their method/path argument spec. Loaded lazily.
+	clientWrappers map[string]clientWrapper
+	// pendingStyleUses collects class tokens referenced by source/template
+	// files, wired to stylesheet file nodes by wireStyles.
+	pendingStyleUses []styleUse
 	// pendingRoutes collects HTTP route registrations found while parsing,
 	// resolved against the finished function index by wireRoutes.
 	pendingRoutes []routeInfo
@@ -84,7 +95,8 @@ func New(dir string) *Connector {
 // parseableExts are the file extensions the extractor understands.
 var parseableExts = map[string]bool{
 	".go": true, ".ts": true, ".tsx": true, ".js": true, ".jsx": true,
-	".py": true, ".rs": true, ".md": true,
+	".py": true, ".rs": true, ".java": true, ".cs": true, ".kt": true,
+	".swift": true, ".md": true,
 }
 
 // dataExts are data/config/style files indexed as plain file nodes (no
@@ -143,6 +155,7 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	c.wireRoutes(g, funcsByName)
 	c.wireModels(g)
 	c.wireClientCalls(g, funcs)
+	c.wireStyles(g)
 	c.wireRouteModels(g)
 	c.mineGitCoChanges(ctx, g)
 
@@ -150,7 +163,8 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 }
 
 // scanFiles walks the tree with the same skip rules as parseFiles and returns
-// relPath → mtime (UnixNano) for every parseable file. Cheap: stat only.
+// relPath → mtime (UnixNano) for every file parseFiles gives a node: parsed
+// sources, data files, and non-binary template candidates. Cheap: stat only.
 // When c.dir is a git checkout, gitignored files/directories are additionally
 // excluded via gitFileSet (SkipDir alone only knows a fixed list of common
 // build-output names — dist, build, node_modules, ... — while a repo's own
@@ -168,16 +182,22 @@ func (c *Connector) scanFiles() map[string]string {
 			}
 			return nil
 		}
-		if !indexableExt(d.Name()) {
-			return nil
-		}
 		rel, _ := filepath.Rel(c.dir, path)
 		if gitOK && !gitFiles[rel] {
 			return nil
 		}
-		if info, err := d.Info(); err == nil {
-			out[rel] = fmt.Sprint(info.ModTime().UnixNano())
+		info, err := d.Info()
+		if err != nil {
+			return nil
 		}
+		if !indexableExt(d.Name()) {
+			// Unknown extension: tracked iff parseFiles would give it a bare
+			// template-candidate file node — same gate, or drift never settles.
+			if binaryExts[filepath.Ext(d.Name())] || info.Size() > maxTemplateBytes {
+				return nil
+			}
+		}
+		out[rel] = fmt.Sprint(info.ModTime().UnixNano())
 		return nil
 	})
 	return out
@@ -278,7 +298,10 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 		}
 		bothFiles := tn.Type == graph.NodeFile && fn.Type == graph.NodeFile
 		switch e.Type {
-		case graph.EdgeImports:
+		case graph.EdgeImports, graph.EdgeUsesStyle:
+			// Dirty source re-emits its own imports/style uses on re-parse;
+			// a dirty *target* (the stylesheet/imported file) is re-created
+			// with a path-stable id, so surviving sources relink verbatim.
 			if bothFiles && dirty[tn.Name] && !dirty[fn.Name] {
 				fileEdgeRelinks = append(fileEdgeRelinks, e)
 			}
@@ -348,6 +371,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	c.wireRoutes(prev, funcsByName)
 	c.wireModels(prev)
 	c.wireClientCalls(prev, newFuncs)
+	c.wireStyles(prev)
 	c.wireRouteModels(prev)
 
 	// Calls from *unchanged* files may now have a target that didn't exist at
@@ -547,6 +571,12 @@ func (c *Connector) detectProjects(g *graph.Graph) {
 				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Python)"})
 			} else if _, e := os.Stat(filepath.Join(path, "Cargo.toml")); e == nil && tracked(path, "Cargo.toml") {
 				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Rust)"})
+			} else if _, e := os.Stat(filepath.Join(path, "pom.xml")); e == nil && tracked(path, "pom.xml") {
+				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Java)"})
+			} else if _, e := os.Stat(filepath.Join(path, "build.gradle")); e == nil && tracked(path, "build.gradle") {
+				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (Java)"})
+			} else if m, _ := filepath.Glob(filepath.Join(path, "*.csproj")); len(m) > 0 && tracked(path, filepath.Base(m[0])) {
+				g.AddNode(&graph.Node{ID: "proj:" + path, Type: graph.NodeProject, Name: filepath.Base(path) + " (C#)"})
 			}
 		}
 		return nil
@@ -760,6 +790,74 @@ func langFor(ext string) *langConfig {
 			(block_comment) @loose.comment
 			`,
 		}
+	case ".java":
+		return &langConfig{
+			lang: java.GetLanguage(),
+			queryStr: `
+			(class_declaration name: (identifier) @def.name)
+			(interface_declaration name: (identifier) @def.name)
+			(enum_declaration name: (identifier) @def.name)
+			(record_declaration name: (identifier) @def.name)
+			(method_declaration name: (identifier) @func.name)
+			(constructor_declaration name: (identifier) @func.name)
+			(method_invocation !object name: (identifier) @call.func)
+			(method_invocation object: (_) name: (identifier) @call.sel)
+			(import_declaration (scoped_identifier) @import.path)
+			(line_comment) @loose.comment
+			(block_comment) @loose.comment
+			(method_declaration (modifiers (annotation (identifier) @jann.name (annotation_argument_list) @jann.args)) name: (identifier) @jann.method)
+			(method_declaration (modifiers (marker_annotation (identifier) @jmann.name)) name: (identifier) @jmann.method)
+			(class_declaration (modifiers (annotation (identifier) @jcls.name (annotation_argument_list) @jcls.args)) name: (identifier) @jcls.class)
+			`,
+		}
+	case ".kt":
+		return &langConfig{
+			lang: kotlin.GetLanguage(),
+			queryStr: `
+			(class_declaration (type_identifier) @def.name)
+			(object_declaration (type_identifier) @def.name)
+			(function_declaration (simple_identifier) @func.name)
+			(call_expression (simple_identifier) @call.func)
+			(call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.sel)))
+			(import_header (identifier) @import.path)
+			(line_comment) @loose.comment
+			(multiline_comment) @loose.comment
+			(function_declaration (modifiers (annotation (constructor_invocation (user_type (type_identifier) @kann.name) (value_arguments) @kann.args))) (simple_identifier) @kann.method)
+			`,
+		}
+	case ".swift":
+		return &langConfig{
+			lang: swift.GetLanguage(),
+			queryStr: `
+			(class_declaration (type_identifier) @def.name)
+			(function_declaration (simple_identifier) @func.name)
+			(call_expression (simple_identifier) @call.func)
+			(call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.sel)))
+			(import_declaration (identifier) @import.path)
+			(comment) @loose.comment
+			(multiline_comment) @loose.comment
+			`,
+		}
+	case ".cs":
+		return &langConfig{
+			lang: csharp.GetLanguage(),
+			queryStr: `
+			(class_declaration name: (identifier) @def.name)
+			(interface_declaration name: (identifier) @def.name)
+			(struct_declaration name: (identifier) @def.name)
+			(record_declaration name: (identifier) @def.name)
+			(enum_declaration name: (identifier) @def.name)
+			(method_declaration name: (identifier) @func.name)
+			(constructor_declaration name: (identifier) @func.name)
+			(local_function_statement name: (identifier) @func.name)
+			(invocation_expression function: (identifier) @call.func)
+			(invocation_expression function: (member_access_expression name: (identifier) @call.sel))
+			(using_directive [(qualified_name) (identifier)] @import.path)
+			(comment) @loose.comment
+			(method_declaration (attribute_list (attribute (identifier) @cattr.name (attribute_argument_list)? @cattr.args)) name: (identifier) @cattr.method)
+			(class_declaration (attribute_list (attribute (identifier) @ccls.name (attribute_argument_list) @ccls.args)) name: (identifier) @ccls.class)
+			`,
+		}
 	}
 	return nil
 }
@@ -799,6 +897,7 @@ func declarationRange(nameNode *sitter.Node) (int, int) {
 		case "function_declaration", "method_declaration",
 			"function_definition", "fn_item",
 			"method_definition", "method",
+			"constructor_declaration", "local_function_statement",
 			// const x = () => {…}: the declarator spans name + arrow body.
 			"variable_declarator":
 			return int(n.StartPoint().Row) + 1, int(n.EndPoint().Row) + 1
@@ -818,6 +917,7 @@ func buildSignature(name string, nameNode *sitter.Node, src []byte) string {
 		if t == "function_declaration" || t == "method_declaration" ||
 			t == "function_definition" || t == "fn_item" ||
 			t == "method_definition" || t == "method" ||
+			t == "constructor_declaration" || t == "local_function_statement" ||
 			t == "variable_declarator" {
 			break
 		}
@@ -863,6 +963,9 @@ func docComment(nameNode *sitter.Node, src []byte, consumed map[int]bool) string
 		case "function_declaration", "method_declaration", "type_declaration",
 			"function_definition", "fn_item", "method_definition", "method",
 			"class_declaration", "class_definition", "struct_item",
+			"constructor_declaration", "local_function_statement",
+			"interface_declaration", "enum_declaration", "record_declaration",
+			"struct_declaration",
 			// const x = () => {…} / export const x = {…}: the doc comment
 			// precedes the declarator, same as any other declaration.
 			"variable_declarator":
@@ -1102,7 +1205,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	// Pre-compile queries for all supported extensions once.
 	// NewQuery is not safe to call in a tight loop inside WalkDir callbacks.
 	compiledLangs := map[string]*langConfig{}
-	for _, ext := range []string{".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs"} {
+	for _, ext := range []string{".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".java", ".cs", ".kt", ".swift"} {
 		lc := langFor(ext)
 		if lc == nil {
 			continue
@@ -1155,6 +1258,18 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			if h := contentHash(path, size); h != "" {
 				attrs["hash"] = h
 			}
+			// Stylesheets: record the selectors they define (.class, #id,
+			// [data-*], --var) so wireStyles can link the templates/JSX that
+			// use them, and scan their own var(--x) references — design
+			// tokens make stylesheet→stylesheet edges.
+			if (ext == ".css" || ext == ".scss" || ext == ".less") && size <= maxTemplateBytes {
+				if raw, err := os.ReadFile(path); err == nil {
+					if sels := extractCSSSelectors(raw); sels != "" {
+						attrs["css_selectors"] = sels
+					}
+					c.scanStyleUses(raw, relPath)
+				}
+			}
 			g.AddNode(&graph.Node{
 				ID:    fileID,
 				Type:  graph.NodeFile,
@@ -1174,30 +1289,68 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		}
 
 		lc := compiledLangs[ext]
-		if lc == nil {
-			return nil
-		}
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		gen := isGenerated(relPath, data)
-		srcLines := strings.Split(string(data), "\n")
-
 		fileAttrs := map[string]string{"path": path, "mtime": mtime}
-		if gen {
-			fileAttrs["generated"] = "true"
+		var data []byte
+		if lc == nil {
+			// Unknown extension: bare file node (mtime-aligned with scanFiles
+			// so drift checks stay stat-only), then content-sniff for embedded
+			// client-side HTTP surface — inline <script> blocks are masked and
+			// parsed with the JS/TS grammar below, htmx/form attributes are
+			// scanned textually. Covers .vue/.html/.cshtml/.svelte/... without
+			// an extension list (see template.go).
+			if binaryExts[ext] || size > maxTemplateBytes {
+				return nil
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			g.AddNode(&graph.Node{ID: fileID, Type: graph.NodeFile, Name: relPath, Attrs: fileAttrs})
+			if projID != "" {
+				g.AddEdge(fileID, projID, graph.EdgeBelongsTo, nil)
+			}
+			if bytes.IndexByte(raw, 0) >= 0 { // binary content behind a text-ish extension
+				return nil
+			}
+			c.scanTemplateAttrs(raw, relPath)
+			c.scanStyleUses(raw, relPath)
+			masked, langExt := maskScriptBlocks(raw)
+			if masked == nil {
+				return nil
+			}
+			if lc = compiledLangs[langExt]; lc == nil {
+				return nil
+			}
+			ext = langExt // detectors treat the embedded blocks as JS/TS
+			fileAttrs["template"] = "true"
+			if isGenerated(relPath, raw) {
+				fileAttrs["generated"] = "true"
+			}
+			data = masked
+		} else {
+			var err error
+			data, err = os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			if isGenerated(relPath, data) {
+				fileAttrs["generated"] = "true"
+			}
+			if ext == ".js" || ext == ".jsx" || ext == ".ts" || ext == ".tsx" {
+				c.scanStyleUses(data, relPath) // className="..." in JSX/TSX
+			}
+			g.AddNode(&graph.Node{
+				ID:    fileID,
+				Type:  graph.NodeFile,
+				Name:  relPath,
+				Attrs: fileAttrs,
+			})
+			if projID != "" {
+				g.AddEdge(fileID, projID, graph.EdgeBelongsTo, nil)
+			}
 		}
-		g.AddNode(&graph.Node{
-			ID:    fileID,
-			Type:  graph.NodeFile,
-			Name:  relPath,
-			Attrs: fileAttrs,
-		})
-		if projID != "" {
-			g.AddEdge(fileID, projID, graph.EdgeBelongsTo, nil)
-		}
+		gen := fileAttrs["generated"] == "true"
+		srcLines := strings.Split(string(data), "\n")
 
 		parser := sitter.NewParser()
 		parser.SetLanguage(lc.lang)
@@ -1233,6 +1386,11 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// match that consumes it (they're separate patterns in the same
 		// query), so `consumed` isn't complete until the loop below ends.
 		var looseComments []*sitter.Node
+
+		// anns collects annotation-declared HTTP surface (Retrofit clients,
+		// Spring/ASP routes); class prefixes combine with method routes at
+		// end of file (emitAnnotationRoutes).
+		var anns annState
 
 		// singletons maps a named-import binding to its resolved target file
 		// id (JS/TS/JSX only — see state.* captures in langFor), populated as
@@ -1421,6 +1579,12 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if bestIdx >= 0 && funcs[bestIdx].lineEnd >= callLine {
 					funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
 				}
+				// Same capture doubles as the native-route probe (Go/Python
+				// registrations, routes_native.go) and, when that declines,
+				// the language-agnostic client-side HTTP probe (clientcalls.go).
+				if !c.detectNativeRoute(g, callNode, callName, relPath, fileID, ext, data) {
+					c.detectGenericClientCall(callNode, callName, relPath, ext, data)
+				}
 			}
 
 			// ── Import ────────────────────────────────────────────────────────
@@ -1483,6 +1647,32 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				c.detectClientFetch(caps, relPath, data)
 			}
 
+			// ── Annotation-declared HTTP surface (Java/Kotlin/C#) ──────────────
+			annArgs := func(key string) string {
+				if n := caps[key]; n != nil {
+					return n.Content(data)
+				}
+				return ""
+			}
+			if n := caps["jann.name"]; n != nil {
+				c.handleAnnotation(&anns, n.Content(data), annArgs("jann.args"), caps["jann.method"], nil, relPath, data)
+			}
+			if n := caps["jmann.name"]; n != nil {
+				c.handleAnnotation(&anns, n.Content(data), "", caps["jmann.method"], nil, relPath, data)
+			}
+			if n := caps["jcls.name"]; n != nil {
+				c.handleAnnotation(&anns, n.Content(data), annArgs("jcls.args"), nil, caps["jcls.class"], relPath, data)
+			}
+			if n := caps["cattr.name"]; n != nil {
+				c.handleAnnotation(&anns, n.Content(data), annArgs("cattr.args"), caps["cattr.method"], nil, relPath, data)
+			}
+			if n := caps["ccls.name"]; n != nil {
+				c.handleAnnotation(&anns, n.Content(data), annArgs("ccls.args"), nil, caps["ccls.class"], relPath, data)
+			}
+			if n := caps["kann.name"]; n != nil {
+				c.handleAnnotation(&anns, n.Content(data), annArgs("kann.args"), caps["kann.method"], nil, relPath, data)
+			}
+
 			// ── Shared-state singleton tracking (JS/TS/JSX) ─────────────────────
 			// Two binding shapes: ES `import { x } from '...'` and CommonJS
 			// `const x = require('...')` — the latter is how most real
@@ -1540,6 +1730,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		}
 
 		emitLooseComments(g, looseComments, consumed, funcs, relPath, fileID, data)
+		c.emitAnnotationRoutes(g, &anns, relPath, fileID)
 		emitStateAccess(g, stateAccesses, singletons, funcs, relPath)
 
 		return nil

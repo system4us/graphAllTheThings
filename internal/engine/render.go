@@ -876,7 +876,7 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 			for _, ed := range e.G.EdgesOf(cur) {
 				var nb string
 				switch {
-				case ed.To == cur && (ed.Type == graph.EdgeCalls || ed.Type == graph.EdgeImports || ed.Type == graph.EdgeReferences || ed.Type == graph.EdgeMentions || ed.Type == graph.EdgeCallsEndpoint || ed.Type == graph.EdgeUsesModel):
+				case ed.To == cur && (ed.Type == graph.EdgeCalls || ed.Type == graph.EdgeImports || ed.Type == graph.EdgeReferences || ed.Type == graph.EdgeMentions || ed.Type == graph.EdgeCallsEndpoint || ed.Type == graph.EdgeUsesModel || ed.Type == graph.EdgeUsesStyle):
 					nb = ed.From
 				case ed.From == cur && ed.Type == graph.EdgeGenerates:
 					nb = ed.To
@@ -904,6 +904,7 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 		{graph.EdgeReferences, "references"},
 		{graph.EdgeUsesModel, "routes touching this model — API surface affected"},
 		{graph.EdgeCallsEndpoint, "frontend call sites hitting this route"},
+		{graph.EdgeUsesStyle, "UI files using this stylesheet's selectors"},
 		{graph.EdgeMentions, "documented in — update these docs too"},
 	}
 	for _, s := range sections {
@@ -1205,7 +1206,8 @@ var (
 // checkable source reference; docSkipDirs are first path segments that the
 // extractor never indexes, so their absence from the graph proves nothing.
 var docSourceExts = map[string]bool{
-	".go": true, ".ts": true, ".tsx": true, ".py": true, ".rs": true, ".md": true,
+	".go": true, ".ts": true, ".tsx": true, ".py": true, ".rs": true,
+	".java": true, ".cs": true, ".md": true,
 	".json": true, ".yaml": true, ".yml": true, ".sql": true, ".toml": true,
 	".css": true, ".scss": true, ".less": true,
 }

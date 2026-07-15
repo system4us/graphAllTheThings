@@ -55,6 +55,7 @@ const (
 	EdgeMentions   = "MENTIONS"   // doc -> function/definition/file it references
 	EdgeCallsEndpoint = "CALLS_ENDPOINT" // function (client call site) -> route it hits over HTTP
 	EdgeUsesModel     = "USES_MODEL"     // route -> ORM model its handler chain touches
+	EdgeUsesStyle     = "USES_STYLE"     // file (template/JSX) -> css file whose classes it uses
 
 	EdgeHandledBy      = "HANDLED_BY"      // route -> function (the terminal handler)
 	EdgeUsesMiddleware = "USES_MIDDLEWARE" // route -> function (middleware in chain order)

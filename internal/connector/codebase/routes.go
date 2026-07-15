@@ -111,10 +111,15 @@ func (c *Connector) detectRoute(g *graph.Graph, caps map[string]*sitter.Node, re
 	}
 
 	// Client-side HTTP call, not a route registration: a template path
-	// (`/x/${id}` — Express paths are never templates), or a plain
+	// (`/x/${id}` — Express paths are never templates), a plain
 	// get/post/put/delete/patch whose extra args are all data-shaped
-	// (axios.get('/x'), api.post('/x', {payload})). `use`/`all` stay server-side.
-	if method != "USE" && method != "ALL" && (isTemplate || (!functionShaped && extraCount >= 0)) {
+	// (axios.get('/x'), api.post('/x', {payload})), or a call used as a
+	// *value* (return/await/assignment/argument — `axios.post('/x', body)`
+	// with an identifier payload is otherwise indistinguishable from a
+	// registration with a handler; registrations are bare statements).
+	// `use`/`all` stay server-side.
+	usedAsValue := callNode.Parent() != nil && callNode.Parent().Type() != "expression_statement"
+	if method != "USE" && method != "ALL" && (isTemplate || usedAsValue || (!functionShaped && extraCount >= 0)) {
 		c.pendingClientCalls = append(c.pendingClientCalls, clientCall{
 			method: method, path: path, file: relPath, line: lineStart,
 		})
@@ -182,6 +187,10 @@ type clientCall struct {
 	path   string
 	file   string
 	line   int
+	// relative marks a path accepted without a leading "/" (BaseAddress-
+	// style clients, Retrofit values): wiring then demands a ≥2-segment
+	// match, since 1-segment tails collide with lookup keys far too easily.
+	relative bool
 }
 
 // detectClientFetch handles bare fetch('/path'|`/path/${id}`) calls.
@@ -199,10 +208,20 @@ func (c *Connector) detectClientFetch(caps map[string]*sitter.Node, relPath stri
 	})
 }
 
-// normalizeClientPath strips quotes/backticks and turns `${expr}` template
-// holes into :param so client paths compare against Express route paths.
+// normalizeClientPath strips quotes/backticks (and literal prefixes like
+// Python's f"", C#'s $"", Rust's r"") and turns interpolation holes into
+// :param so client paths compare against Express route paths: `${expr}`
+// (JS templates), `{expr}` / `{}` (f-strings, format!, C# interpolation,
+// str.format, Retrofit), `$var` (Kotlin), and Go fmt verbs (%s %d %v %x %f).
+// Absolute URLs lose their scheme+host (desktop/mobile apps call
+// `https://api.x.com/users/1`, not a relative path), and a leading base-var
+// hole (`${API_BASE}/users` → `:param/users`) is dropped the same way.
 func normalizeClientPath(raw string) string {
-	s := strings.Trim(raw, "\"'`")
+	s := raw
+	for len(s) > 0 && s[0] != '"' && s[0] != '\'' && s[0] != '`' {
+		s = s[1:]
+	}
+	s = strings.Trim(s, "\"'`")
 	for {
 		i := strings.Index(s, "${")
 		if i < 0 {
@@ -214,7 +233,65 @@ func normalizeClientPath(raw string) string {
 		}
 		s = s[:i] + ":param" + s[i+j+1:]
 	}
+	for {
+		i := strings.Index(s, "{")
+		if i < 0 {
+			break
+		}
+		j := strings.Index(s[i:], "}")
+		if j < 0 {
+			break
+		}
+		s = s[:i] + ":param" + s[i+j+1:]
+	}
+	// Swift \(expr) interpolation.
+	for {
+		i := strings.Index(s, `\(`)
+		if i < 0 {
+			break
+		}
+		j := strings.Index(s[i:], ")")
+		if j < 0 {
+			break
+		}
+		s = s[:i] + ":param" + s[i+j+1:]
+	}
+	// Kotlin/shell-style bare $var interpolation.
+	for i := 0; i+1 < len(s); {
+		if s[i] == '$' && (isWordByte(s[i+1]) && !(s[i+1] >= '0' && s[i+1] <= '9')) {
+			j := i + 1
+			for j < len(s) && isWordByte(s[j]) {
+				j++
+			}
+			s = s[:i] + ":param" + s[j:]
+			i += len(":param")
+		} else {
+			i++
+		}
+	}
+	for _, verb := range []string{"%s", "%d", "%v", "%x", "%f"} {
+		s = strings.ReplaceAll(s, verb, ":param")
+	}
+	// Absolute URL → path component ("https://api.x.com/users/1" → "/users/1";
+	// the host may itself be a hole: ":param://..." still parses).
+	if i := strings.Index(s, "://"); i >= 0 && i <= 12 {
+		rest := s[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			s = rest[j:]
+		} else {
+			s = "/"
+		}
+	}
+	// `${API_BASE}/users` → ":param/users": the leading hole is a base, not
+	// a path segment.
+	if strings.HasPrefix(s, ":param/") {
+		s = strings.TrimPrefix(s, ":param")
+	}
 	return s
+}
+
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 // pathSegmentsMatch compares a client path against a route path from the
@@ -272,10 +349,30 @@ func (c *Connector) wireClientCalls(g *graph.Graph, funcs []funcInfo) {
 			seen[e.From+"\x00"+e.To] = true
 		}
 	}
+	// One call site can be queued twice — the dedicated JS detectors and the
+	// generic probe (clientcalls.go), or a wrapper plus the verb-string
+	// heuristic. Collapse by file:line:path, preferring the entry that knows
+	// its method.
+	byKey := map[string]int{}
+	deduped := c.pendingClientCalls[:0]
+	for _, cc := range c.pendingClientCalls {
+		k := cc.file + "\x00" + fmt.Sprint(cc.line) + "\x00" + cc.path
+		if i, ok := byKey[k]; ok {
+			if deduped[i].method == "" && cc.method != "" {
+				deduped[i] = cc
+			}
+			continue
+		}
+		byKey[k] = len(deduped)
+		deduped = append(deduped, cc)
+	}
+	c.pendingClientCalls = deduped
 	for _, cc := range c.pendingClientCalls {
 		bestScore, bestID, ties := 0, "", 0
 		for _, r := range routes {
-			if cc.method != "" && r.Attrs["method"] != cc.method {
+			// Route method "" = any-method wildcard (net/http HandleFunc
+			// without a 1.22 pattern verb).
+			if cc.method != "" && r.Attrs["method"] != "" && r.Attrs["method"] != cc.method {
 				continue
 			}
 			if r.Attrs["file"] == cc.file {
@@ -289,7 +386,7 @@ func (c *Connector) wireClientCalls(g *graph.Graph, funcs []funcInfo) {
 				ties++
 			}
 		}
-		if bestScore == 0 || ties > 1 {
+		if bestScore == 0 || ties > 1 || (cc.relative && bestScore < 2) {
 			continue
 		}
 		src := ""

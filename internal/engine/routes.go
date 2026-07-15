@@ -36,7 +36,7 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 		routes = filtered
 	}
 	if len(routes) == 0 {
-		return "no HTTP routes detected (static: Express-style JS/TS/JSX; tag others via annotate_entity's route_method/route_path/route_framework)\n", nil
+		return "no HTTP routes detected (static: Express JS/TS/JSX, Spring/ASP.NET annotations, gin/chi/echo/gorilla/net-http Go, Flask/FastAPI decorators; tag others via annotate_entity's route_method/route_path/route_framework)\n", nil
 	}
 
 	sort.Slice(routes, func(i, j int) bool {
@@ -104,7 +104,11 @@ func (e *Engine) Routes(fileSubstr string) (string, error) {
 				models = append(models, on.Name)
 			}
 		}
-		line := fmt.Sprintf("  :%s  %s %s", n.Attrs["line_start"], n.Attrs["method"], n.Attrs["path"])
+		method := n.Attrs["method"]
+		if method == "" {
+			method = "ANY" // wildcard registration (net/http HandleFunc)
+		}
+		line := fmt.Sprintf("  :%s  %s %s", n.Attrs["line_start"], method, n.Attrs["path"])
 		if handler != "" {
 			line += "  → " + handler
 		}
