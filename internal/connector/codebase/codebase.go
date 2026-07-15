@@ -1021,6 +1021,9 @@ func langFor(ext string) *langConfig {
 			(import_declaration (identifier) @import.path)
 			(comment) @loose.comment
 			(multiline_comment) @loose.comment
+			(class_declaration
+			  name: (type_identifier) @swiftmodel.name
+			  body: (class_body) @swiftmodel.body) @swiftmodel.class
 			`,
 		}
 	case ".cs":
@@ -2077,6 +2080,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 			if _, ok := caps["kmodel.class"]; ok {
 				c.detectKotlinModel(g, caps, relPath, fileID, data)
+			}
+			if _, ok := caps["swiftmodel.class"]; ok {
+				c.detectSwiftModel(g, caps, relPath, fileID, data)
 			}
 
 			// ── Shared-state singleton tracking (JS/TS/JSX) ─────────────────────

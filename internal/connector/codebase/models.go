@@ -399,6 +399,97 @@ func kotlinAnnotationStringArg(argsNode *sitter.Node, data []byte, key string) s
 	return ""
 }
 
+// detectSwiftModel handles Vapor/Fluent's property-wrapper style: `static
+// let schema = "todos"` is Fluent's near-universal requirement for any
+// class conforming to its Model protocol — a safer, less ambiguous gate
+// than checking for `: Model` in the inheritance clause the way weak-base
+// detection does elsewhere, since "Model" as a bare protocol/base name is
+// exactly the kind of generic token that already needs field evidence
+// everywhere else in this file. Every property carrying a recognized
+// Fluent property wrapper (@ID, @Field, @Parent, @Children, ...) counts as
+// a column; @Field(key: "...") gives the renamed-column case.
+func (c *Connector) detectSwiftModel(g *graph.Graph, caps map[string]*sitter.Node, relPath, fileID string, data []byte) {
+	nameNode := caps["swiftmodel.name"]
+	body := caps["swiftmodel.body"]
+	if nameNode == nil || body == nil {
+		return
+	}
+	table := ""
+	var fields []string
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		prop := body.NamedChild(i)
+		if prop.Type() != "property_declaration" {
+			continue
+		}
+		pname := ""
+		if patternNode := prop.ChildByFieldName("name"); patternNode != nil {
+			if bid := patternNode.ChildByFieldName("bound_identifier"); bid != nil {
+				pname = bid.Content(data)
+			}
+		}
+		if pname == "" {
+			continue
+		}
+		if pname == "schema" {
+			if v := prop.ChildByFieldName("value"); v != nil && v.Type() == "line_string_literal" {
+				table = swiftLineStringContent(v, data)
+			}
+			continue
+		}
+
+		colName := ""
+		isFluentField := false
+		for j := 0; j < int(prop.NamedChildCount()); j++ {
+			mods := prop.NamedChild(j)
+			if mods.Type() != "modifiers" {
+				continue
+			}
+			for k := 0; k < int(mods.NamedChildCount()); k++ {
+				a := mods.NamedChild(k)
+				if a.Type() != "attribute" || a.NamedChildCount() == 0 {
+					continue
+				}
+				aname := ""
+				if ut := a.NamedChild(0); ut.Type() == "user_type" && ut.NamedChildCount() > 0 {
+					aname = ut.NamedChild(0).Content(data)
+				}
+				switch aname {
+				case "ID", "Field", "Parent", "OptionalParent", "Children", "OptionalChild", "Siblings", "Timestamp", "Group", "Enum", "Boolean":
+					isFluentField = true
+				}
+				// @Field(key: "title") — arg[0] is the "key" label, arg[1]
+				// its string value; a bare @Field has neither.
+				if aname == "Field" && a.NamedChildCount() > 2 {
+					if v := a.NamedChild(2); v.Type() == "line_string_literal" {
+						colName = swiftLineStringContent(v, data)
+					}
+				}
+			}
+		}
+		if !isFluentField {
+			continue
+		}
+		entry := pname
+		if colName != "" && colName != pname {
+			entry += "→" + colName
+		}
+		fields = append(fields, entry)
+	}
+	if table == "" {
+		return // no `static let schema = ...` found: not confidently a Fluent model
+	}
+	c.emitModelFields(g, nameNode.Content(data), table, fields, relPath, fileID, int(nameNode.StartPoint().Row)+1)
+}
+
+// swiftLineStringContent returns the text of a Swift line_string_literal's
+// text field — e.g. "todos" out of `"todos"`.
+func swiftLineStringContent(n *sitter.Node, data []byte) string {
+	if t := n.ChildByFieldName("text"); t != nil {
+		return t.Content(data)
+	}
+	return ""
+}
+
 // detectCSharpModel handles two independent EF Core signals: a class whose
 // base list matches a configured model base (weak defaults "Base"/"Model",
 // or a project-specific name like "BaseEntity" via .gatt/models.json — C#
