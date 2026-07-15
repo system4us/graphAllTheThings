@@ -977,6 +977,14 @@ func langFor(ext string) *langConfig {
 			(method_declaration (modifiers (annotation (identifier) @jann.name (annotation_argument_list) @jann.args)) name: (identifier) @jann.method)
 			(method_declaration (modifiers (marker_annotation (identifier) @jmann.name)) name: (identifier) @jmann.method)
 			(class_declaration (modifiers (annotation (identifier) @jcls.name (annotation_argument_list) @jcls.args)) name: (identifier) @jcls.class)
+			(class_declaration
+			  (modifiers (marker_annotation (identifier) @jmodel.ann))
+			  name: (identifier) @jmodel.name
+			  body: (class_body) @jmodel.body) @jmodel.class
+			(class_declaration
+			  (modifiers (annotation (identifier) @jmodel.ann (annotation_argument_list) @jmodel.annargs))
+			  name: (identifier) @jmodel.name
+			  body: (class_body) @jmodel.body) @jmodel.class
 			`,
 		}
 	case ".kt":
@@ -2035,6 +2043,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 			if n := caps["jcls.name"]; n != nil {
 				c.handleAnnotation(&anns, n.Content(data), annArgs("jcls.args"), nil, caps["jcls.class"], relPath, data)
+			}
+			if _, ok := caps["jmodel.class"]; ok {
+				c.detectJavaModel(g, caps, relPath, fileID, data)
 			}
 			if n := caps["cattr.name"]; n != nil {
 				c.handleAnnotation(&anns, n.Content(data), annArgs("cattr.args"), caps["cattr.method"], nil, relPath, data)

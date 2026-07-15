@@ -162,6 +162,111 @@ func (c *Connector) emitModelFields(g *graph.Graph, name, table string, fields [
 	g.AddEdge(id, fileID, graph.EdgeBelongsTo, nil)
 }
 
+// detectJavaModel handles JPA/Hibernate-style entities: `@Entity` (a bare
+// marker annotation — the primary, sufficient-on-its-own signal) and
+// `@Table(name = "...")` (table name override) on a class_declaration.
+// Every non-transient field counts as a column: JPA persists fields by
+// default and @Column is only needed to customize name/constraints, so
+// requiring an explicit decorator per field — the way the TS/Sequelize
+// detector does, where every field-as-column needs its own @Column — would
+// silently miss most real entities' fields, which skip @Column entirely
+// when the column name already matches the field name.
+func (c *Connector) detectJavaModel(g *graph.Graph, caps map[string]*sitter.Node, relPath, fileID string, data []byte) {
+	annName := caps["jmodel.ann"]
+	nameNode := caps["jmodel.name"]
+	if annName == nil || nameNode == nil {
+		return
+	}
+	ann := annName.Content(data)
+	if ann != "Entity" && ann != "Table" {
+		return
+	}
+	name := nameNode.Content(data)
+
+	table := ""
+	if ann == "Table" {
+		if argsNode := caps["jmodel.annargs"]; argsNode != nil {
+			table = javaAnnotationStringArg(argsNode, data, "name")
+		}
+	}
+
+	var fields []string
+	if body := caps["jmodel.body"]; body != nil {
+		for i := 0; i < int(body.NamedChildCount()); i++ {
+			f := body.NamedChild(i)
+			if f.Type() != "field_declaration" {
+				continue
+			}
+			transient, colName := false, ""
+			for j := 0; j < int(f.NamedChildCount()); j++ {
+				mods := f.NamedChild(j)
+				if mods.Type() != "modifiers" {
+					continue
+				}
+				for k := 0; k < int(mods.NamedChildCount()); k++ {
+					a := mods.NamedChild(k)
+					var aname string
+					var argsN *sitter.Node
+					switch a.Type() {
+					case "marker_annotation":
+						if id := a.ChildByFieldName("name"); id != nil {
+							aname = id.Content(data)
+						}
+					case "annotation":
+						if id := a.ChildByFieldName("name"); id != nil {
+							aname = id.Content(data)
+						}
+						argsN = a.ChildByFieldName("arguments")
+					}
+					if aname == "Transient" {
+						transient = true
+					}
+					if aname == "Column" && argsN != nil {
+						if n := javaAnnotationStringArg(argsN, data, "name"); n != "" {
+							colName = n
+						}
+					}
+				}
+			}
+			if transient {
+				continue
+			}
+			declarator := f.ChildByFieldName("declarator")
+			if declarator == nil {
+				continue
+			}
+			fnameNode := declarator.ChildByFieldName("name")
+			if fnameNode == nil {
+				continue
+			}
+			fname := fnameNode.Content(data)
+			entry := fname
+			if colName != "" && colName != fname {
+				entry += "→" + colName
+			}
+			fields = append(fields, entry)
+		}
+	}
+	c.emitModelFields(g, name, table, fields, relPath, fileID, int(nameNode.StartPoint().Row)+1)
+}
+
+// javaAnnotationStringArg finds `key = "value"` inside a Java
+// annotation_argument_list (element_value_pair nodes) — e.g. the "owners"
+// in `@Table(name = "owners")`.
+func javaAnnotationStringArg(argsNode *sitter.Node, data []byte, key string) string {
+	for i := 0; i < int(argsNode.NamedChildCount()); i++ {
+		pair := argsNode.NamedChild(i)
+		if pair.Type() != "element_value_pair" {
+			continue
+		}
+		k, v := pair.ChildByFieldName("key"), pair.ChildByFieldName("value")
+		if k != nil && v != nil && k.Content(data) == key && v.Type() == "string_literal" {
+			return strings.Trim(v.Content(data), "\"")
+		}
+	}
+	return ""
+}
+
 // detectClassModel handles TS/JS class declarations: TypeORM-style decorated
 // classes (@Entity/@Table on the class, @Column({name}) on fields) and any
 // class extending a configured base. A weak base (Model, Base) alone is not
