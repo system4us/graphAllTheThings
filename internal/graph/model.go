@@ -41,6 +41,7 @@ const (
 	NodeComment = "comment" // a floating comment not attached to any declaration's doc
 	NodeState   = "state"   // a tracked property slot on a shared cross-file singleton
 	NodeModel   = "model"   // an ORM model found in code (e.g. Sequelize Model.init / sequelize.define)
+	NodePackage = "package" // a resolved local package/namespace directory (Go, Python, Java, Kotlin, C#)
 )
 
 // Edge types.

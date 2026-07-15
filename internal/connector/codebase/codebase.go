@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"graphallthethings/internal/graph"
 
@@ -67,6 +69,55 @@ type Connector struct {
 	gitFiles      map[string]bool
 	gitFilesOK    bool
 	gitFilesKnown bool
+	// goModuleRoot/goModulePath are the enclosing go.mod's directory and
+	// `module` path, used to resolve a Go import spec that names a package
+	// of this project (as opposed to stdlib/a third-party dependency) to a
+	// local "pkg:<dir>" node instead of an opaque external one. Loaded
+	// lazily by loadGoModule; goModuleChecked distinguishes "not looked up
+	// yet" from "looked up, no go.mod found" (goModulePath == "").
+	goModuleRoot    string
+	goModulePath    string
+	goModuleChecked bool
+	// jvmSourceRoots holds every conventional Maven/Gradle source directory
+	// found in the tree (the extraction root itself, plus any
+	// src/main/java, src/main/kotlin, src/test/java, src/test/kotlin at any
+	// depth — multi-module repos have one pair per module). Used to resolve
+	// Java/Kotlin imports to local package nodes without needing to parse
+	// every file's own package declaration first. Loaded lazily.
+	jvmSourceRoots []string
+	jvmRootsLoaded bool
+	// csharpRoots holds one entry per .csproj found in the tree (its
+	// directory + root namespace) plus a namespace-less fallback rooted at
+	// the extraction root, used to resolve `using X.Y.Z;` best-effort (C#
+	// namespaces aren't required to mirror the directory tree the way Go/
+	// Java/Kotlin package names are). Loaded lazily.
+	csharpRoots       []csharpRoot
+	csharpRootsLoaded bool
+	// rustCrates holds one entry per Cargo.toml found in the tree (its
+	// directory + package name), used to resolve `crate::`/`self::`/
+	// `super::`/cross-crate `use` paths to local files. Loaded lazily.
+	rustCrates       []rustCrate
+	rustCratesLoaded bool
+	// dispatchVerbs is the registration-call-name allowlist (defaults +
+	// .gatt/dispatch.json) for string-keyed dispatch resolution — see
+	// dispatch.go. Loaded lazily.
+	dispatchVerbs map[string]bool
+	// pendingDispatchAssocs/pendingDispatchTriggers collect the two halves
+	// of string-keyed dispatch during the walk, resolved against the
+	// finished function index by wireDispatch (dispatch.go) after the whole
+	// tree is parsed.
+	pendingDispatchAssocs   []dispatchAssoc
+	pendingDispatchTriggers []dispatchTrigger
+}
+
+// csharpRoot pairs a project directory with its root namespace, for
+// stripping that prefix off a `using` directive before mapping the
+// remainder to a subdirectory. ns == "" marks the namespace-less fallback
+// root (the bare extraction root) — there's no prefix to strip, the import's
+// full dotted path is tried directly.
+type csharpRoot struct {
+	dir string
+	ns  string
 }
 
 // docMentions holds the candidate code references extracted from one doc.
@@ -156,6 +207,7 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	c.wireModels(g)
 	c.wireClientCalls(g, funcs)
 	c.wireStyles(g)
+	c.wireDispatch(g, funcsByName)
 	c.wireRouteModels(g)
 	c.mineGitCoChanges(ctx, g)
 
@@ -602,6 +654,7 @@ func langFor(ext string) *langConfig {
 			// call.func = direct call (local resolution candidate)
 			// call.sel  = selector field (pkg.Func or obj.Method — skip local resolution)
 			queryStr: `
+			(package_clause (package_identifier) @pkg.name)
 			(type_declaration (type_spec name: (type_identifier) @def.name))
 			(type_declaration (type_spec
 			  name: (type_identifier) @gomodel.name
@@ -774,6 +827,7 @@ func langFor(ext string) *langConfig {
 			(call function: (attribute attribute: (identifier) @call.sel))
 			(import_statement name: (dotted_name) @import.path)
 			(import_from_statement module_name: (dotted_name) @import.path)
+			(import_from_statement module_name: (relative_import) @import.path)
 			(comment) @loose.comment
 			`,
 		}
@@ -1181,6 +1235,114 @@ func isGenerated(relPath string, data []byte) bool {
 	return false
 }
 
+// isExportedGoName reports whether a Go identifier is exported per the
+// language spec: its first Unicode letter is uppercase. Tagged onto
+// definition/function nodes so "what's this package's public API" doesn't
+// need a second pass over the source.
+func isExportedGoName(name string) bool {
+	r, _ := utf8.DecodeRuneInString(name)
+	return r != utf8.RuneError && unicode.IsUpper(r)
+}
+
+// modifiersText returns the raw source text of a declaration node's
+// "modifiers" child (Java class_declaration/method_declaration/…, Kotlin
+// class_declaration/function_declaration/…), or "" when the declaration has
+// none — which, per each language's own default-visibility rule, is itself
+// meaningful (see isExportedJavaName/isExportedKotlinName). declNode is the
+// declaration itself (e.g. defNode.Parent()/funcNameNode.Parent()), not the
+// name identifier. A raw-text check is enough here — the modifiers node's
+// byte range covers keywords like "public"/"private" even where the
+// grammar doesn't expose them as their own named child.
+func modifiersText(declNode *sitter.Node, src []byte) string {
+	if declNode == nil {
+		return ""
+	}
+	for i := 0; i < int(declNode.ChildCount()); i++ {
+		if ch := declNode.Child(i); ch.Type() == "modifiers" {
+			return ch.Content(src)
+		}
+	}
+	return ""
+}
+
+// isExportedJavaName reports whether a Java declaration is public — the
+// only visibility Java exposes outside its own package. No modifiers at all
+// (Java's default) means package-private, not exported.
+func isExportedJavaName(declNode *sitter.Node, src []byte) bool {
+	return strings.Contains(modifiersText(declNode, src), "public")
+}
+
+// isExportedKotlinName reports whether a Kotlin declaration is part of the
+// public API. Kotlin's default visibility (no modifier at all) is public;
+// "private" and "internal" (module-only) are the non-exported cases.
+func isExportedKotlinName(declNode *sitter.Node, src []byte) bool {
+	mods := modifiersText(declNode, src)
+	return !strings.Contains(mods, "private") && !strings.Contains(mods, "internal")
+}
+
+// isExportedCSharpName reports whether a C# declaration carries the
+// "public" modifier. Unlike Java/Kotlin, C# grammar emits one bare
+// "modifier" node per keyword (not a single wrapping "modifiers" node), so
+// every direct child needs checking rather than one Content() read.
+// Best-effort: doesn't model C#'s per-context default visibility (e.g. a
+// top-level class defaults to internal, not public, when unmarked) — an
+// unmarked declaration is reported as not exported, which undercounts the
+// true public surface in some codebases rather than overcounting it.
+func isExportedCSharpName(declNode *sitter.Node, src []byte) bool {
+	if declNode == nil {
+		return false
+	}
+	for i := 0; i < int(declNode.ChildCount()); i++ {
+		if ch := declNode.Child(i); ch.Type() == "modifier" && strings.Contains(ch.Content(src), "public") {
+			return true
+		}
+	}
+	return false
+}
+
+// isExportedRustName reports whether a Rust declaration carries a bare "pub"
+// visibility modifier. "pub(crate)"/"pub(super)"/"pub(in path)" are scoped
+// visibility, not the crate's external public API, so those are reported as
+// not exported — only unqualified "pub" counts.
+func isExportedRustName(declNode *sitter.Node, src []byte) bool {
+	if declNode == nil {
+		return false
+	}
+	for i := 0; i < int(declNode.ChildCount()); i++ {
+		if ch := declNode.Child(i); ch.Type() == "visibility_modifier" {
+			return strings.TrimSpace(ch.Content(src)) == "pub"
+		}
+	}
+	return false
+}
+
+// isExportedName reports whether name is part of a package's public API,
+// per the export convention of the language ext implies, and whether that
+// language has a convention gatt models at all — ok is false for languages
+// without one captured yet (or without a meaningful one, e.g. JS/TS where
+// "exported" isn't a per-declaration keyword the same way), in which case
+// the caller leaves the "exported" attr off entirely rather than writing a
+// misleading value. declNode is the enclosing declaration (not the name
+// identifier itself) — every case but Go/Python uses it, for a modifiers
+// check.
+func isExportedName(ext, name string, declNode *sitter.Node, src []byte) (exported, ok bool) {
+	switch ext {
+	case ".go":
+		return isExportedGoName(name), true
+	case ".py":
+		return isExportedPythonName(name), true
+	case ".java":
+		return isExportedJavaName(declNode, src), true
+	case ".kt":
+		return isExportedKotlinName(declNode, src), true
+	case ".cs":
+		return isExportedCSharpName(declNode, src), true
+	case ".rs":
+		return isExportedRustName(declNode, src), true
+	}
+	return false, false
+}
+
 // receiverTypeName extracts the type name from a Go receiver node like "(e *Engine)" → "Engine".
 func receiverTypeName(recvNode *sitter.Node, src []byte) string {
 	text := strings.Trim(recvNode.Content(src), "()")
@@ -1374,6 +1536,10 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		qc := sitter.NewQueryCursor()
 		qc.Exec(lc.query, tree.RootNode())
 
+		// goPkgName is this file's own "package X" clause (Go only) — wired to
+		// a per-directory package node once the capture loop below finishes.
+		goPkgName := ""
+
 		// lastFuncLine detects re-entry into a function (unused currently, kept for future).
 		lastFuncLine := -1
 
@@ -1411,6 +1577,11 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				caps[lc.query.CaptureNameForId(cap.Index)] = cap.Node
 			}
 
+			// ── Package clause (Go) ─────────────────────────────────────────────
+			if pkgNode, ok := caps["pkg.name"]; ok {
+				goPkgName = pkgNode.Content(data)
+			}
+
 			// ── Type/class definition ──────────────────────────────────────────
 			if defNode, ok := caps["def.name"]; ok {
 				name := defNode.Content(data)
@@ -1428,6 +1599,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				}
 				if doc := docComment(defNode, data, consumed); doc != "" {
 					attrs["doc"] = doc
+				}
+				if exported, ok := isExportedName(ext, name, defNode.Parent(), data); ok {
+					attrs["exported"] = fmt.Sprint(exported)
 				}
 				if gen {
 					attrs["generated"] = "true"
@@ -1448,9 +1622,16 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			// func.name) and that isn't nested in some function/block.
 			if nameNode, ok := caps["const.name"]; ok {
 				if declNode, ok := caps["const.decl"]; ok && isTopLevelDeclarator(declNode) {
+					var valNode *sitter.Node
 					valType := ""
 					if v := declNode.ChildByFieldName("value"); v != nil {
-						valType = v.Type()
+						valNode, valType = v, v.Type()
+					}
+					// A dispatch/lookup table's {key: funcIdentifier} pairs feed
+					// the string-keyed dispatch registry (dispatch.go) — the
+					// object itself is still indexed as a definition node below.
+					if valType == "object" {
+						c.collectDispatchTable(valNode, data)
 					}
 					if valType != "arrow_function" && valType != "function_expression" {
 						name := nameNode.Content(data)
@@ -1526,6 +1707,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if doc := docComment(funcNameNode, data, consumed); doc != "" {
 					attrs["doc"] = doc
 				}
+				if exported, ok := isExportedName(ext, name, funcNameNode.Parent(), data); ok {
+					attrs["exported"] = fmt.Sprint(exported)
+				}
 				if gen {
 					attrs["generated"] = "true"
 				}
@@ -1576,8 +1760,10 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 						}
 					}
 				}
+				callerFuncID := ""
 				if bestIdx >= 0 && funcs[bestIdx].lineEnd >= callLine {
 					funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
+					callerFuncID = funcs[bestIdx].id
 				}
 				// Same capture doubles as the native-route probe (Go/Python
 				// registrations, routes_native.go) and, when that declines,
@@ -1585,15 +1771,43 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if !c.detectNativeRoute(g, callNode, callName, relPath, fileID, ext, data) {
 					c.detectGenericClientCall(callNode, callName, relPath, ext, data)
 				}
+				// String-keyed dispatch (queueJob("createPdf"), io.on("connected", h)):
+				// JS/TS/JSX only — the object-literal lookup-table side of the
+				// registry (collectDispatchTable) is JS/TS/JSX-only too.
+				if ext == ".js" || ext == ".jsx" || ext == ".ts" || ext == ".tsx" {
+					c.detectDispatchCall(callNode, callName, callerFuncID, data)
+				}
 			}
 
 			// ── Import ────────────────────────────────────────────────────────
 			if importNode, ok := caps["import.path"]; ok {
 				importStr := strings.Trim(importNode.Content(data), `"'`)
+				// resolved already carries its own "file:"/"pkg:" id prefix —
+				// each language's resolver decides which kind of local node
+				// its import specifier lands on (Go: always a package;
+				// Python: a module file or a package directory).
+				resolved := ""
+				switch ext {
+				case ".go":
+					resolved = c.resolveGoPackageImport(g, importStr)
+				case ".py":
+					resolved = c.resolvePythonImport(g, path, importStr)
+				case ".java", ".kt":
+					resolved = c.resolveJVMImport(g, importStr)
+				case ".cs":
+					resolved = c.resolveCSharpImport(g, importStr)
+				case ".rs":
+					resolved = c.resolveRustImport(path, importStr)
+				}
 				if local := c.resolveLocalImport(path, importStr); local != "" {
 					// Relative import of a file we index (code or data):
 					// wire file → file so Blast can walk importers.
 					g.AddEdge(fileID, "file:"+local, graph.EdgeImports, nil)
+				} else if resolved != "" {
+					// Import of a package/module local to this project: wire
+					// file → that node instead of an opaque external one, so
+					// "who imports this" is queryable at the package level.
+					g.AddEdge(fileID, resolved, graph.EdgeImports, nil)
 				} else {
 					importID := "import:" + importStr
 					if g.Nodes[importID] == nil {
@@ -1732,6 +1946,10 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		emitLooseComments(g, looseComments, consumed, funcs, relPath, fileID, data)
 		c.emitAnnotationRoutes(g, &anns, relPath, fileID)
 		emitStateAccess(g, stateAccesses, singletons, funcs, relPath)
+
+		if goPkgName != "" {
+			c.wireGoPackage(g, fileID, relPath, goPkgName)
+		}
 
 		return nil
 	})
@@ -2144,6 +2362,492 @@ func (c *Connector) resolveLocalImport(fromPath, spec string) string {
 		}
 	}
 	return ""
+}
+
+// loadGoModule finds the go.mod enclosing c.dir (walking up, same as any Go
+// tool would) and records its directory plus `module` path. Leaves both
+// fields empty when no go.mod is found — not an error, just means Go import
+// specs in this tree can't be told apart from third-party packages, and fall
+// back to the generic external-node path like every other language.
+func (c *Connector) loadGoModule() {
+	dir, err := filepath.Abs(c.dir)
+	if err != nil {
+		return
+	}
+	for {
+		data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if err == nil {
+			for line := range strings.SplitSeq(string(data), "\n") {
+				if s := strings.TrimSpace(line); strings.HasPrefix(s, "module ") {
+					c.goModuleRoot = dir
+					c.goModulePath = strings.TrimSpace(strings.TrimPrefix(s, "module "))
+					return
+				}
+			}
+			return // go.mod with no module line — malformed, treat as absent
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return
+		}
+		dir = parent
+	}
+}
+
+// getOrCreatePackageNode returns (creating if absent) the "pkg:<dirRel>"
+// node for a resolved local directory — the package/module-directory
+// abstraction shared by every language whose imports are directory-scoped
+// (Go, Python, Java, Kotlin, C#). dirRel must already be repo-relative and
+// slash-normalized. name/importPath are used only when creating the node;
+// an already-existing node's Name is left alone here — see setPackageName
+// to overwrite it once a language's own file declares the authoritative
+// name (a "package X" clause, `package a.b.c;`, ...).
+func (c *Connector) getOrCreatePackageNode(g *graph.Graph, dirRel, name, importPath string) string {
+	pkgID := "pkg:" + dirRel
+	if g.Nodes[pkgID] == nil {
+		attrs := map[string]string{"dir": dirRel}
+		if importPath != "" {
+			attrs["import_path"] = importPath
+		}
+		g.AddNode(&graph.Node{ID: pkgID, Type: graph.NodePackage, Name: name, Attrs: attrs})
+	}
+	return pkgID
+}
+
+// setPackageName overwrites a package node's Name with the value declared by
+// one of its own files, once that file is parsed — an importer may have
+// already created the node as a placeholder (name guessed from the
+// directory) before the package's own source was visited. No-op if the node
+// doesn't exist yet (the caller creates it via getOrCreatePackageNode).
+func setPackageName(g *graph.Graph, pkgID, name string) {
+	if n := g.Nodes[pkgID]; n != nil {
+		n.Name = name
+	}
+}
+
+// resolveGoPackageImport resolves a Go import path to a local "pkg:<dir>"
+// node id when it names a package of this project (as declared in go.mod)
+// whose directory falls inside the extraction root. Returns "" for stdlib/
+// third-party imports, when no go.mod was found, or when the resolved
+// directory lies outside c.dir (e.g. extraction scoped to a subdirectory of
+// a larger module) — those keep falling through to the generic external-node
+// path in the caller. Creates a placeholder package node on first sight if
+// one doesn't exist yet; wireGoPackage overwrites it with the declared
+// package name once (if) that package's own files are parsed.
+func (c *Connector) resolveGoPackageImport(g *graph.Graph, importPath string) string {
+	if !c.goModuleChecked {
+		c.loadGoModule()
+		c.goModuleChecked = true
+	}
+	if c.goModulePath == "" {
+		return ""
+	}
+	var rel string
+	switch {
+	case importPath == c.goModulePath:
+		rel = "."
+	case strings.HasPrefix(importPath, c.goModulePath+"/"):
+		rel = strings.TrimPrefix(importPath, c.goModulePath+"/")
+	default:
+		return "" // not this project's module — stdlib or third-party
+	}
+	pkgDirAbs := filepath.Join(c.goModuleRoot, rel)
+	pkgDirRel, err := filepath.Rel(c.dir, pkgDirAbs)
+	if err != nil || pkgDirRel == ".." || strings.HasPrefix(pkgDirRel, ".."+string(filepath.Separator)) {
+		return "" // package lives outside the extraction root
+	}
+	name := filepath.Base(pkgDirRel)
+	if pkgDirRel == "." {
+		name = filepath.Base(c.goModulePath)
+	}
+	return c.getOrCreatePackageNode(g, filepath.ToSlash(pkgDirRel), name, importPath)
+}
+
+// wireGoPackage links a Go file to its package node (one per directory,
+// keyed by "pkg:<dir>") using the authoritative name from that file's own
+// "package X" clause.
+func (c *Connector) wireGoPackage(g *graph.Graph, fileID, relPath, pkgName string) {
+	dir := filepath.ToSlash(filepath.Dir(relPath))
+	pkgID := "pkg:" + dir
+	if g.Nodes[pkgID] != nil {
+		setPackageName(g, pkgID, pkgName)
+	} else {
+		importPath := ""
+		if !c.goModuleChecked {
+			c.loadGoModule()
+			c.goModuleChecked = true
+		}
+		if c.goModulePath != "" {
+			if dir == "." {
+				importPath = c.goModulePath
+			} else {
+				importPath = c.goModulePath + "/" + dir
+			}
+		}
+		c.getOrCreatePackageNode(g, dir, pkgName, importPath)
+	}
+	g.AddEdge(fileID, pkgID, graph.EdgeBelongsTo, nil)
+}
+
+// isExportedPythonName applies Python's convention (there is no formal
+// export keyword): a name not starting with "_" is public. Best-effort —
+// doesn't account for an __init__.py's explicit __all__ list overriding it.
+func isExportedPythonName(name string) bool {
+	return name != "" && !strings.HasPrefix(name, "_")
+}
+
+// pyRoots returns the candidate source roots to resolve an absolute Python
+// import against: the extraction root itself (flat layout, the common case)
+// and its "src" subdirectory (src layout), in that order.
+func (c *Connector) pyRoots() []string {
+	roots := []string{c.dir}
+	if info, err := os.Stat(filepath.Join(c.dir, "src")); err == nil && info.IsDir() {
+		roots = append(roots, filepath.Join(c.dir, "src"))
+	}
+	return roots
+}
+
+// resolvePythonImport resolves a Python import spec — absolute ("foo.bar",
+// from an import_statement/import_from_statement's dotted_name) or relative
+// (".foo", "..bar.baz", ".", "..", the raw text of a relative_import node) —
+// to a local file or package node id. Relative imports resolve against the
+// importing file's own directory (one leading dot = its enclosing package,
+// each extra dot climbs one more directory, matching Python's own rule);
+// absolute imports are tried against every root in pyRoots. Returns "" when
+// nothing on disk matches — stdlib, a third-party package, or a namespace
+// layout this heuristic can't infer — so the caller falls through to the
+// generic external node, same as every unresolved import in any language.
+func (c *Connector) resolvePythonImport(g *graph.Graph, fromPath, spec string) string {
+	if strings.HasPrefix(spec, ".") {
+		dots := 0
+		for dots < len(spec) && spec[dots] == '.' {
+			dots++
+		}
+		baseDir := filepath.Dir(fromPath)
+		for i := 1; i < dots; i++ {
+			baseDir = filepath.Dir(baseDir)
+		}
+		var segments []string
+		if rest := spec[dots:]; rest != "" {
+			segments = strings.Split(rest, ".")
+		}
+		return c.resolvePyPath(g, baseDir, segments)
+	}
+	for _, root := range c.pyRoots() {
+		if id := c.resolvePyPath(g, root, strings.Split(spec, ".")); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// resolvePyPath joins segments onto base and resolves the result to a file
+// node (base/seg/…/last.py — a module) or a package node (any existing
+// directory; PEP 420 namespace packages need no __init__.py, so gatt doesn't
+// require one either). Empty segments (bare "from . import x") resolve base
+// itself as a package. Returns "" — and creates nothing — when the target
+// falls outside the extraction root or doesn't exist on disk.
+func (c *Connector) resolvePyPath(g *graph.Graph, base string, segments []string) string {
+	target := base
+	if len(segments) > 0 {
+		target = filepath.Join(append([]string{base}, segments...)...)
+	}
+	if info, err := os.Stat(target + ".py"); err == nil && !info.IsDir() {
+		if rel, err := filepath.Rel(c.dir, target+".py"); err == nil && !strings.HasPrefix(rel, "..") {
+			return "file:" + target + ".py"
+		}
+		return ""
+	}
+	return c.resolveDirSegments(g, base, segments, "")
+}
+
+// resolveDirSegments joins segs onto root and, if the result is an existing
+// directory inside the extraction root, returns its "pkg:<dir>" node
+// (get-or-create). Empty segs resolves root itself. Returns "" — nothing
+// created — when the target doesn't exist, isn't a directory, or falls
+// outside c.dir. Shared by every directory-scoped language resolver
+// (Python's package branch, Java/Kotlin, C#); importPath is stored on the
+// node only when the node doesn't already exist.
+func (c *Connector) resolveDirSegments(g *graph.Graph, root string, segs []string, importPath string) string {
+	target := root
+	if len(segs) > 0 {
+		target = filepath.Join(append([]string{root}, segs...)...)
+	}
+	info, err := os.Stat(target)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	rel, err := filepath.Rel(c.dir, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "" // outside the extraction root
+	}
+	rel = filepath.ToSlash(rel)
+	name := filepath.Base(rel)
+	if rel == "." {
+		name = filepath.Base(c.dir)
+	}
+	return c.getOrCreatePackageNode(g, rel, name, importPath)
+}
+
+// loadJVMRoots walks the tree once for every conventional Maven/Gradle
+// source directory — src/main/java, src/main/kotlin, src/test/java,
+// src/test/kotlin, at any depth, so multi-module repos (one such pair per
+// module) are covered — plus the extraction root itself, for flat/simple
+// layouts with no src/ nesting at all.
+func (c *Connector) loadJVMRoots() {
+	c.jvmSourceRoots = []string{c.dir}
+	suffixes := []string{"/src/main/java", "/src/main/kotlin", "/src/test/java", "/src/test/kotlin"}
+	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if graph.SkipDir(d.Name(), path == c.dir) {
+			return filepath.SkipDir
+		}
+		slash := filepath.ToSlash(path)
+		for _, suf := range suffixes {
+			if strings.HasSuffix(slash, suf) {
+				c.jvmSourceRoots = append(c.jvmSourceRoots, path)
+				return filepath.SkipDir // nothing indexable lives above java/kotlin sources
+			}
+		}
+		return nil
+	})
+}
+
+// resolveJVMImport resolves a Java or Kotlin import spec (a dotted path,
+// e.g. "com.foo.Bar" or "com.foo.wild" from a wildcard import) to a local
+// "pkg:<dir>" node. The last segment of an import is usually a class name,
+// not a directory, so each root is tried twice: once with the full path
+// (covers wildcard imports, where every segment is package) and once with
+// the last segment dropped (covers importing a specific class). Returns ""
+// — the generic external-node fallback — when nothing on disk matches any
+// known source root, e.g. stdlib/third-party imports or an unconventional
+// source layout loadJVMRoots didn't find.
+func (c *Connector) resolveJVMImport(g *graph.Graph, importPath string) string {
+	if !c.jvmRootsLoaded {
+		c.loadJVMRoots()
+		c.jvmRootsLoaded = true
+	}
+	segments := strings.Split(importPath, ".")
+	if len(segments) == 0 {
+		return ""
+	}
+	tries := [][]string{segments}
+	if len(segments) > 1 {
+		tries = append(tries, segments[:len(segments)-1])
+	}
+	for _, root := range c.jvmSourceRoots {
+		for _, segs := range tries {
+			if id := c.resolveDirSegments(g, root, segs, strings.Join(segs, ".")); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+// csharpRootNamespaceRe extracts a .csproj's <RootNamespace> value.
+var csharpRootNamespaceRe = regexp.MustCompile(`<RootNamespace>\s*([^<\s][^<]*?)\s*</RootNamespace>`)
+
+// loadCSharpRoots finds every .csproj in the tree and registers its
+// directory plus root namespace — <RootNamespace> from the project file
+// when present, else the MSBuild default (the .csproj's own filename) —
+// for the namespace-prefix-stripping resolution in resolveCSharpImport.
+// Always includes a namespace-less fallback rooted at the extraction root,
+// for repos with no .csproj or a flat layout where the namespace happens to
+// mirror the folder tree directly.
+func (c *Connector) loadCSharpRoots() {
+	c.csharpRoots = []csharpRoot{{dir: c.dir}}
+	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if graph.SkipDir(d.Name(), path == c.dir) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".csproj") {
+			return nil
+		}
+		ns := strings.TrimSuffix(d.Name(), ".csproj")
+		if data, err := os.ReadFile(path); err == nil {
+			if m := csharpRootNamespaceRe.FindSubmatch(data); m != nil {
+				ns = string(m[1])
+			}
+		}
+		c.csharpRoots = append(c.csharpRoots, csharpRoot{dir: filepath.Dir(path), ns: ns})
+		return nil
+	})
+}
+
+// resolveCSharpImport resolves a `using X.Y.Z;` directive to a local
+// "pkg:<dir>" node. C# namespaces aren't required to mirror the directory
+// tree the way Go/Java/Kotlin package names are, so this is best-effort:
+// for each known project root, strip its root namespace prefix (when the
+// import starts with it) and try the remainder as a subdirectory of that
+// project; the namespace-less fallback root tries the import's full dotted
+// path directly against the extraction root, for repos where the namespace
+// happens to mirror the folder tree from the top regardless. Returns "" —
+// the generic external-node fallback — when nothing on disk matches.
+func (c *Connector) resolveCSharpImport(g *graph.Graph, importPath string) string {
+	if !c.csharpRootsLoaded {
+		c.loadCSharpRoots()
+		c.csharpRootsLoaded = true
+	}
+	for _, root := range c.csharpRoots {
+		var segments []string
+		switch {
+		case root.ns == "":
+			segments = strings.Split(importPath, ".")
+		case importPath == root.ns:
+			segments = nil // the project root itself
+		case strings.HasPrefix(importPath, root.ns+"."):
+			segments = strings.Split(strings.TrimPrefix(importPath, root.ns+"."), ".")
+		default:
+			continue // this project's namespace doesn't cover the import
+		}
+		if id := c.resolveDirSegments(g, root.dir, segments, importPath); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// rustCrate is one crate found in the tree: its root (the directory
+// containing Cargo.toml) and package name, for cross-crate
+// `use other_crate::…` resolution within a workspace. name comes from
+// Cargo.toml's [package] name when present, else the directory name
+// (Cargo's own default) — either way normalized to '_' for '-', matching
+// how Cargo itself maps a crate name to the identifier used in `use` paths.
+type rustCrate struct {
+	dir  string
+	name string
+}
+
+// cargoNameRe extracts a Cargo.toml's [package] name. Matches the first
+// `name = "..."` line in the file, which in a conventional Cargo.toml is
+// the package table's — good enough without a real TOML parser.
+var cargoNameRe = regexp.MustCompile(`(?m)^\s*name\s*=\s*"([^"]+)"`)
+
+// loadRustCrates finds every Cargo.toml in the tree and registers its
+// directory and package name, the registry resolveRustImport resolves
+// `crate::`, `self::`, `super::`, and cross-crate `use` paths against.
+func (c *Connector) loadRustCrates() {
+	c.rustCrates = nil
+	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if graph.SkipDir(d.Name(), path == c.dir) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "Cargo.toml" {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		name := strings.ReplaceAll(filepath.Base(dir), "-", "_")
+		if data, err := os.ReadFile(path); err == nil {
+			if m := cargoNameRe.FindSubmatch(data); m != nil {
+				name = strings.ReplaceAll(string(m[1]), "-", "_")
+			}
+		}
+		c.rustCrates = append(c.rustCrates, rustCrate{dir: dir, name: name})
+		return nil
+	})
+}
+
+// crateForFile returns the registered crate that owns fromPath — the one
+// whose directory is the longest matching ancestor — or nil when none is
+// registered (no Cargo.toml found anywhere in the tree).
+func (c *Connector) crateForFile(fromPath string) *rustCrate {
+	var best *rustCrate
+	for i := range c.rustCrates {
+		cr := &c.rustCrates[i]
+		if cr.dir != fromPath && !strings.HasPrefix(fromPath, cr.dir+string(filepath.Separator)) {
+			continue
+		}
+		if best == nil || len(cr.dir) > len(best.dir) {
+			best = cr
+		}
+	}
+	return best
+}
+
+// resolveRustFile tries the conventional module-file shapes for base+segs:
+// base/a/b/c.rs (single-file module) or base/a/b/c/mod.rs (directory
+// module) — and, since a use path's last segment is often an item rather
+// than a module, the same two shapes with the last segment dropped. Rust
+// has no namespace-package equivalent (every module needs its own file), so
+// unlike Python/Go/Java/Kotlin/C# this only ever resolves to an existing
+// "file:" node, never creates a "pkg:" one.
+func (c *Connector) resolveRustFile(base string, segs []string) string {
+	tries := [][]string{segs}
+	if len(segs) > 1 {
+		tries = append(tries, segs[:len(segs)-1])
+	}
+	for _, s := range tries {
+		target := base
+		if len(s) > 0 {
+			target = filepath.Join(append([]string{base}, s...)...)
+		}
+		for _, cand := range []string{target + ".rs", filepath.Join(target, "mod.rs")} {
+			info, err := os.Stat(cand)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			if rel, err := filepath.Rel(c.dir, cand); err == nil && !strings.HasPrefix(rel, "..") {
+				return "file:" + cand
+			}
+		}
+	}
+	return ""
+}
+
+// resolveRustImport resolves a `use` path's argument (the raw text of a
+// scoped_identifier, e.g. "crate::foo::bar::Baz", "self::sub::Thing",
+// "super::other::Thing2", or "other_crate::thing") to a local file node.
+// "self"/"super" are approximated relative to fromPath's own directory:
+// exactly right for a directory-per-module (mod.rs) layout, approximate for
+// a lone "modname.rs" file whose "module" is really its parent directory —
+// disambiguating that would need parsing the parent's own `mod`
+// declarations, which gatt doesn't do. Returns "" — the external-node
+// fallback — for a crates.io dependency, an unregistered workspace member,
+// or a path this heuristic can't place.
+func (c *Connector) resolveRustImport(fromPath, spec string) string {
+	if !c.rustCratesLoaded {
+		c.loadRustCrates()
+		c.rustCratesLoaded = true
+	}
+	segments := strings.Split(spec, "::")
+	if len(segments) == 0 {
+		return ""
+	}
+	head, rest := segments[0], segments[1:]
+	switch head {
+	case "crate":
+		if cr := c.crateForFile(fromPath); cr != nil {
+			return c.resolveRustFile(filepath.Join(cr.dir, "src"), rest)
+		}
+		return ""
+	case "self":
+		return c.resolveRustFile(filepath.Dir(fromPath), rest)
+	case "super":
+		return c.resolveRustFile(filepath.Dir(filepath.Dir(fromPath)), rest)
+	default:
+		norm := strings.ReplaceAll(head, "-", "_")
+		for _, cr := range c.rustCrates {
+			if cr.name == norm {
+				return c.resolveRustFile(filepath.Join(cr.dir, "src"), rest)
+			}
+		}
+		return "" // crates.io / external dependency
+	}
 }
 
 // loadTSConfigs scans the tree for tsconfig.json files and records their

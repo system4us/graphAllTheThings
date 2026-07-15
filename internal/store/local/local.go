@@ -134,6 +134,48 @@ func (s *Store) StoredModel() string {
 	return s.Model
 }
 
+// PeekModel reads just the "model" field from a vectors.json file without
+// unmarshaling the entries array — full load() CPU-parses every embedded
+// vector (float32 per dimension, thousands of nodes) just to answer "which
+// model made these," which measured 3s+ on an 11k-node index and is paid by
+// every command (openEngine calls this via resolveModel), not just the
+// search/code-query ones that actually need the vectors. "model" is the
+// first field the file struct marshals, so the decoder returns before ever
+// reaching "entries". Returns "" on any error — callers already treat that
+// as "no index yet", same as a failed StoredModel().
+func PeekModel(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return ""
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		key, _ := keyTok.(string)
+		if key == "model" {
+			var v string
+			if dec.Decode(&v) == nil {
+				return v
+			}
+			return ""
+		}
+		// Not the field we want — skip its value (object/array/scalar,
+		// whatever it is) without decoding into typed Go values.
+		var skip json.RawMessage
+		if dec.Decode(&skip) != nil {
+			return ""
+		}
+	}
+	return ""
+}
+
 // Cached is a previously-embedded node: the text hash it was embedded from
 // and its (already normalized) vector, so `index` can reuse it unchanged.
 type Cached struct {

@@ -349,7 +349,11 @@ func resolveModel(flagModel string, vs store.VectorStore) string {
 		return flagModel
 	}
 	if ls, ok := vs.(*local.Store); ok {
-		if m := ls.StoredModel(); m != "" {
+		// PeekModel, not StoredModel: this runs on every command via
+		// openEngine, most of which never touch a vector at all — a full
+		// load() here would CPU-parse the entire embeddings file (measured
+		// 3s+ on an 11k-node index) just to read one string field.
+		if m := local.PeekModel(ls.Path); m != "" {
 			return m
 		}
 	}

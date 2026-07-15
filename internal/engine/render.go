@@ -604,6 +604,19 @@ func (e *Engine) RenderFunction(id string) (string, error) {
 	return b.String(), nil
 }
 
+// modelMatches returns the ids of every NodeModel node with the given name.
+// Shared by Impact (to tell "not a function, it's a model" apart from "not
+// found at all") and Blast (as its model-by-name fallback).
+func (e *Engine) modelMatches(name string) []string {
+	var matches []string
+	for id, nn := range e.G.Nodes {
+		if nn.Type == graph.NodeModel && nn.Name == name {
+			matches = append(matches, id)
+		}
+	}
+	return matches
+}
+
 // Impact walks CALLS edges backwards from a function — every caller,
 // transitively, up to depth levels — answering "what breaks if I change this
 // signature" before a refactor. Accepts a node id or a bare function name
@@ -619,6 +632,9 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 		}
 		switch len(matches) {
 		case 0:
+			if len(e.modelMatches(id)) > 0 {
+				return "", fmt.Errorf("%q is a model, not a function — impact only walks the call graph; use `gatt blast %s` for its associations and route usage", id, id)
+			}
 			return "", fmt.Errorf("function %q not found; use find_entities to locate it", id)
 		case 1:
 			id = matches[0]
@@ -649,7 +665,8 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 		var next []string
 		for _, cur := range level {
 			for _, ed := range e.G.EdgesOf(cur) {
-				if ed.Type == graph.EdgeCalls && ed.To == cur && !visited[ed.From] {
+				isCaller := ed.Type == graph.EdgeCalls || ed.Type == graph.EdgeHandledBy || ed.Type == graph.EdgeUsesMiddleware
+				if isCaller && ed.To == cur && !visited[ed.From] {
 					visited[ed.From] = true
 					next = append(next, ed.From)
 				}
@@ -663,7 +680,11 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 			label = fmt.Sprintf("depth %d", d)
 		}
 		fmt.Fprintf(&b, "\n%s (%d):\n", label, len(next))
-		var lines []string
+		type callerLine struct {
+			label   string
+			snippet string
+		}
+		var items []callerLine
 		for _, cid := range next {
 			cn := e.G.Nodes[cid]
 			if cn == nil {
@@ -673,15 +694,27 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 			if strings.Contains(cn.Attrs["file"], "_test.") || strings.Contains(cn.Attrs["file"], ".test.") {
 				tag = " [test]"
 			}
-			lines = append(lines, fmt.Sprintf("  %s (%s)%s", cn.Name, funcLoc(cn), tag))
+			item := callerLine{label: fmt.Sprintf("  %s (%s)%s", cn.Name, funcLoc(cn), tag)}
+			// Content only for direct callers — these are what the agent
+			// actually edits; deeper levels stay location-only so the pack
+			// doesn't balloon at higher --depth values.
+			if d == 1 {
+				item.snippet = e.snippetFor(cn)
+			}
+			items = append(items, item)
 		}
-		sort.Strings(lines)
-		shown := lines
+		sort.Slice(items, func(i, j int) bool { return items[i].label < items[j].label })
+		shown := items
 		if len(shown) > 25 {
 			shown = shown[:25]
 		}
-		b.WriteString(strings.Join(shown, "\n") + "\n")
-		if extra := len(lines) - len(shown); extra > 0 {
+		for _, it := range shown {
+			b.WriteString(it.label + "\n")
+			if it.snippet != "" {
+				b.WriteString(indentSnippet(it.snippet, "      "))
+			}
+		}
+		if extra := len(items) - len(shown); extra > 0 {
 			fmt.Fprintf(&b, "  … +%d more\n", extra)
 		}
 		total += len(next)
@@ -802,9 +835,12 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 				}
 			}
 		}
+		if len(matches) == 0 {
+			matches = e.modelMatches(target)
+		}
 		switch len(matches) {
 		case 0:
-			return "", fmt.Errorf("%q not found as file or function; use search to locate it", target)
+			return "", fmt.Errorf("%q not found as file, function, or model; use search to locate it", target)
 		case 1:
 			n = e.G.Nodes[matches[0]]
 		default:
@@ -823,6 +859,14 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 	}
 	if depth <= 0 {
 		depth = 3
+	}
+	if n.Type == graph.NodeModel && depth > 1 {
+		// REFERENCES between models isn't transitively "breaks" the way CALLS/
+		// IMPORTS is: Opportunity referencing Lead doesn't mean everything that
+		// references Opportunity breaks when Lead changes. Cap at direct
+		// references/routes only — depth >1 was schema-wide noise (hundreds of
+		// unrelated models pulled in via chained FKs).
+		depth = 1
 	}
 
 	loc := func(nn *graph.Node) string {
@@ -876,7 +920,7 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 			for _, ed := range e.G.EdgesOf(cur) {
 				var nb string
 				switch {
-				case ed.To == cur && (ed.Type == graph.EdgeCalls || ed.Type == graph.EdgeImports || ed.Type == graph.EdgeReferences || ed.Type == graph.EdgeMentions || ed.Type == graph.EdgeCallsEndpoint || ed.Type == graph.EdgeUsesModel || ed.Type == graph.EdgeUsesStyle):
+				case ed.To == cur && (ed.Type == graph.EdgeCalls || ed.Type == graph.EdgeImports || ed.Type == graph.EdgeReferences || ed.Type == graph.EdgeMentions || ed.Type == graph.EdgeCallsEndpoint || ed.Type == graph.EdgeUsesModel || ed.Type == graph.EdgeUsesStyle || ed.Type == graph.EdgeHandledBy || ed.Type == graph.EdgeUsesMiddleware):
 					nb = ed.From
 				case ed.From == cur && ed.Type == graph.EdgeGenerates:
 					nb = ed.To
@@ -906,6 +950,8 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 		{graph.EdgeCallsEndpoint, "frontend call sites hitting this route"},
 		{graph.EdgeUsesStyle, "UI files using this stylesheet's selectors"},
 		{graph.EdgeMentions, "documented in — update these docs too"},
+		{graph.EdgeHandledBy, "routes handled by this function"},
+		{graph.EdgeUsesMiddleware, "routes using this as middleware"},
 	}
 	for _, s := range sections {
 		hits := byEdge[s.edge]
@@ -938,6 +984,14 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 				fmt.Fprintf(&b, "  %s [depth %d]%s\n", h.node.Name, h.depth, tag)
 			} else {
 				fmt.Fprintf(&b, "  %s (%s) [depth %d]%s\n", h.node.Name, where, h.depth, tag)
+			}
+			// Content only for depth-1 function hits — direct callers/
+			// importers are what the agent edits; file-level hits (whole
+			// modules) and deeper levels stay location-only.
+			if h.depth == 1 && h.node.Type == graph.NodeFunction {
+				if snip := e.snippetFor(h.node); snip != "" {
+					b.WriteString(indentSnippet(snip, "      "))
+				}
 			}
 		}
 		if extra := len(hits) - len(shown); extra > 0 {
