@@ -261,7 +261,8 @@ func decoratorTable(dec *sitter.Node, data []byte) string {
 
 // detectPyModel handles Python ORM classes: Django (models.Model), SQLAlchemy
 // (declarative Base / DeclarativeBase, __tablename__, Column(...)), Flask
-// (db.Model), mongoengine. Weak bases need field evidence in the body.
+// (db.Model), mongoengine, SQLModel (table=True). Weak bases need field
+// evidence in the body.
 func (c *Connector) detectPyModel(g *graph.Graph, caps map[string]*sitter.Node, relPath, fileID string, data []byte) {
 	if c.modelBases == nil {
 		c.loadModelBases()
@@ -270,12 +271,32 @@ func (c *Connector) detectPyModel(g *graph.Graph, caps map[string]*sitter.Node, 
 	if name == "" {
 		return
 	}
+	basesNode := caps["pymodel.bases"]
 	strongBase, weakBase := false, false
-	for _, tok := range baseTokens(caps["pymodel.bases"].Content(data)) {
+	for _, tok := range baseTokens(basesNode.Content(data)) {
 		if c.modelBases[tok] {
 			strongBase = true
 		} else if weakModelBases[tok] {
 			weakBase = true
+		}
+	}
+	// SQLModel: `class User(UserBase, table=True):` — table=True is a
+	// self-sufficient signal independent of the other base name(s).
+	// UserBase-style intermediates (shared Pydantic field mixins) are
+	// almost never in modelBases themselves — they're same-file classes
+	// extending bare SQLModel, not a name this connector's base-class list
+	// could enumerate — so relying on base-name matching alone misses
+	// every SQLModel table. baseTokens' identifier-only split already
+	// drops the `=True` half of the keyword argument, so this needs the
+	// actual argument_list node, not the flattened token string.
+	for i := range int(basesNode.NamedChildCount()) {
+		kw := basesNode.NamedChild(i)
+		if kw.Type() != "keyword_argument" {
+			continue
+		}
+		kwName, kwVal := kw.ChildByFieldName("name"), kw.ChildByFieldName("value")
+		if kwName != nil && kwName.Content(data) == "table" && kwVal != nil && kwVal.Content(data) == "True" {
+			strongBase = true
 		}
 	}
 	if !strongBase && !weakBase {
@@ -306,15 +327,28 @@ func (c *Connector) detectPyModel(g *graph.Graph, caps map[string]*sitter.Node, 
 			continue
 		}
 		left, right := assign.ChildByFieldName("left"), assign.ChildByFieldName("right")
-		if left == nil || right == nil || left.Type() != "identifier" {
+		if left == nil || left.Type() != "identifier" {
 			continue
 		}
 		fname := left.Content(data)
 		if fname == "__tablename__" {
-			table = strings.Trim(right.Content(data), "\"'")
+			if right != nil {
+				table = strings.Trim(right.Content(data), "\"'")
+			}
 			continue
 		}
-		if right.Type() != "call" {
+		if right == nil || right.Type() != "call" {
+			// Bare `name: Type` (no value) or `name: Type = <plain
+			// default>` (no Column/Field/Relationship call) — SQLModel/
+			// dataclass-style, every annotated class attribute is a real
+			// column whether or not it carries a call. Only trusted once
+			// the class already has a strong, independent signal it's a
+			// table (table=True, or a known strong base) — for a weak
+			// base this alone would false-positive on plain typed
+			// attributes that were never meant as schema.
+			if strongBase {
+				fields = append(fields, fname)
+			}
 			continue
 		}
 		fn := right.ChildByFieldName("function")
@@ -323,7 +357,10 @@ func (c *Connector) detectPyModel(g *graph.Graph, caps map[string]*sitter.Node, 
 		}
 		fnName := fn.Content(data)
 		short := fnName[strings.LastIndex(fnName, ".")+1:]
-		if short != "Column" && short != "relationship" && !strings.HasSuffix(short, "Field") {
+		// SQLModel spells its own field/relationship helpers capitalized
+		// (Field, Relationship); SQLAlchemy's are lowercase (Column,
+		// relationship). EqualFold covers both without a second literal set.
+		if !strings.EqualFold(short, "Column") && !strings.EqualFold(short, "relationship") && !strings.HasSuffix(short, "Field") {
 			continue
 		}
 		entry := fname
