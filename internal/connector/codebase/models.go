@@ -267,6 +267,138 @@ func javaAnnotationStringArg(argsNode *sitter.Node, data []byte, key string) str
 	return ""
 }
 
+// detectKotlinModel is detectJavaModel's Kotlin counterpart — same JPA
+// annotations (@Entity/@Table/@Column), different grammar shape entirely.
+// Kotlin's tree-sitter grammar exposes no field names on these nodes (the
+// existing kann.* route captures already navigate it positionally, same
+// convention followed here): a no-args annotation like `@Entity` wraps a
+// bare user_type, while an argument-bearing one like `@Table(name = "x")`
+// wraps a constructor_invocation instead — structurally distinct node
+// shapes for the same @Annotation syntax, so both need their own query
+// pattern same as Java's marker_annotation/annotation split.
+func (c *Connector) detectKotlinModel(g *graph.Graph, caps map[string]*sitter.Node, relPath, fileID string, data []byte) {
+	annName := caps["kmodel.ann"]
+	nameNode := caps["kmodel.name"]
+	if annName == nil || nameNode == nil {
+		return
+	}
+	ann := annName.Content(data)
+	if ann != "Entity" && ann != "Table" {
+		return
+	}
+	name := nameNode.Content(data)
+
+	table := ""
+	if ann == "Table" {
+		if argsNode := caps["kmodel.annargs"]; argsNode != nil {
+			table = kotlinAnnotationStringArg(argsNode, data, "name")
+		}
+	}
+
+	var fields []string
+	if body := caps["kmodel.body"]; body != nil {
+		for i := 0; i < int(body.NamedChildCount()); i++ {
+			prop := body.NamedChild(i)
+			if prop.Type() != "property_declaration" {
+				continue
+			}
+			transient, colName := false, ""
+			var varDecl *sitter.Node
+			for j := 0; j < int(prop.NamedChildCount()); j++ {
+				switch ch := prop.NamedChild(j); ch.Type() {
+				case "modifiers":
+					for k := 0; k < int(ch.NamedChildCount()); k++ {
+						a := ch.NamedChild(k)
+						if a.Type() != "annotation" {
+							continue
+						}
+						aname, argsN := kotlinAnnotationNameArgs(a, data)
+						if aname == "Transient" {
+							transient = true
+						}
+						if aname == "Column" && argsN != nil {
+							if n := kotlinAnnotationStringArg(argsN, data, "name"); n != "" {
+								colName = n
+							}
+						}
+					}
+				case "variable_declaration":
+					varDecl = ch
+				}
+			}
+			if transient || varDecl == nil {
+				continue
+			}
+			var fname string
+			for j := 0; j < int(varDecl.NamedChildCount()); j++ {
+				if id := varDecl.NamedChild(j); id.Type() == "simple_identifier" {
+					fname = id.Content(data)
+					break
+				}
+			}
+			if fname == "" {
+				continue
+			}
+			entry := fname
+			if colName != "" && colName != fname {
+				entry += "→" + colName
+			}
+			fields = append(fields, entry)
+		}
+	}
+	c.emitModelFields(g, name, table, fields, relPath, fileID, int(nameNode.StartPoint().Row)+1)
+}
+
+// kotlinAnnotationNameArgs extracts an annotation's bare type name and its
+// value_arguments node (nil for a marker-style annotation with no parens):
+// @Entity -> (annotation (user_type (type_identifier))); @Table(...) ->
+// (annotation (constructor_invocation (user_type (type_identifier))
+// (value_arguments ...))).
+func kotlinAnnotationNameArgs(ann *sitter.Node, data []byte) (string, *sitter.Node) {
+	if ann.NamedChildCount() == 0 {
+		return "", nil
+	}
+	child := ann.NamedChild(0)
+	if child.Type() == "constructor_invocation" {
+		var name string
+		var args *sitter.Node
+		for i := 0; i < int(child.NamedChildCount()); i++ {
+			switch c := child.NamedChild(i); c.Type() {
+			case "user_type":
+				if ti := c.NamedChild(0); ti != nil && ti.Type() == "type_identifier" {
+					name = ti.Content(data)
+				}
+			case "value_arguments":
+				args = c
+			}
+		}
+		return name, args
+	}
+	if child.Type() == "user_type" {
+		if ti := child.NamedChild(0); ti != nil && ti.Type() == "type_identifier" {
+			return ti.Content(data), nil
+		}
+	}
+	return "", nil
+}
+
+// kotlinAnnotationStringArg finds `key = "value"` inside a Kotlin
+// value_arguments list (value_argument nodes: name then value, no field
+// labels in this grammar).
+func kotlinAnnotationStringArg(argsNode *sitter.Node, data []byte, key string) string {
+	for i := 0; i < int(argsNode.NamedChildCount()); i++ {
+		arg := argsNode.NamedChild(i)
+		if arg.Type() != "value_argument" || arg.NamedChildCount() < 2 {
+			continue
+		}
+		k, v := arg.NamedChild(0), arg.NamedChild(1)
+		if k.Type() == "simple_identifier" && k.Content(data) == key && v.Type() == "string_literal" {
+			return strings.Trim(v.Content(data), "\"")
+		}
+	}
+	return ""
+}
+
 // detectClassModel handles TS/JS class declarations: TypeORM-style decorated
 // classes (@Entity/@Table on the class, @Column({name}) on fields) and any
 // class extending a configured base. A weak base (Model, Base) alone is not

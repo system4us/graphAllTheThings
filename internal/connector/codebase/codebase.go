@@ -1000,6 +1000,14 @@ func langFor(ext string) *langConfig {
 			(line_comment) @loose.comment
 			(multiline_comment) @loose.comment
 			(function_declaration (modifiers (annotation (constructor_invocation (user_type (type_identifier) @kann.name) (value_arguments) @kann.args))) (simple_identifier) @kann.method)
+			(class_declaration
+			  (modifiers (annotation (user_type (type_identifier) @kmodel.ann)))
+			  (type_identifier) @kmodel.name
+			  (class_body) @kmodel.body) @kmodel.class
+			(class_declaration
+			  (modifiers (annotation (constructor_invocation (user_type (type_identifier) @kmodel.ann) (value_arguments) @kmodel.annargs)))
+			  (type_identifier) @kmodel.name
+			  (class_body) @kmodel.body) @kmodel.class
 			`,
 		}
 	case ".swift":
@@ -2055,6 +2063,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 			if n := caps["kann.name"]; n != nil {
 				c.handleAnnotation(&anns, n.Content(data), annArgs("kann.args"), caps["kann.method"], nil, relPath, data)
+			}
+			if _, ok := caps["kmodel.class"]; ok {
+				c.detectKotlinModel(g, caps, relPath, fileID, data)
 			}
 
 			// ── Shared-state singleton tracking (JS/TS/JSX) ─────────────────────
