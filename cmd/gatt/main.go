@@ -336,7 +336,7 @@ func indexFlags(fs *flag.FlagSet) (graphPath, qdURL, coll, embURL, embModel *str
 	graphPath = fs.String("graph", defaultGraph, "graph file")
 	qdURL = fs.String("qdrant", "", "qdrant url (opt-in; default is the in-process vector index)")
 	coll = fs.String("collection", "gatt", "qdrant collection")
-	embURL = fs.String("embed-url", embed.DefaultURL, "embedding server url (ollama)")
+	embURL = fs.String("embed-url", embed.DefaultURL, "embedding server url (ollama; a url ending in /v1 selects the OpenAI-compatible API: TEI, llama.cpp, LM Studio; optional token in GATT_EMBED_API_KEY)")
 	embModel = fs.String("embed-model", "", "embedding model (default: model recorded in the index, else "+embed.DefaultModel+")")
 	return
 }
