@@ -24,6 +24,7 @@ import (
 	"graphallthethings/internal/enrich"
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/indexer"
+	"graphallthethings/internal/lock"
 	"graphallthethings/internal/mcpserver"
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
@@ -100,6 +101,10 @@ func main() {
 		err = cmdOverview(ctx, os.Args[2:])
 	case "mcp":
 		err = cmdMCP(ctx, os.Args[2:])
+	case "serve":
+		err = cmdServe(ctx, os.Args[2:])
+	case "notify":
+		err = cmdNotify(ctx, os.Args[2:])
 	case "install":
 		err = cmdInstall(ctx, os.Args[2:])
 	case "init":
@@ -159,6 +164,14 @@ curate it (business knowledge the schema can't express):
 serve it:
   gatt mcp     [--graph PATH] [--no-semantic] [--qdrant URL] [--source-kind KIND --source SRC]
       --source-kind/--source wire the live source into the check_drift + refresh_graph MCP tools
+  gatt serve   [--graph PATH] [--addr 127.0.0.1:7788] [--onnx DIR] [--no-embed] [--embed-url URL] [--qdrant URL]
+      --onnx DIR starts tools/gatt-embed (local ONNX model, downloaded on first use) and embeds with it;
+      then export GATT_EMBED_URL=http://127.0.0.1:7801/v1 so queries embed with the same model
+      keep the graph and vectors fresh in the background (loopback only); POST /refresh, GET /status.
+      Queries never embed on their own; wire your agent's hook to "gatt notify":
+        {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"gatt notify"}]}]}}
+  gatt notify  [--addr 127.0.0.1:7788] [-v]
+      ask a running "gatt serve" to refresh; silent and exit 0 when none is running, so a hook never fails
   gatt install [--graph PATH] [--scope project|user|agy] [--source-kind KIND --source SRC]
       register MCP server in Claude Code or Antigravity (a passed source is stored in the MCP config);
       scope auto-detects between claude/agy when not given, and the gatt binary is added to PATH
@@ -336,7 +349,7 @@ func indexFlags(fs *flag.FlagSet) (graphPath, qdURL, coll, embURL, embModel *str
 	graphPath = fs.String("graph", defaultGraph, "graph file")
 	qdURL = fs.String("qdrant", "", "qdrant url (opt-in; default is the in-process vector index)")
 	coll = fs.String("collection", "gatt", "qdrant collection")
-	embURL = fs.String("embed-url", embed.DefaultURL, "embedding server url (ollama)")
+	embURL = fs.String("embed-url", envOr("GATT_EMBED_URL", embed.DefaultURL), "embedding server url (default $GATT_EMBED_URL, else ollama; a url ending in /v1 selects the OpenAI-compatible API: TEI, llama.cpp, LM Studio, gatt serve --onnx; optional token in GATT_EMBED_API_KEY)")
 	embModel = fs.String("embed-model", "", "embedding model (default: model recorded in the index, else "+embed.DefaultModel+")")
 	return
 }
@@ -388,45 +401,106 @@ func openStore(graphPath, qdURL, coll string) store.VectorStore {
 
 // autoRefreshCodebase incrementally re-parses changed files of a codebase
 // graph before answering, so line numbers and call edges never go stale
-// mid-session, then re-embeds just the changed nodes (best-effort — an
-// unreachable embedder never blocks the refresh; hybrid Find covers the gap).
+// mid-session. Embedding is NOT done here by default: a query command must
+// never wait on an embedding server, and a re-parsed repo can mean thousands of
+// nodes. The vectors catch up via `gatt serve` (driven by the agent's hook) or
+// `gatt index`, both of which are hash-incremental. Set GATT_EMBED_ON_REFRESH=1
+// to restore the old inline behaviour (best-effort — an unreachable embedder
+// never blocks the refresh; hybrid Find covers the gap).
 // No-op for non-codebase graphs or when nothing changed.
 func autoRefreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, embModel string) {
-	// Cheap precheck first (stat walk + light metadata read): the common
-	// no-drift case never materializes the graph.
-	source, mts, err := graph.LoadCodebaseState(graphPath)
-	if err != nil || !strings.HasPrefix(source, "codebase:") {
-		return
-	}
-	conn := codebase.New(strings.TrimPrefix(source, "codebase:"))
-	if !conn.HasDrift(mts) {
-		return
-	}
-	raw, err := graph.LoadRaw(graphPath)
-	if err != nil {
-		return
-	}
-	ng, summary, err := conn.Update(ctx, raw)
+	embedNow := os.Getenv("GATT_EMBED_ON_REFRESH") == "1"
+	res, err := refreshCodebase(ctx, graphPath, qdURL, coll, embURL, embModel, embedNow)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "graph auto-refresh skipped: %v\n", err)
 		return
 	}
-	if summary == "" {
+	if res.Summary == "" {
 		return
 	}
-	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
-	if err := ng.Save(graphPath); err != nil {
-		return
+	fmt.Fprintf(os.Stderr, "graph auto-refreshed: %s\n", res.Summary)
+	if res.Embedded > 0 {
+		fmt.Fprintf(os.Stderr, "re-embedded %d changed node(s)\n", res.Embedded)
 	}
-	fmt.Fprintf(os.Stderr, "graph auto-refreshed: %s\n", summary)
+	if !embedNow && res.Changed > 0 && vectorsExist(graphPath, qdURL) {
+		fmt.Fprintf(os.Stderr, "note: %d node(s) changed since the vectors were built; semantic search may lag (run `gatt index`, or keep `gatt serve` running)\n", res.Changed)
+	}
+}
 
-	if len(added) > 0 {
+// refreshResult describes one refreshCodebase run.
+type refreshResult struct {
+	Summary  string // empty when nothing drifted (or the graph isn't a codebase)
+	Changed  int    // nodes (re-)added by the refresh
+	Embedded int    // nodes sent to the embedder (0 unless embedNow)
+}
+
+// refreshCodebase re-parses drifted files and saves the graph. With embedNow it
+// also re-embeds the added nodes, skipping those whose text is unchanged.
+func refreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, embModel string, embedNow bool) (refreshResult, error) {
+	// Cheap precheck first (stat walk + light metadata read): the common
+	// no-drift case never materializes the graph.
+	source, mts, err := graph.LoadCodebaseState(graphPath)
+	if err != nil || !strings.HasPrefix(source, "codebase:") {
+		return refreshResult{}, nil
+	}
+	conn := codebase.New(strings.TrimPrefix(source, "codebase:"))
+	if !conn.HasDrift(mts) {
+		return refreshResult{}, nil
+	}
+	// Re-parse and save under a cross-process lock: `gatt serve` and a query
+	// command can both notice the same drift at once. Whoever waits re-checks
+	// drift once it holds the lock, so the second one usually finds nothing to do.
+	release, err := lock.Acquire(graphPath+".lock", 2*time.Minute)
+	if err != nil {
+		return refreshResult{}, err
+	}
+	ng, summary, added, err := func() (*graph.Graph, string, []string, error) {
+		defer release()
+		if _, mts, err := graph.LoadCodebaseState(graphPath); err != nil || !conn.HasDrift(mts) {
+			return nil, "", nil, nil
+		}
+		raw, err := graph.LoadRaw(graphPath)
+		if err != nil {
+			return nil, "", nil, nil
+		}
+		ng, summary, err := conn.Update(ctx, raw)
+		if err != nil || summary == "" {
+			return nil, "", nil, err
+		}
+		added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
+		if err := ng.Save(graphPath); err != nil {
+			return nil, "", nil, nil
+		}
+		return ng, summary, added, nil
+	}()
+	if err != nil {
+		return refreshResult{}, err
+	}
+	if summary == "" {
+		return refreshResult{}, nil
+	}
+	res := refreshResult{Summary: summary, Changed: len(added)}
+
+	if embedNow && len(added) > 0 {
 		vs := openStore(graphPath, qdURL, coll)
 		emb := embed.New(embURL, resolveModel(embModel, vs))
-		if n, err := indexer.ReindexNodes(ctx, ng, vs, emb, resolveModel(embModel, vs), added); err == nil && n > 0 {
-			fmt.Fprintf(os.Stderr, "re-embedded %d changed node(s)\n", n)
+		if n, err := indexer.ReindexNodes(ctx, ng, vs, emb, resolveModel(embModel, vs), added); err == nil {
+			res.Embedded = n
+		} else {
+			fmt.Fprintf(os.Stderr, "re-embed skipped: %v\n", err)
 		}
 	}
+	return res, nil
+}
+
+// vectorsExist reports whether a vector index is present, so the "vectors lag"
+// note is only shown to people who actually use semantic search.
+func vectorsExist(graphPath, qdURL string) bool {
+	if qdURL != "" {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(filepath.Dir(graphPath), "vectors.json"))
+	return err == nil
 }
 
 func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine, error) {

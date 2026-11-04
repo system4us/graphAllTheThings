@@ -7,6 +7,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"graphallthethings/internal/embed"
@@ -14,6 +15,10 @@ import (
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
 )
+
+// ErrModelMismatch is returned by ReindexNodes when the store was built with a
+// different embedding model than the one requested.
+var ErrModelMismatch = errors.New("embedding model mismatch")
 
 // Result reports what an index run did.
 type Result struct {
@@ -25,9 +30,31 @@ type Result struct {
 // ReindexNodes embeds only the given node ids and merges them into the store.
 // This is the post-refresh path: a handful of changed nodes in milliseconds,
 // instead of walking the whole graph. Ids no longer in the graph are skipped.
+//
+// Re-parsing a file removes and re-adds all of its nodes, so ids arrive here
+// even when their text did not change; those are skipped by comparing the text
+// hash with the stored one. The returned count is the number of nodes actually
+// sent to the embedder.
+//
+// If the store holds vectors from a different model the call fails with
+// ErrModelMismatch instead of upserting: a partial upsert under a new model
+// would discard every other vector (see local.Store.Upsert).
 func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, ids []string) (int, error) {
+	known := map[string]string{} // node id -> hash of the text its stored vector came from
 	if ls, ok := vs.(*local.Store); ok {
+		if stored := ls.StoredModel(); stored != "" && stored != model {
+			return 0, fmt.Errorf("%w: index has %q, asked for %q (run `gatt index --full` to switch)", ErrModelMismatch, stored, model)
+		}
+		for id, c := range ls.Indexed() { // loads the file once; Upsert reuses it
+			known[id] = c.Hash
+		}
 		ls.Model = model
+	} else if inc, ok := vs.(store.Incremental); ok {
+		h, err := inc.Hashes(ctx)
+		if err != nil {
+			return 0, err
+		}
+		known = h
 	}
 	var liveIDs, texts []string
 	for _, id := range ids {
@@ -35,8 +62,12 @@ func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb
 		if n == nil || n.Type == graph.NodeDatabase || n.Type == graph.NodeAPI {
 			continue
 		}
+		text := g.NodeText(id)
+		if h, ok := known[id]; ok && h == local.TextHash(text) {
+			continue // same text as the stored vector
+		}
 		liveIDs = append(liveIDs, id)
-		texts = append(texts, g.NodeText(id))
+		texts = append(texts, text)
 	}
 	if len(liveIDs) == 0 {
 		return 0, nil
@@ -52,7 +83,7 @@ func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb
 		for j, v := range vecs {
 			n := g.Nodes[liveIDs[i+j]]
 			points = append(points, store.Point{
-				NodeID: liveIDs[i+j], Type: n.Type, Name: n.Name, Text: texts[i+j], Vector: v,
+				NodeID: liveIDs[i+j], Type: n.Type, Name: n.Name, Text: texts[i+j], Hash: local.TextHash(texts[i+j]), Vector: v,
 			})
 		}
 	}
@@ -70,6 +101,9 @@ func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb
 // large graph can take many sequential HTTP round-trips to the embedder, so
 // the CLI uses this to print a progress indicator.
 func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, full bool, progress func(done, total int)) (Result, error) {
+	if inc, ok := vs.(store.Incremental); ok {
+		return reindexIncremental(ctx, g, vs, inc, emb, full, progress)
+	}
 	// Reuse vectors for nodes whose embedding text is unchanged. Only the local
 	// store exposes a cache, and only vectors from the same model are
 	// comparable. Set the store's model last: reading the cache loads the file
@@ -120,8 +154,106 @@ func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *emb
 	if len(points) == 0 {
 		return Result{}, fmt.Errorf("nothing to index")
 	}
-	if err := vs.Upsert(ctx, points); err != nil {
+	// Nothing to embed and every stored vector is still live: the index is
+	// already exact, so don't rewrite (and re-parse) a file of many MB for nothing.
+	// points all came from the cache, so equal counts mean identical id sets.
+	if _, ok := vs.(*local.Store); ok && len(todoIDs) == 0 && len(cache) == len(points) {
+		return Result{Total: len(points), Reused: reused}, nil
+	}
+	// points is the complete live set, so for the local store Replace also drops
+	// vectors of nodes deleted from the graph (Upsert alone only ever adds).
+	if err := replaceAll(ctx, vs, points); err != nil {
 		return Result{}, err
 	}
 	return Result{Total: len(points), Embedded: len(todoIDs), Reused: reused}, nil
+}
+
+// replacer is implemented by stores that can be rewritten to exactly a point set.
+type replacer interface {
+	Replace(ctx context.Context, points []store.Point) error
+}
+
+// replaceAll writes points as the complete index when the store supports it
+// (dropping vectors of deleted nodes), else falls back to Upsert.
+func replaceAll(ctx context.Context, vs store.VectorStore, points []store.Point) error {
+	if r, ok := vs.(replacer); ok {
+		return r.Replace(ctx, points)
+	}
+	return vs.Upsert(ctx, points)
+}
+
+// reindexIncremental is Reindex for stores that report their stored hashes
+// (Qdrant): only changed or new nodes are embedded and uploaded, and nodes that
+// left the graph are deleted. Nothing is held in memory but the changes.
+func reindexIncremental(ctx context.Context, g *graph.Graph, vs store.VectorStore, inc store.Incremental, emb *embed.Client, full bool, progress func(done, total int)) (Result, error) {
+	known := map[string]string{}
+	if !full {
+		h, err := inc.Hashes(ctx)
+		if err != nil {
+			return Result{}, err
+		}
+		known = h
+	}
+	var todoIDs, todoTexts []string
+	live := map[string]bool{}
+	for id, n := range g.Nodes {
+		if n.Type == graph.NodeDatabase || n.Type == graph.NodeAPI {
+			continue
+		}
+		live[id] = true
+		text := g.NodeText(id)
+		if h, ok := known[id]; ok && h == local.TextHash(text) {
+			continue
+		}
+		todoIDs = append(todoIDs, id)
+		todoTexts = append(todoTexts, text)
+	}
+	if len(live) == 0 {
+		return Result{}, fmt.Errorf("nothing to index")
+	}
+
+	const batch = 64
+	var points []store.Point
+	for i := 0; i < len(todoIDs); i += batch {
+		end := min(i+batch, len(todoIDs))
+		vecs, err := emb.Embed(ctx, todoTexts[i:end])
+		if err != nil {
+			return Result{}, err
+		}
+		for j, v := range vecs {
+			n := g.Nodes[todoIDs[i+j]]
+			points = append(points, store.Point{
+				NodeID: todoIDs[i+j], Type: n.Type, Name: n.Name, Text: todoTexts[i+j],
+				Hash: local.TextHash(todoTexts[i+j]), Vector: v,
+			})
+		}
+		if progress != nil {
+			progress(end, len(todoIDs))
+		}
+	}
+
+	switch {
+	case full:
+		if err := replaceAll(ctx, vs, points); err != nil {
+			return Result{}, err
+		}
+	case len(points) > 0:
+		if err := vs.Upsert(ctx, points); err != nil {
+			return Result{}, err
+		}
+	}
+	if !full {
+		var stale []string
+		for id := range known {
+			if !live[id] {
+				stale = append(stale, id)
+			}
+		}
+		if len(stale) > 0 {
+			if err := inc.Delete(ctx, stale); err != nil {
+				return Result{}, err
+			}
+		}
+	}
+	return Result{Total: len(live), Embedded: len(todoIDs), Reused: len(live) - len(todoIDs)}, nil
 }

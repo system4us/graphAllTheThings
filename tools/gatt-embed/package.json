@@ -1,0 +1,17 @@
+{
+  "name": "gatt-embed",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local ONNX embedding worker for gatt: an OpenAI-compatible /v1/embeddings endpoint. The model is downloaded on first use.",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.2"
+  },
+  "scripts": {
+    "postinstall": "node prune.mjs"
+  },
+  "license": "AGPL-3.0-or-later"
+}
