@@ -6,7 +6,7 @@
   "author": "Leandro Fusco",
   "repository": { "type": "git", "url": "git+https://github.com/system4us/graphAllTheThings.git" },
   "bin": { "gatt": "bin/gatt.js" },
-  "files": ["bin", "README.md", "LICENSE"],
-  "engines": { "node": ">=16" },
-  "optionalDependencies": {}
+  "scripts": { "postinstall": "node install.js" },
+  "files": ["bin", "install.js", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" }
 }
