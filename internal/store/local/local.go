@@ -101,7 +101,28 @@ func (s *Store) Upsert(_ context.Context, points []store.Point) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.Path, data, 0o644); err != nil {
+	// Write to a temp file and rename: a crash mid-write, or a concurrent
+	// reader (a query running while `gatt serve` re-embeds), must never see a
+	// truncated vectors.json.
+	tmp, err := os.CreateTemp(filepath.Dir(s.Path), ".vectors-*.tmp")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), s.Path); err != nil {
+		os.Remove(tmp.Name())
 		return err
 	}
 	s.entries = f.Entries

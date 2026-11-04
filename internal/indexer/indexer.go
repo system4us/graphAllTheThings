@@ -7,6 +7,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"graphallthethings/internal/embed"
@@ -14,6 +15,10 @@ import (
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
 )
+
+// ErrModelMismatch is returned by ReindexNodes when the store was built with a
+// different embedding model than the one requested.
+var ErrModelMismatch = errors.New("embedding model mismatch")
 
 // Result reports what an index run did.
 type Result struct {
@@ -25,8 +30,22 @@ type Result struct {
 // ReindexNodes embeds only the given node ids and merges them into the store.
 // This is the post-refresh path: a handful of changed nodes in milliseconds,
 // instead of walking the whole graph. Ids no longer in the graph are skipped.
+//
+// Re-parsing a file removes and re-adds all of its nodes, so ids arrive here
+// even when their text did not change; those are skipped by comparing the text
+// hash with the stored one. The returned count is the number of nodes actually
+// sent to the embedder.
+//
+// If the store holds vectors from a different model the call fails with
+// ErrModelMismatch instead of upserting: a partial upsert under a new model
+// would discard every other vector (see local.Store.Upsert).
 func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, ids []string) (int, error) {
+	var cache map[string]local.Cached
 	if ls, ok := vs.(*local.Store); ok {
+		if stored := ls.StoredModel(); stored != "" && stored != model {
+			return 0, fmt.Errorf("%w: index has %q, asked for %q (run `gatt index --full` to switch)", ErrModelMismatch, stored, model)
+		}
+		cache = ls.Indexed() // loads the file once; Upsert reuses it
 		ls.Model = model
 	}
 	var liveIDs, texts []string
@@ -35,8 +54,12 @@ func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb
 		if n == nil || n.Type == graph.NodeDatabase || n.Type == graph.NodeAPI {
 			continue
 		}
+		text := g.NodeText(id)
+		if c, ok := cache[id]; ok && c.Hash == local.TextHash(text) {
+			continue // same text as the stored vector
+		}
 		liveIDs = append(liveIDs, id)
-		texts = append(texts, g.NodeText(id))
+		texts = append(texts, text)
 	}
 	if len(liveIDs) == 0 {
 		return 0, nil
