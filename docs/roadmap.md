@@ -1,0 +1,31 @@
+# Roadmap
+
+- [x] PostgreSQL connector (`pg_catalog`: native enums, column comments, multi-column FKs, view dependencies, multi-schema)
+- [x] OpenAPI connector (endpoints, schemas, `$ref` relationships) — OpenAPI 3.x + Swagger 2.0, from a `.json`/`.yaml` file or a live `http(s)://.../openapi.json` (FastAPI, swaggo)
+- [x] Codebase connector (tree-sitter: Go, TS/TSX, JS/JSX, Python, Rust, Java, C#) with call graph, `.gatt/` semantic overlay, and mtime-based incremental refresh
+- [x] SQLite graph storage (`graph.db`): FTS5 full-text index, delta writes
+- [x] Incremental re-extraction with change detection (`extract --check` reports drift; `index` re-embeds only changed nodes)
+- [x] Spec↔code linking (`extract openapi --code`, `gatt enrich`): endpoints/schemas point at their Go source
+- [x] HTTP route entities in code (Express-style JS/TS/JSX): `gatt routes`
+- [x] Shared mutable-state data flow (JS/TS/JSX named-import singletons): `impact`/`blast` shared-state section
+- [x] Exhaustive literal/regex search (`gatt grep`) as a proof-of-absence complement to semantic `search`
+- [x] Annotated directory tree (`gatt tree`) and floating "why" comments as queryable `comment` nodes
+- [x] Structural diff against a git ref (`gatt diff`): rename/move-aware function/type changes + current callers
+- [x] Blast radius for any node (`gatt blast`): callers + importers (tsconfig aliases resolved) + generated copies + same-basename duplicates by content hash
+- [x] Git co-change mining (`CO_CHANGED`): stylesheets/docs/e2e-tests/i18n that ship together with no static edge
+- [x] Doc drift (`gatt doc-drift`): MENTIONS edges doc→code, broken/stale reference report
+- [x] Language-agnostic ORM models (`gatt models`): Sequelize/TypeORM/gorm/Django/SQLAlchemy + FK-name inference + `.gatt/models.json` overlay
+- [x] Full-stack intersection: `USES_MODEL` (route → models its handler touches) + `CALLS_ENDPOINT` (frontend call site → route)
+- [x] Absolute graph roots + wrong-cwd refresh guard (legacy relative-source graphs refuse instead of corrupting)
+- [x] Language-agnostic client-call detection: verb-evidence heuristic over every parsed language (incl. Java/C#), method-as-string wrappers, options objects, format-string paths, `.gatt/clients.json` overlay
+- [x] Template files by content sniff (no extension list): `.vue`/`.html`/`.cshtml`/`.svelte`/... — inline `<script>` masked & parsed as JS/TS, htmx + `<form>` attributes scanned
+- [x] Kotlin + Swift parsing; absolute-URL/base-var/relative-path client calls (desktop & mobile apps); Retrofit `@GET` client annotations
+- [x] Annotation-declared routes: Spring `@GetMapping`/`@RequestMapping` (Java), ASP.NET `[HttpGet]`/`[Route("api/[controller]")]` (C#) — full-stack chain included
+- [x] Java + C# parsing (functions, types, call graph, imports, docs)
+- [x] Language-scoped local import/package resolution beyond Go: Python (absolute + relative, PEP 420), Java/Kotlin (`src/main/{java,kotlin}` source roots), C# (`.csproj` `<RootNamespace>` stripping), Rust (`Cargo.toml` crate roots, `crate`/`self`/`super`) — plus `exported` tagging per language's own visibility rule
+- [x] String-keyed dispatch (`CALLS`, `inferred=true`): `queueJob("createPdf")` against a lookup table, `io.emit("connected")`/custom verbs (`.gatt/dispatch.json`) against an `io.on("connected", handler)` registration — JS/TS/JSX
+- [ ] Sample values for low-cardinality string columns (`status`, `type`, ...) that carry no declared enum — see `TODO(#2)` in `internal/connector/postgres/postgres.go`
+- [ ] Query-log mining: add edges from JOINs observed in real queries (relationships not declared as FKs)
+- [x] Route detection for Go (gin/chi/echo/gorilla/net-http incl. 1.22 `"GET /x"` patterns and `.Methods()` chains) and Python (Flask/FastAPI decorators, `methods=[...]`, `<int:id>` params)
+- [x] Builder-chain & enum clients: OkHttp `.url().post()` (verb text-scanned in the chain; no verb = any-method wildcard), Alamofire `method: .post`, `HttpMethod.POST`-style enum args
+- [x] Selector-level CSS linkage (`USES_STYLE`): `.class`/`#id`/`[data-*]`/`--var` → the templates/JSX/stylesheets using them; repo-defined tokens only (utility frameworks excluded by construction)

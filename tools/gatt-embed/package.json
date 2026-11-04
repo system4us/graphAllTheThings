@@ -12,5 +12,6 @@
   },
   "scripts": {
     "postinstall": "node prune.mjs"
-  }
+  },
+  "license": "AGPL-3.0-or-later"
 }

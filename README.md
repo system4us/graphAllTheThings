@@ -6,52 +6,28 @@ Turn any source's metadata into a semantic knowledge graph that AI agents query 
 
 **Solution:** extract metadata **once** (schema, enums, foreign keys — or functions, call edges, doc comments) into a graph, index it semantically, and give the agent MCP tools that answer "which tables?", "which columns?", "how do I join them?", "who calls this function?" instantly.
 
-Three source shapes, one graph engine:
-
 | Source | Extracted | Ask it |
 |--------|-----------|--------|
 | **Database** (SQLite, PostgreSQL) | tables, columns, enums, FKs, indexes, comments | "which tables hold login events, and how do I join them?" |
 | **API spec** (OpenAPI 3.x, Swagger 2.0) | endpoints, schemas, `$ref` relationships, auth | "what's the full request to create an order?" |
 | **Codebase** (Go, TS/TSX, JS/JSX, Python, Rust, Java, C#, Kotlin, Swift) | functions, types, call graph, HTTP routes, ORM models, docs, git co-change | "what breaks if I change this signature?" / "which routes touch this model?" / "which docs went stale?" |
 
-## Architecture
+## Highlights
 
-```
-source (sqlite | postgres | openapi | codebase)
-        │  extract (once; incremental after that)
-        ▼
-  gatt-out/graph.db        ← source of truth: typed nodes + edges (SQLite + FTS5,
-        │                    default) — or graph.json (portable, versionable, via --out)
-        │  index
-        ▼
-  gatt-out/vectors.json    ← semantic layer: node embeddings (Ollama bge-m3, multilingual),
-        │                    cosine search in-process; --qdrant swaps in a Qdrant server
-        ▼
-  MCP stdio server         ← agents call tools; zero live introspection
-```
+- **One graph engine, three source shapes** — traversal, search, join paths and MCP tools are shared.
+- **Never stale (codebases)** — every query checks file mtimes and re-parses only what changed (~60 ms when nothing did).
+- **Hybrid search** — FTS5 bm25 plus semantic embeddings; keyword search still works with no embedding backend at all.
+- **Local, incremental embeddings** — `gatt serve --onnx` embeds on your CPU with no external service and re-embeds only nodes whose text changed. A 21,830-node graph indexes in ~5 minutes once; an edit then costs ~1.6 s.
+- **Exhaustive when it matters** — `gatt grep` is a proof of absence; `search` is top-N.
+- **Everything in one binary + one directory** (`gatt-out/`), versionable and portable.
 
-- **Graph structure** (nodes, edges, join paths) lives in `graph.db` by default (SQLite with an FTS5 full-text index, incremental delta writes) or `graph.json` (portable, diff-able) if you pass `--out gatt-out/graph.json` on the first extract. All commands auto-detect whichever exists; `--graph PATH` overrides.
-- **Search is hybrid**: FTS5 bm25 (when the graph is SQLite) + semantic embeddings, so results are good even before indexing. If the vector index or Ollama is unavailable, `find_entities` falls back to keyword matching.
-- **Vector index is in-process by default.** Metadata graphs are small (hundreds to a few thousand nodes), so brute-force cosine takes microseconds — no vector database required. Pass `--qdrant URL` to `index`/`search`/`mcp` to opt into a Qdrant server (useful for very large or shared indexes).
+## Contents
 
-### Graph model
-
-Three source shapes share one graph so the traversal, search, and join machinery is reused across all of them.
-
-**Database** — Nodes: `database`, `table`, `column`, `view`, `index` — attrs carry data types, enum values, defaults, row counts, DDL.
-Edges: `HAS_TABLE`, `HAS_COLUMN`, `HAS_INDEX`, `INDEXES`, `FOREIGN_KEY` (column→column), `REFERENCES` (table→table, with `from_column`/`to_column` for join building).
-
-**API spec (OpenAPI 3.x / Swagger 2.0)** — from FastAPI's `/openapi.json`, a swaggo-generated `swagger.json`, or any spec file. Nodes: `api`, `schema` (a component model, like a table), `property` (like a column), `endpoint` (an HTTP operation).
-Edges: `HAS_SCHEMA`, `HAS_PROPERTY`, `HAS_ENDPOINT`, `REFERS_TO` (property→schema, a `$ref` — the FK analogue), `REFERENCES` (schema→schema, derived from `$ref`s, with `from_property`/`cardinality`), `ACCEPTS`/`RESPONDS_WITH` (endpoint→schema request/response bodies). Named enum components are inlined as a property's allowed values rather than modeled as a relationship, and `join_path` returns the `$ref` chain (`User → Order (buyer)`) instead of a SQL `JOIN`.
-
-Each endpoint carries what a request actually needs: the **full URL** (server base — 3.x `servers` with variables substituted, or 2.0 `host`+`basePath` — joined to the path) and the **auth scheme** (`Bearer`, `Basic`, `apiKey header X-API-Key`, resolved from the operation's `security` or the global default, `OAuth2`/public overrides included). So an agent gets a copy-pasteable curl skeleton — method, URL, auth header, and the typed request body with its enums — from one `sql_context` call instead of loading a multi-megabyte spec.
-
-**Codebase** — tree-sitter parses Go, TypeScript/TSX, JavaScript/JSX, Python, Rust, Java, C#, Kotlin, and Swift (plus Markdown docs). Nodes: `project`, `file`, `function` (with signature, `file:line` range, doc comment, body for short functions), `definition` (types and their methods — plus, for JS/TS/JSX, module-scope `const`/exported bindings like config objects and lookup tables, so `queueDefinitions`-style entities are queryable and doc-drift-checkable too), `component`, `feature`, `doc`, `comment` (a substantive floating comment not attached to any declaration), and `route` (an Express-style registration in JS/TS/JSX, or an annotation-declared Spring `@GetMapping`/ASP.NET `[HttpGet]` handler in Java/C# — class-level `@RequestMapping`/`[Route("api/[controller]")]` prefixes joined in) plus — JS/TS/JSX only — `state` (a tracked property on a cross-file singleton, e.g. `config.session`), and `package` — one per resolved local directory, shared by every language whose imports are directory-scoped (Go: keyed by its `package X` clause; Python: a directory with (or without, PEP 420) `__init__.py`; Java/Kotlin: resolved against every `src/main/java`, `src/main/kotlin`, `src/test/java`, `src/test/kotlin` found in the tree; C#: `using` directives resolved best-effort by stripping each `.csproj`'s `<RootNamespace>` prefix, since C# namespaces aren't required to mirror folders the way the others are). Functions/definitions in Go/Python/Java/Kotlin/C# carry an `exported` attr (capitalized name for Go; no leading `_` for Python; `public` modifier for Java/C#; not `private`/`internal` for Kotlin) so "what's this package's public API" doesn't need a source read — Rust gets the same `exported` attr (bare `pub`, not `pub(crate)`/`pub(super)`) but resolves `use` paths straight to the owning `.rs` file instead of a `package` node, since Rust modules are 1:1 with files/`mod.rs`, never a bare directory. Swift is parsed (functions/types/calls) but its `import` resolves external modules only — same-module Swift files need no import statement to reference each other, so there's nothing local to resolve. `model` nodes capture ORM models across languages — Sequelize `Model.init`/`sequelize.define` (JS/TS), TypeORM `@Entity`/`@Column` decorators, Go structs with `gorm:`/`db:`/`bun:`/`xorm:` tags, Django/SQLAlchemy classes — with the DB table, the field→column renames a SQL grep can't see, and associations: explicit (`A.hasMany(B)`, resolved even when declared in a central `setupAssociations` file) plus `*_id`/`…Id`/`…ID` foreign-key-name inference in any language (`inferred=true` on the edge). Unknown ORMs: declare base classes in `.gatt/models.json` (`{"base_classes": [...]}`) or tag a type via `annotate model_table=<table>`; `gatt models` lists them all. Two cross-layer edges close the full-stack chain: `USES_MODEL` (route → every model its handler chain touches, via resolved CALLS + file imports — graph-level, so language-agnostic) and `CALLS_ENDPOINT` (client call site → route, **in any parsed language**: axios-style `x.get('/path')`, `fetch(...)`, method-as-string wrappers (`apiRequest("post", "/x")`, Go `http.NewRequest("POST", ...)`, Python `requests.request("GET", ...)`), verb-prefixed members (`getForObject`, `GetAsync`), options objects (`axios({method, url})`), format-string paths (`fmt.Sprintf("/x/%d", id)`, f-strings, `$"..."`/`$var`/`\(x)` interpolation), Retrofit verb annotations (`@GET("users/{id}")` on Java/Kotlin interface methods), absolute URLs (`https://api.x.com/users/1` loses scheme+host — desktop/mobile apps have no relative origin) and base-var templates (`` `${API_BASE}/users` ``) — all normalized to `:param` and matched by method + path tail with ambiguous matches skipped (relative `BaseAddress`-style paths need a ≥2-segment match); a candidate needs explicit HTTP-verb evidence, so `strings.HasPrefix(s, "/x")` never wires. In-house wrappers the heuristics can't see: declare them in `.gatt/clients.json` — `{"wrappers": [{"name": "apiRequest", "method_arg": 0, "path_arg": 1}, {"name": "getJSON", "method": "GET", "path_arg": 0}]}`). Template files (`.vue`, `.html`, `.cshtml`, `.svelte`, ... — detected by content, not by an extension list) join the same chain: inline `<script>` blocks are masked in place and parsed with the JS/TS grammar (line numbers survive; `lang="ts"` respected; `src=`/non-JS blocks skipped), so functions inside a Vue SFC or a Razor page become regular graph nodes whose fetch/axios calls wire to routes, and markup-level surface — htmx `hx-get/post/put/patch/delete` attributes and `<form action method>` — is scanned textually with the file node as the edge source. `gatt routes` shows both per route (`models:` / `called from:`); `blast` on a model lists the API surface it backs; `search`/`describe` on a frontend function shows `Calls backend routes: …`.
-Edges: `CALLS` (resolved local calls — the call graph — plus, JS/TS/JSX only, string-keyed dispatch: `queueJob("createPdf")` against a `{createPdf: createPdfHandler}` lookup table, or `io.emit("connected")`/a custom `io.receivedMsj("connected")` against a `io.on("connected", onConnected)` registration elsewhere — CALLS can't see either normally, since the call site never names the handler. Both shapes require a function *identifier* as evidence, not just a matching string, to keep it from over-firing; registration verbs beyond the built-in `on`/`addEventListener`/`addListener`/`once`/`subscribe` set — e.g. an in-house `receivedMsj`-style wrapper's *registration* side — go in `.gatt/dispatch.json` (`{"registration_verbs": ["receivedMsj"]}`); the *trigger* side needs no configuration, any call whose first argument matches an established registry key wires, regardless of the callee's own name. These edges carry `inferred=true` + `via=dispatch`, same convention as the FK-name-inference edges below), `HAS_METHOD`, `BELONGS_TO` (also file → `package`, Go only — Python/Java/Kotlin/C#/Rust packages are inferred from the import graph, not declared per file, so there's no authoritative per-file name to wire), `IMPORTS` (relative specifiers **and** tsconfig path aliases resolve to local file nodes for JS/TS/JSX; every other supported language resolves its own import syntax — Go `go.mod` paths, Python absolute/relative dotted imports, Java/Kotlin dotted imports against detected source roots, C# `using` namespaces against `.csproj` root namespaces, Rust `crate`/`self`/`super`/cross-crate `use` paths against `Cargo.toml` crate roots — to the target's local `package` node (or, JS/TS/Python/Rust, directly to a `file` node when the import names a single module) instead of an opaque external one — `blast pkg:<dir>` (or `blast <file>` for Rust) shows every internal importer, the package-level import graph. Unresolvable specifiers (stdlib, third-party, an unconventional layout the heuristic can't find) still fall back to the external node as before), `GENERATES` (declared generation pipelines), `CO_CHANGED` (git history), `MENTIONS` (doc → code it references), `REFERENCES` (model → model associations), `USES_MODEL` (route → model), `CALLS_ENDPOINT` (frontend call site → route), `USES_STYLE` (template/JSX/stylesheet file → repo stylesheet whose selectors it uses: `.class`, `#id` and `[data-*]` mined from selector position in css/scss/less plus `--var` custom-property definitions; usage side scans `class=`/`className=`/`classList`, `id=`/`getElementById`/`'#x'` query strings, `data-*=`/`dataset.camelCase`/`setAttribute('data-*')`, and `var(--x)` — design tokens make stylesheet→stylesheet edges; matched tokens on the edge's `selectors` attr. Only tokens defined in the repo's own stylesheets link, so Tailwind/Bootstrap utility soup produces zero edges; tag/global/pseudo selectors are excluded by design — every file uses `div`, and `.btn:hover` already links through `.btn`. `blast` on a stylesheet lists the UI files its selectors reach), `HANDLED_BY`/`USES_MIDDLEWARE` (route → function), and — JS/TS/JSX only — `READS`/`WRITES` (function → state). Generated code (`.pb.go`, `_gen.go`, `.min.js`, …) is excluded from context packs but still findable via search. Graphs record an absolute repo root, so every command works from any cwd via `--graph`; a legacy relative-root graph refuses to refresh from the wrong cwd instead of silently re-pointing at the wrong tree.
+[Quickstart](#quickstart) · [Semantic search and background refresh](#semantic-search-and-background-refresh) · [Codebase graphs](#codebase-graphs) · [Curated annotations](#curated-annotations) · [Keeping it fresh](#keeping-it-fresh) · [MCP tools](#mcp-tools) · [Architecture](#architecture) · [Adding a connector](#adding-a-connector) · [Layout](#layout) · [Roadmap](docs/roadmap.md) · [License](#license)
 
 ## Quickstart
 
-Requires: Go 1.24+ and Ollama on `:11434` with `bge-m3` pulled (optional — keyword/FTS fallback works without it).
+**Requires:** Go 1.25+. Semantic search is optional — without an embedding backend, search falls back to keyword/FTS5. For embeddings use Ollama with `bge-m3` pulled (default, `:11434`) or the bundled local ONNX worker (see [Semantic search and background refresh](#semantic-search-and-background-refresh)).
 
 Measured on a real 113-table CRM: answering one data question costs **~2.3k tokens in 1 tool call** with gatt vs ~7.8k tokens across 6 introspection queries (list tables + describe candidates) — and the join chain comes out correct on the first try. On a codebase, one `code-query` (~3 KB) replaces a 20–50k-token Grep/Read exploration.
 
@@ -62,7 +38,7 @@ gatt extract sqlite path/to/db.sqlite     # → gatt-out/graph.db
 gatt extract postgres "postgres://user:pass@host:5432/db?sslmode=disable"
 gatt extract openapi http://localhost:8000/openapi.json   # live FastAPI spec (or a .json/.yaml file; OpenAPI 3.x or Swagger 2.0)
 gatt extract codebase .                                   # parse a repo → gatt-out/graph.db (pass --out ...json for a portable/diffable graph)
-gatt index                                # embed nodes → gatt-out/vectors.json
+gatt index                                # embed nodes → gatt-out/vectors.json + vectors.bin
 gatt install                              # register MCP server in Claude Code
 gatt install --scope agy                  # register MCP server in Antigravity CLI
 ```
@@ -100,6 +76,69 @@ gatt explain messages                     # one node: attrs + relationships
 gatt overview                             # all tables (or files/components), counts, references
 ```
 
+
+## Semantic search and background refresh
+
+Queries refresh the *graph* (cheap) but never wait on an embedding server. Vectors are built by `gatt index`, or kept up to date in the background by `gatt serve`.
+
+### Choose an embedding backend
+
+| Backend | How | Notes |
+|---|---|---|
+| **Ollama** (default) | `ollama pull bge-m3`; nothing else to configure | multilingual `bge-m3`, `http://localhost:11434` |
+| **Local ONNX worker** | `gatt serve --onnx tools/gatt-embed` | runs on CPU, no external service; model downloaded on first use (~130 MB) |
+| **Any OpenAI-compatible server** | `--embed-url http://host:port/v1` | Text Embeddings Inference, llama.cpp, LM Studio, …; optional token in `GATT_EMBED_API_KEY` |
+
+The vectors themselves are stored locally (default) or in Qdrant (`--qdrant URL`). The model name is stored with them; a different model is refused rather than silently replacing the index (`gatt index --full` to switch).
+
+### Set it up (local ONNX)
+
+```sh
+(cd tools/gatt-embed && npm install)      # once; Node >= 18; a postinstall prune leaves ~120 MB
+gatt serve --onnx tools/gatt-embed        # keeps graph + vectors fresh, starts and stops the worker
+export GATT_EMBED_URL=http://127.0.0.1:7801/v1   # so queries embed with the same model
+```
+
+Then let your agent tell `serve` when something may have changed. `gatt notify` is silent and always exits 0 — even when nothing is listening — so it can never fail a hook:
+
+```json
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"gatt notify"}]}]}}
+```
+
+`gatt serve --no-embed` refreshes only the graph. `GATT_EMBED_ON_REFRESH=1` makes query commands embed inline again (the old behaviour).
+
+### What it costs (Sagpic, 21,830 nodes, 12 cores)
+
+| | |
+|---|---|
+| First index | ~5 min (~60 nodes/s); Qdrant 5 min 24 s |
+| Hook pass, nothing changed | ~35 ms |
+| Hook pass, one file edited | ~1.6 s (Qdrant: the same) |
+| Re-extracting an unchanged repo | 0 nodes re-embedded |
+
+### How it works
+
+- **`serve`** listens on `127.0.0.1:7788` (`POST /refresh`, `GET /status` with embedding progress), rejects any non-loopback `Host` and any `Origin` header, and coalesces a burst of hooks into one extra pass.
+- **Incremental by content.** A node is re-embedded only if its text hash changed. The text lists neighbours (callers, references, …) sorted, so edge order — which differs between extractions and after an incremental refresh — never causes re-embeds. Nodes that left the graph are removed from the index. Upgrading from vectors built before this change re-embeds the affected nodes once.
+- **The worker** (`tools/gatt-embed`: `@huggingface/transformers` + ONNX Runtime) exposes an OpenAI-compatible `/v1/embeddings`. Texts are truncated to 128 tokens (what the default multilingual MiniLM, 384-d, was trained on) and embedded in length-sorted sub-batches, because padding to the longest text made one long node slow its whole batch ~7×.
+- **Local index format.** `vectors.json` holds only metadata (3 MB for 21.8k nodes) and `vectors.bin` the raw float32 vectors (33 MB; it used to be one 106 MB JSON). A generation id ties the two files together, so a reader that catches a write in progress retries instead of mixing them. Older all-in-JSON files are still read and upgraded on the next write; older gatt *binaries* cannot read the new layout.
+- **Qdrant** is incremental too: a pass reads the stored text hashes (paged), uploads only changed nodes and deletes the ones that left the graph. `gatt index --full` recreates the collection.
+- **"Up to date"** is a stamp of the graph file (size + mtime) written when a catch-up finishes, taken before the graph is read — not a comparison of file times — so a changed clock, a restored older copy, or a change during embedding can't make `serve` skip a needed pass.
+- **Concurrent processes.** Graph refresh+save and the vector-index write each take a lock file (`<graph>.lock`, `vectors.json.lock`; considered stale after 5 min), so `serve` and query commands can run together without losing writes.
+
+### Environment variables
+
+| Variable | Used by | Meaning |
+|---|---|---|
+| `GATT_EMBED_URL` | all commands | default for `--embed-url` |
+| `GATT_EMBED_API_KEY` | OpenAI-compatible mode | bearer token |
+| `GATT_EMBED_ON_REFRESH` | query commands | `1` = embed inline on refresh |
+| `GATT_ADDR` | `serve`, `notify` | listen / target address (default `127.0.0.1:7788`) |
+| `GATT_EMBED_WORKER` | `serve` | default for `--onnx` |
+| `GATT_EMBED_MODEL`, `GATT_EMBED_PORT`, `GATT_EMBED_CACHE` | worker | model, port, download cache |
+| `GATT_EMBED_MAX_TOKENS`, `GATT_EMBED_SUB_BATCH` | worker | truncation length (128), sub-batch size (16) |
+| `GATT_EMBED_KEEP_GPU`, `GATT_EMBED_KEEP_WEB` | worker install | `1` = keep GPU / browser runtimes the postinstall prune removes |
+
 ## Codebase graphs
 
 `gatt extract codebase <dir>` parses the repo with tree-sitter and builds the call graph. When `<dir>` is a git checkout, extraction (and `gatt grep`) additionally respects the repo's own `.gitignore`/`.git/info/exclude` via `git ls-files` — not just a fixed list of common build-output names (`dist`, `build`, `node_modules`, …) — so a project-specific output directory is excluded too, instead of a compiled/minified copy of every function competing with its real source definition as an ambiguous same-named node. Falls back to the fixed skip list alone when `<dir>` isn't a git checkout.
@@ -116,7 +155,7 @@ The agent-workflow commands:
 - **`gatt doc-drift`** — which documentation lies: markdown docs whose inline-code references no longer resolve (a symbol deleted/renamed, a cited file moved) or point at code whose last git commit postdates the doc's. Run it after refactors to get the list of docs needing an update, and before trusting a doc.
 - **`gatt diff [ref]`** — structural diff of the working tree against a git ref (default `HEAD`): added/removed/changed/renamed/moved functions and types, detected by matching signatures across two extractions (not a textual diff), plus the current callers of anything that changed. Reuses git's own rename detection (`git diff -M`) for whole-file renames; function-level renames/moves are a same-file (then cross-file) signature-match heuristic.
 
-**Never stale:** every query command (and the MCP server) checks file mtimes before answering (~60ms), re-parses only the files that changed since the last extract, evicts deleted entities, re-wires cross-file edges (calls, imports, mentions, associations, route models), and re-embeds just the changed nodes — by default only via `gatt serve` / `gatt index` (see *Background refresh*), so a query never waits on an embedding server (`GATT_EMBED_ON_REFRESH=1` restores the old inline behaviour). Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exceptions that refresh only on full re-extract: `CO_CHANGED` edges — git history has no incremental delta worth mining — and `CALLS_ENDPOINT` edges from files that didn't themselves change.)
+**Never stale:** every query command (and the MCP server) checks file mtimes before answering (~60ms), re-parses only the files that changed since the last extract, evicts deleted entities, re-wires cross-file edges (calls, imports, mentions, associations, route models), and re-embeds just the changed nodes — by default only via `gatt serve` / `gatt index` (see [Semantic search and background refresh](#semantic-search-and-background-refresh)), so a query never waits on an embedding server (`GATT_EMBED_ON_REFRESH=1` restores the old inline behaviour). Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exceptions that refresh only on full re-extract: `CO_CHANGED` edges — git history has no incremental delta worth mining — and `CALLS_ENDPOINT` edges from files that didn't themselves change.)
 
 ### Semantic overlay (`.gatt/`)
 
@@ -173,33 +212,6 @@ gatt index                             # re-embed only the nodes whose text chan
 - **Re-extraction is non-destructive to curated knowledge.** Annotations live in their sidecar and are re-applied on load; if a re-extract removes a node an annotation targeted, you get a warning naming the orphaned annotation. The `.gatt/` overlay is merged fresh on every extract.
 - **Re-indexing is incremental.** `index` reuses cached vectors for nodes whose embedding text is unchanged (content-hashed) and only embeds what actually moved — so re-indexing a 113-table CRM after a one-column migration embeds two nodes, not two thousand.
 
-## Background refresh and local ONNX embeddings
-
-Queries refresh the *graph* (cheap) but never embed. Vectors catch up in the background:
-
-```sh
-(cd tools/gatt-embed && npm install)      # once: local ONNX worker (Node >= 18); a postinstall prune leaves ~120 MB
-gatt serve --onnx tools/gatt-embed        # keeps graph + vectors fresh, starts/stops the worker
-export GATT_EMBED_URL=http://127.0.0.1:7801/v1   # so queries embed with the same model
-```
-
-Wire the agent's hook to `gatt notify` (silent, exits 0 when nothing is listening, so it can never fail a hook):
-
-```json
-{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"gatt notify"}]}]}}
-```
-
-- **`serve`** listens on `127.0.0.1:7788` (`POST /refresh`, `GET /status`), rejects non-loopback `Host` and any `Origin` header, and coalesces a burst of hooks into one extra pass. Each pass re-parses drifted files and re-embeds only nodes whose text hash changed.
-- **`--onnx`** runs `tools/gatt-embed`: `@huggingface/transformers` + ONNX Runtime on CPU, an OpenAI-compatible `/v1/embeddings`. The default model (multilingual MiniLM, 384-d) is downloaded on first use (~130 MB) and cached. Any other server works with `--embed-url http://host:port/v1` (TEI, llama.cpp, LM Studio) or Ollama (default).
-- **Speed:** ~60 nodes/s on 12 cores; a 21,830-node graph embeds in ~5 min once. After that a hook pass with nothing to do costs ~35 ms, a one-file edit ~1.6 s (re-parse, save, rewrite the 37 MB vector index; Qdrant is the same), and a full re-extraction of an unchanged repo re-embeds 0 nodes. Texts are truncated to 128 tokens (what the model was trained on) and embedded in length-sorted sub-batches, because padding to the longest text made one long node slow its whole batch 7x. `GET /status` shows `progress` while it runs. Tunables: `GATT_EMBED_MAX_TOKENS`, `GATT_EMBED_SUB_BATCH`.
-- **Local index format:** `vectors.json` holds only metadata (3 MB for 21.8k nodes) and `vectors.bin` the raw float32 vectors (33 MB; was one 106 MB JSON). A generation id ties the two files together so a reader that catches a write in progress retries instead of mixing them. Older all-in-JSON files are still read and upgraded on the next write. Older gatt binaries cannot read the new layout — reindex with them or upgrade.
-- **Incremental by content:** a node is re-embedded only if its text hash changed. The text lists neighbours (callers, references...) sorted, so edge order — which differs between extractions and after an incremental refresh — never causes re-embeds. Upgrading from vectors built before this change re-embeds the affected nodes once. Deleted nodes are dropped from the index by `gatt index` / `serve`.
-- **Qdrant (`--qdrant`)** is incremental too: the collection is no longer recreated on every write; a pass reads the stored text hashes (paged), uploads only changed nodes and deletes the ones that left the graph. `gatt index --full` still recreates it. Validated against Qdrant 1.20 (Docker): unchanged re-index embeds 0, one new function embeds 1, deleting a file removes its points.
-- **"Vectors are up to date"** is a stamp of the graph file (size + mtime) written when a catch-up finishes — not a comparison of file times — so a changed clock or a restored older copy can't make `serve` skip a needed pass.
-- **Concurrent processes:** graph refresh+save and `vectors.json` read-merge-write each take a lock file (`<graph>.lock`, `vectors.json.lock`; stale after 5 min), so `serve` and query commands can run together without losing writes.
-- The model name is stored next to the vectors; a different model is refused rather than silently replacing the index (`gatt index --full` to switch).
-- `gatt serve --no-embed` refreshes the graph only.
-
 ## MCP tools
 
 **Read** — answer schema/code questions from the pre-built graph:
@@ -246,6 +258,29 @@ JOIN order_items ON orders.id = order_items.order_id
 JOIN products ON order_items.product_id = products.id
 ```
 
+## Architecture
+
+```
+source (sqlite | postgres | openapi | codebase)
+        │  extract (once; incremental after that)
+        ▼
+  gatt-out/graph.db        ← source of truth: typed nodes + edges (SQLite + FTS5,
+        │                    default) — or graph.json (portable, versionable, via --out)
+        │  index  (or `gatt serve`, in the background)
+        ▼
+  gatt-out/vectors.json    ← semantic layer: node embeddings from Ollama, a local ONNX worker
+  gatt-out/vectors.bin       or any OpenAI-compatible server; cosine search in-process;
+        │                    --qdrant swaps in a Qdrant server
+        ▼
+  MCP stdio server         ← agents call tools; zero live introspection
+```
+
+- **Graph structure** (nodes, edges, join paths) lives in `graph.db` by default (SQLite with an FTS5 full-text index, incremental delta writes) or `graph.json` (portable, diff-able) if you pass `--out gatt-out/graph.json` on the first extract. All commands auto-detect whichever exists; `--graph PATH` overrides.
+- **Search is hybrid**: FTS5 bm25 (when the graph is SQLite) + semantic embeddings, so results are good even before indexing. If the vector index or Ollama is unavailable, `find_entities` falls back to keyword matching.
+- **Vector index is in-process by default.** Metadata graphs are small (hundreds to a few thousand nodes), so brute-force cosine takes microseconds — no vector database required. Pass `--qdrant URL` to `index`/`search`/`mcp` to opt into a Qdrant server (useful for very large or shared indexes).
+
+For the node and edge types of each source (database, API spec, codebase) see **[docs/graph-model.md](docs/graph-model.md)**.
+
 ## Adding a connector
 
 Implement `connector.Connector` (`internal/connector/connector.go`):
@@ -259,51 +294,31 @@ type Connector interface {
 
 Emit nodes/edges with the model in `internal/graph/model.go`, wire into `cmd/gatt/main.go`. The graph, index, search, and MCP layers need no changes.
 
-## Roadmap
-
-- [x] PostgreSQL connector (`pg_catalog`: native enums, column comments, multi-column FKs, view dependencies, multi-schema)
-- [x] OpenAPI connector (endpoints, schemas, `$ref` relationships) — OpenAPI 3.x + Swagger 2.0, from a `.json`/`.yaml` file or a live `http(s)://.../openapi.json` (FastAPI, swaggo)
-- [x] Codebase connector (tree-sitter: Go, TS/TSX, JS/JSX, Python, Rust, Java, C#) with call graph, `.gatt/` semantic overlay, and mtime-based incremental refresh
-- [x] SQLite graph storage (`graph.db`): FTS5 full-text index, delta writes
-- [x] Incremental re-extraction with change detection (`extract --check` reports drift; `index` re-embeds only changed nodes)
-- [x] Spec↔code linking (`extract openapi --code`, `gatt enrich`): endpoints/schemas point at their Go source
-- [x] HTTP route entities in code (Express-style JS/TS/JSX): `gatt routes`
-- [x] Shared mutable-state data flow (JS/TS/JSX named-import singletons): `impact`/`blast` shared-state section
-- [x] Exhaustive literal/regex search (`gatt grep`) as a proof-of-absence complement to semantic `search`
-- [x] Annotated directory tree (`gatt tree`) and floating "why" comments as queryable `comment` nodes
-- [x] Structural diff against a git ref (`gatt diff`): rename/move-aware function/type changes + current callers
-- [x] Blast radius for any node (`gatt blast`): callers + importers (tsconfig aliases resolved) + generated copies + same-basename duplicates by content hash
-- [x] Git co-change mining (`CO_CHANGED`): stylesheets/docs/e2e-tests/i18n that ship together with no static edge
-- [x] Doc drift (`gatt doc-drift`): MENTIONS edges doc→code, broken/stale reference report
-- [x] Language-agnostic ORM models (`gatt models`): Sequelize/TypeORM/gorm/Django/SQLAlchemy + FK-name inference + `.gatt/models.json` overlay
-- [x] Full-stack intersection: `USES_MODEL` (route → models its handler touches) + `CALLS_ENDPOINT` (frontend call site → route)
-- [x] Absolute graph roots + wrong-cwd refresh guard (legacy relative-source graphs refuse instead of corrupting)
-- [x] Language-agnostic client-call detection: verb-evidence heuristic over every parsed language (incl. Java/C#), method-as-string wrappers, options objects, format-string paths, `.gatt/clients.json` overlay
-- [x] Template files by content sniff (no extension list): `.vue`/`.html`/`.cshtml`/`.svelte`/... — inline `<script>` masked & parsed as JS/TS, htmx + `<form>` attributes scanned
-- [x] Kotlin + Swift parsing; absolute-URL/base-var/relative-path client calls (desktop & mobile apps); Retrofit `@GET` client annotations
-- [x] Annotation-declared routes: Spring `@GetMapping`/`@RequestMapping` (Java), ASP.NET `[HttpGet]`/`[Route("api/[controller]")]` (C#) — full-stack chain included
-- [x] Java + C# parsing (functions, types, call graph, imports, docs)
-- [x] Language-scoped local import/package resolution beyond Go: Python (absolute + relative, PEP 420), Java/Kotlin (`src/main/{java,kotlin}` source roots), C# (`.csproj` `<RootNamespace>` stripping), Rust (`Cargo.toml` crate roots, `crate`/`self`/`super`) — plus `exported` tagging per language's own visibility rule
-- [x] String-keyed dispatch (`CALLS`, `inferred=true`): `queueJob("createPdf")` against a lookup table, `io.emit("connected")`/custom verbs (`.gatt/dispatch.json`) against an `io.on("connected", handler)` registration — JS/TS/JSX
-- [ ] Sample values for low-cardinality string columns (`status`, `type`, ...) that carry no declared enum — see `TODO(#2)` in `internal/connector/postgres/postgres.go`
-- [ ] Query-log mining: add edges from JOINs observed in real queries (relationships not declared as FKs)
-- [x] Route detection for Go (gin/chi/echo/gorilla/net-http incl. 1.22 `"GET /x"` patterns and `.Methods()` chains) and Python (Flask/FastAPI decorators, `methods=[...]`, `<int:id>` params)
-- [x] Builder-chain & enum clients: OkHttp `.url().post()` (verb text-scanned in the chain; no verb = any-method wildcard), Alamofire `method: .post`, `HttpMethod.POST`-style enum args
-- [x] Selector-level CSS linkage (`USES_STYLE`): `.class`/`#id`/`[data-*]`/`--var` → the templates/JSX/stylesheets using them; repo-defined tokens only (utility frameworks excluded by construction)
-
 ## Layout
 
 ```
 cmd/gatt/                 CLI: init | extract | enrich | index | query | code-query | impact |
                           blast | doc-drift | search | grep | tree | routes | models | diff |
-                          path | explain | annotate | overview | mcp | install
+                          path | explain | annotate | overview | serve | notify | mcp | install
 internal/engine/          query operations shared by CLI and MCP
 internal/graph/           graph model, traversal, persistence (JSON + SQLite/FTS5)
 internal/connector/       Connector interface + sqlite/, postgres/, openapi/, codebase/
-internal/embed/           Ollama embedding client
+internal/embed/           embedding client: Ollama and OpenAI-compatible (/v1) servers
+internal/indexer/         incremental (hash-based) indexing into any VectorStore
+internal/lock/            cross-process lock files
 internal/store/           VectorStore interface
-internal/store/local/     default in-process cosine index (vectors.json)
-internal/store/qdrant/    opt-in Qdrant REST backend
+internal/store/local/     default in-process cosine index (vectors.json + vectors.bin)
+internal/store/qdrant/    opt-in Qdrant REST backend (+ qdranttest, an in-memory fake for tests)
 internal/mcpserver/       MCP stdio server (official go-sdk)
 tools/mkdemo/             generates a demo SQLite DB for testing
+tools/gatt-embed/         local ONNX embedding worker (Node), used by `gatt serve --onnx`
+docs/                     graph model reference, roadmap
 ```
+
+## License
+
+gatt is free software, licensed under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See [LICENSE](LICENSE).
+
+In short: you may use, study, modify and redistribute it, including commercially; if you distribute a modified version, or let users interact with one over a network (AGPL §13), you must offer them its corresponding source under the same license.
+
+Things gatt uses or downloads keep their own licenses: Go and npm dependencies (see `go.mod` and `tools/gatt-embed/package-lock.json`), and the embedding model weights fetched from Hugging Face on first use — check the model card of the model you configure.
