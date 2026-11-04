@@ -75,11 +75,7 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: node scripts/npm-publish.mjs "${GITHUB_REF_NAME#v}" dist
+        run: node scripts/npm-publish.mjs "${GITHUB_REF_NAME#v}"
