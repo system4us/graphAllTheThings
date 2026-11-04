@@ -518,6 +518,15 @@ func (g *Graph) NodeText(id string) string {
 			usedByRoutes = append(usedByRoutes, on.Name)
 		}
 	}
+	// Neighbours arrive in edge order, which is not stable: a fresh extraction
+	// and an incremental refresh (evicted edges are re-added at the end) both
+	// reorder it. Sort the set-like lists so identical content gives identical
+	// text, otherwise the embedding hash changes and nodes re-embed for nothing.
+	// Lists whose order carries meaning (columns, accepts, returns, middleware)
+	// are left in declaration order.
+	for _, l := range [][]string{refs, refBy, usedBy, methods, calledBy, handledBy, writesState, readsState, writtenBy, readBy, callsEndpoints, usesModels, usedByRoutes} {
+		sort.Strings(l)
+	}
 	if len(cols) > 0 {
 		label := "Columns"
 		if n.Type == NodeSchema {

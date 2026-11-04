@@ -262,6 +262,13 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 		return st
 	}
 
+	// No drift this pass and the vectors are newer than the graph: nothing can be
+	// pending, so skip loading and hashing the whole index (seconds on big repos).
+	// A query-time refresh rewrites graph.db without embedding, which makes the
+	// vectors older and lets the next pass catch up.
+	if res.Summary == "" && qdURL == "" && vectorsFresh(graphPath) {
+		return st
+	}
 	g, err := graph.Load(graphPath)
 	if err != nil {
 		st.Error = err.Error()
@@ -279,7 +286,32 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 		return st
 	}
 	st.Embedded += r.Embedded
+	if qdURL == "" {
+		touchVectors(graphPath) // mark "caught up" even when nothing needed embedding
+	}
 	return st
+}
+
+func vectorsPath(graphPath string) string {
+	return filepath.Join(filepath.Dir(graphPath), "vectors.json")
+}
+
+// vectorsFresh reports whether vectors.json is at least as new as the graph.
+func vectorsFresh(graphPath string) bool {
+	v, err := os.Stat(vectorsPath(graphPath))
+	if err != nil {
+		return false
+	}
+	g, err := os.Stat(graphPath)
+	if err != nil {
+		return false
+	}
+	return !v.ModTime().Before(g.ModTime())
+}
+
+func touchVectors(graphPath string) {
+	now := time.Now()
+	_ = os.Chtimes(vectorsPath(graphPath), now, now)
 }
 
 // localStoredModel returns the model recorded in a local vector index, or ""

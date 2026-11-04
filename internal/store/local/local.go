@@ -14,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
+	"graphallthethings/internal/lock"
 	"graphallthethings/internal/store"
 )
 
@@ -65,15 +67,41 @@ func TextHash(text string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func (s *Store) Upsert(_ context.Context, points []store.Point) error {
+func (s *Store) Upsert(ctx context.Context, points []store.Point) error {
+	return s.write(points, true)
+}
+
+// Replace makes the index contain exactly points: vectors for nodes that are no
+// longer in the graph are dropped. Use it only with the complete live set (a
+// full `index` pass); a partial set would discard the rest.
+func (s *Store) Replace(_ context.Context, points []store.Point) error {
+	return s.write(points, false)
+}
+
+// write persists points under a cross-process lock. With merge it re-reads the
+// file inside the lock, so a concurrent writer's changes are not lost.
+func (s *Store) write(points []store.Point, merge bool) error {
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+		return err
+	}
+	release, err := lock.Acquire(s.Path+".lock", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	// Merge over the existing index so a partial upsert (post-refresh
 	// re-embed of a few changed nodes) doesn't wipe the other vectors.
 	// A missing file or a model switch starts from empty.
 	desired := s.Model
+	s.loaded = false // another process may have written since we last read
 	_ = s.load()
 	if desired != "" && desired != s.Model {
 		s.entries = nil
 		s.Model = desired
+	}
+	if !merge {
+		s.entries = nil
 	}
 	byID := map[string]int{}
 	for i, e := range s.entries {
@@ -93,9 +121,6 @@ func (s *Store) Upsert(_ context.Context, points []store.Point) error {
 			f.Entries = append(f.Entries, e)
 		}
 		f.Dim = len(p.Vector)
-	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
-		return err
 	}
 	data, err := json.Marshal(f)
 	if err != nil {

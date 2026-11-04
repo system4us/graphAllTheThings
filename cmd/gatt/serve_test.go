@@ -229,3 +229,25 @@ func TestStatusReportsProgressWhileRunning(t *testing.T) {
 		t.Error("progress not reset after the pass")
 	}
 }
+
+func TestVectorsFresh(t *testing.T) {
+	dir := t.TempDir()
+	graphPath := filepath.Join(dir, "graph.db")
+	if vectorsFresh(graphPath) {
+		t.Error("no files: must not be fresh")
+	}
+	os.WriteFile(graphPath, []byte("g"), 0o644)
+	if vectorsFresh(graphPath) {
+		t.Error("no vectors.json: must not be fresh")
+	}
+	os.WriteFile(vectorsPath(graphPath), []byte("{}"), 0o644)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(vectorsPath(graphPath), old, old)
+	if vectorsFresh(graphPath) {
+		t.Error("vectors older than the graph: a query-time refresh left them behind")
+	}
+	touchVectors(graphPath)
+	if !vectorsFresh(graphPath) {
+		t.Error("after catching up (touch) vectors must be fresh")
+	}
+}

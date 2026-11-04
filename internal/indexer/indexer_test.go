@@ -4,15 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/graph"
+	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
 )
 
@@ -113,5 +116,75 @@ func TestUpsertIsAtomic(t *testing.T) {
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 || entries[0].Name() != "vectors.json" {
 		t.Errorf("leftover temp files after upsert: %v", entries)
+	}
+}
+
+func TestReindexDropsDeletedNodes(t *testing.T) {
+	var sent atomic.Int64
+	emb := fakeEmbedder(t, &sent)
+	path := filepath.Join(t.TempDir(), "vectors.json")
+	g := testGraph("a", "b", "c")
+	if _, err := Reindex(context.Background(), g, local.New(path), emb, "m1", false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(local.New(path).Indexed()); got != 3 {
+		t.Fatalf("setup: %d vectors, want 3", got)
+	}
+
+	delete(g.Nodes, "func:b") // node removed from the graph (file deleted)
+	res, err := Reindex(context.Background(), g, local.New(path), emb, "m1", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := local.New(path).Indexed()
+	if _, stale := got["func:b"]; stale || len(got) != 2 {
+		t.Errorf("deleted node still indexed: %d vectors, has func:b=%v", len(got), stale)
+	}
+	if res.Embedded != 0 || res.Reused != 2 {
+		t.Errorf("embedded=%d reused=%d, want 0/2 (nothing to re-embed)", res.Embedded, res.Reused)
+	}
+}
+
+// Two writers on the same file must both survive (read-merge-write is locked).
+func TestConcurrentUpsertsLoseNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vectors.json")
+	const writers = 12
+	done := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		go func(i int) {
+			s := local.New(path) // each "process" has its own Store, like separate gatt runs
+			s.Model = "m1"
+			done <- s.Upsert(context.Background(), []store.Point{{
+				NodeID: fmt.Sprintf("n%d", i), Type: "function", Name: "n", Text: "t", Vector: []float32{1, 0},
+			}})
+		}(i)
+	}
+	for i := 0; i < writers; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(local.New(path).Indexed()); got != writers {
+		t.Errorf("%d vectors after %d concurrent upserts, want %d (lost updates)", got, writers, writers)
+	}
+}
+
+func TestReindexSkipsWriteWhenNothingChanged(t *testing.T) {
+	var sent atomic.Int64
+	emb := fakeEmbedder(t, &sent)
+	path := filepath.Join(t.TempDir(), "vectors.json")
+	g := testGraph("a", "b")
+	if _, err := Reindex(context.Background(), g, local.New(path), emb, "m1", false, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(path)
+	time.Sleep(20 * time.Millisecond)
+	res, err := Reindex(context.Background(), g, local.New(path), emb, "m1", false, nil)
+	if err != nil || res.Embedded != 0 || res.Reused != 2 {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	after, _ := os.Stat(path)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("vectors.json was rewritten although nothing changed")
 	}
 }

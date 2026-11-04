@@ -143,7 +143,19 @@ func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *emb
 	if len(points) == 0 {
 		return Result{}, fmt.Errorf("nothing to index")
 	}
-	if err := vs.Upsert(ctx, points); err != nil {
+	// Nothing to embed and every stored vector is still live: the index is
+	// already exact, so don't rewrite (and re-parse) a file of many MB for nothing.
+	// points all came from the cache, so equal counts mean identical id sets.
+	if _, ok := vs.(*local.Store); ok && len(todoIDs) == 0 && len(cache) == len(points) {
+		return Result{Total: len(points), Reused: reused}, nil
+	}
+	// points is the complete live set, so for the local store Replace also drops
+	// vectors of nodes deleted from the graph (Upsert alone only ever adds).
+	if ls, ok := vs.(*local.Store); ok {
+		if err := ls.Replace(ctx, points); err != nil {
+			return Result{}, err
+		}
+	} else if err := vs.Upsert(ctx, points); err != nil {
 		return Result{}, err
 	}
 	return Result{Total: len(points), Embedded: len(todoIDs), Reused: reused}, nil

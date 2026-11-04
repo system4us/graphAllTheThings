@@ -24,6 +24,7 @@ import (
 	"graphallthethings/internal/enrich"
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/indexer"
+	"graphallthethings/internal/lock"
 	"graphallthethings/internal/mcpserver"
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
@@ -446,19 +447,36 @@ func refreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, embMod
 	if !conn.HasDrift(mts) {
 		return refreshResult{}, nil
 	}
-	raw, err := graph.LoadRaw(graphPath)
+	// Re-parse and save under a cross-process lock: `gatt serve` and a query
+	// command can both notice the same drift at once. Whoever waits re-checks
+	// drift once it holds the lock, so the second one usually finds nothing to do.
+	release, err := lock.Acquire(graphPath+".lock", 2*time.Minute)
 	if err != nil {
-		return refreshResult{}, nil
+		return refreshResult{}, err
 	}
-	ng, summary, err := conn.Update(ctx, raw)
+	ng, summary, added, err := func() (*graph.Graph, string, []string, error) {
+		defer release()
+		if _, mts, err := graph.LoadCodebaseState(graphPath); err != nil || !conn.HasDrift(mts) {
+			return nil, "", nil, nil
+		}
+		raw, err := graph.LoadRaw(graphPath)
+		if err != nil {
+			return nil, "", nil, nil
+		}
+		ng, summary, err := conn.Update(ctx, raw)
+		if err != nil || summary == "" {
+			return nil, "", nil, err
+		}
+		added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
+		if err := ng.Save(graphPath); err != nil {
+			return nil, "", nil, nil
+		}
+		return ng, summary, added, nil
+	}()
 	if err != nil {
 		return refreshResult{}, err
 	}
 	if summary == "" {
-		return refreshResult{}, nil
-	}
-	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
-	if err := ng.Save(graphPath); err != nil {
 		return refreshResult{}, nil
 	}
 	res := refreshResult{Summary: summary, Changed: len(added)}
