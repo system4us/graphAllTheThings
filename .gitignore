@@ -16,3 +16,4 @@ dist/
 test_ts.go
 gen_graph.py
 whatsappCRM_schema.sql
+npm-out/
