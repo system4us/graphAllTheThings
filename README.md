@@ -70,4 +70,6 @@ Only nodes whose text changed are re-embedded: on a 21,830-node graph the first 
 
 ## License
 
-[GNU AGPL v3 or later](LICENSE). You may use, modify and redistribute it, including commercially; if you distribute a modified version or let users interact with one over a network (AGPL §13), you must offer them its source under the same license. Dependencies and downloaded embedding models keep their own licenses.
+Copyright (C) 2026 Leandro Fusco <leandrofusdev@gmail.com>
+
+Licensed under the [GNU AGPL v3 or later](LICENSE). You may use, modify and redistribute it, including commercially; if you distribute a modified version or let users interact with one over a network (AGPL §13), you must offer them its source under the same license. Dependencies and downloaded embedding models keep their own licenses.
