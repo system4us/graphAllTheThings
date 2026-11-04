@@ -1757,6 +1757,13 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		if lc.declQuery != nil {
 			c.fileTypes[relPath] = collectDecls(tree, lc.declQuery, data)
 		}
+		if ext == ".cs" {
+			// Persisted on the file node so an incremental refresh still knows the
+			// namespaces of files it does not re-parse.
+			ns := parseCSharpNamespaces(data)
+			fileAttrs["cs_declared"] = strings.Join(ns.declared, " ")
+			fileAttrs["cs_uses"] = strings.Join(ns.uses, " ")
+		}
 
 		// fileAttrs is the same map the file node's Attrs already points at
 		// (AddNode stores it by reference), so this mutation is visible on

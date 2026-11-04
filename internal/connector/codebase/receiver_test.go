@@ -391,3 +391,87 @@ func TestJavaImportedPackageNeverQualifiesACall(t *testing.T) {
 	})
 	wantEdges(t, got)
 }
+
+func TestCSharpExtensionMethodThroughDeclaredType(t *testing.T) {
+	csproj := "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><RootNamespace>Poc</RootNamespace></PropertyGroup></Project>\n"
+	got := extractFiles(t, map[string]string{
+		"Poc.csproj":                  csproj,
+		"Abstractions/IAppBuilder.cs": "namespace Poc.Abstractions { public interface IAppBuilder { void Own(); } }\n",
+		"Abstractions/IOther.cs":      "namespace Poc.Abstractions { public interface IOther { } }\n",
+		"Builder/Ext.cs": "using Poc.Abstractions;\nnamespace Poc.Builder { public static class Ext {\n" +
+			"  public static IAppBuilder UseRouting(this IAppBuilder app) { return app; }\n" +
+			"  public static IOther UseRouting(this IOther o) { return o; }\n" +
+			"  public static void Own(this IAppBuilder app) { }\n} }\n",
+		"Startup.cs": "using Poc.Abstractions;\nusing Poc.Builder;\nnamespace Poc { public class Startup {\n" +
+			"  public void Configure(IAppBuilder app) { app.UseRouting(); app.Own(); }\n" +
+			"  public void Lib(Unknown u) { u.UseRouting(); }\n} }\n",
+	})
+	// UseRouting on IAppBuilder -> only the IAppBuilder overload (not IOther's).
+	// Own() is an INSTANCE method of IAppBuilder, which wins over the extension: it
+	// resolves to the interface's own declaration, never to Ext.Own.
+	// Unknown is not defined in the repo: nothing is provable.
+	wantEdges(t, got, "Configure->Own@Abstractions/IAppBuilder.cs", "Configure->UseRouting@Builder/Ext.cs")
+}
+
+func TestCSharpExtensionReceiver(t *testing.T) {
+	for in, want := range map[string]string{
+		"UseRouting(this IApplicationBuilder app)":            "IApplicationBuilder",
+		"Add<T>(this IServiceCollection services, T x)":       "IServiceCollection",
+		"Map(this Microsoft.AspNetCore.Builder.IEndpoints e)": "IEndpoints",
+		"Normal(IApplicationBuilder app)":                     "",
+		"Run(IThing thisOne)":                                 "",
+	} {
+		if got := csharpExtensionReceiver(in); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+// C# visibility is by namespace, not directory; and a refresh that re-parses only
+// the caller must still know the namespaces of the files it does not re-parse.
+func TestCSharpNamespaceVisibilityAndIncrementalUpdate(t *testing.T) {
+	tmp := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(tmp, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The namespace has nothing to do with the folders.
+	write("a/b/c/Widget.cs", "namespace Acme.Core.Things { public class Widget { public string Spin() { return \"s\"; } } }\n")
+	write("x/Other.cs", "namespace Acme.Hidden { public class Widget { public string Spin() { return \"h\"; } } }\n")
+	write("z/User.cs", "using Acme.Core.Things;\nnamespace Acme.App { public class User { public string Go(Widget w) { return w.Spin(); } } }\n")
+	write("z/Same.cs", "namespace Acme.Core.Things.Deep { public class Same { public string Go(Widget w) { return w.Spin(); } } }\n")
+	write("z/None.cs", "namespace Acme.Elsewhere { public class None { public string Go(Widget w) { return w.Spin(); } } }\n")
+
+	c := New(tmp)
+	g, err := c.Extract(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges := func(g *graph.Graph) []string {
+		var out []string
+		for _, e := range g.Edges {
+			if e.Type == graph.EdgeCalls && e.Attrs["via"] == "receiver" {
+				out = append(out, g.Nodes[e.From].Attrs["file"]+"->"+g.Nodes[e.To].Attrs["file"])
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	// `using` imports the namespace; an enclosing namespace is visible without one;
+	// an unrelated namespace sees nothing (two Widget types exist, neither is in scope).
+	want := []string{"z/Same.cs->a/b/c/Widget.cs", "z/User.cs->a/b/c/Widget.cs"}
+	wantEdges(t, edges(g), want...)
+
+	// Re-parse only the caller: Widget.cs is untouched, its namespace must persist.
+	write("z/User.cs", "using Acme.Core.Things;\n// touched\nnamespace Acme.App { public class User { public string Go(Widget w) { return w.Spin(); } } }\n")
+	future := time.Now().Add(time.Hour)
+	os.Chtimes(filepath.Join(tmp, "z/User.cs"), future, future)
+	g2, summary, err := New(tmp).Update(context.Background(), g)
+	if err != nil || summary == "" {
+		t.Fatalf("Update: %q %v", summary, err)
+	}
+	wantEdges(t, edges(g2), want...)
+}

@@ -119,6 +119,43 @@ func (c *Connector) pyModuleFile(fromAbs, spec string) string {
 	return ""
 }
 
+var (
+	csNamespaceRe = regexp.MustCompile(`(?m)^\s*namespace\s+([\w.]+)\s*[;{]`)
+	csUsingRe     = regexp.MustCompile(`(?m)^\s*(?:global\s+)?using\s+([\w.]+)\s*;`)
+)
+
+// csNS is what C# visibility is made of: the namespaces a file declares and the
+// namespaces it imports with `using`. (`using static`, aliases and `using var`
+// do not match the pattern.)
+type csNS struct{ declared, uses []string }
+
+func parseCSharpNamespaces(src []byte) csNS {
+	var out csNS
+	for _, m := range csNamespaceRe.FindAllSubmatch(src, -1) {
+		out.declared = append(out.declared, string(m[1]))
+	}
+	for _, m := range csUsingRe.FindAllSubmatch(src, -1) {
+		out.uses = append(out.uses, string(m[1]))
+	}
+	return out
+}
+
+var csExtensionRe = regexp.MustCompile(`^\w+\s*(?:<[^>(]*>)?\(\s*this\s+([\w.]+)`)
+
+// csharpExtensionReceiver returns T for a C# extension method signature
+// "M(this T x, ...)" (T without namespace or generic arguments), else "".
+func csharpExtensionReceiver(signature string) string {
+	m := csExtensionRe.FindStringSubmatch(signature)
+	if m == nil {
+		return ""
+	}
+	t := m[1]
+	if i := strings.LastIndexByte(t, '.'); i >= 0 {
+		t = t[i+1:]
+	}
+	return t
+}
+
 // maxReceiverTargets bounds how many same-named functions in the resolved file
 // get an edge (overloads). More than this means the method name is too
 // ambiguous inside that file to be informative.
@@ -191,6 +228,9 @@ type recvIndex struct {
 	funcsInDir    map[string]map[string][]string // rel dir -> name -> ids (package-level, not methods)
 	defs          map[string][]defRef            // type name -> definitions
 	methodsOf     map[string]map[string][]string // definition id -> method name -> function ids (Go: HAS_METHOD)
+	extByType     map[string]map[string][]string // C# extension methods: receiver type -> method name -> function ids
+	funcFile      map[string]string              // function id -> file (C# extension methods only)
+	csNS          map[string]csNS                // C# file -> declared / imported namespaces
 	pkgName       map[string]string              // package node id -> name
 	importedPkgs  map[string][]string            // caller rel file -> imported local package node ids
 	importedFiles map[string][]string            // caller rel file -> imported local rel files
@@ -202,6 +242,9 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 		funcsInDir:    map[string]map[string][]string{},
 		defs:          map[string][]defRef{},
 		methodsOf:     map[string]map[string][]string{},
+		extByType:     map[string]map[string][]string{},
+		funcFile:      map[string]string{},
+		csNS:          map[string]csNS{},
 		pkgName:       map[string]string{},
 		importedPkgs:  map[string][]string{},
 		importedFiles: map[string][]string{},
@@ -236,6 +279,17 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 				ri.funcsInFile[f] = m
 			}
 			m[n.Name] = append(m[n.Name], id)
+			if strings.HasSuffix(f, ".cs") {
+				if t := csharpExtensionReceiver(n.Attrs["signature"]); t != "" {
+					em := ri.extByType[t]
+					if em == nil {
+						em = map[string][]string{}
+						ri.extByType[t] = em
+					}
+					em[n.Name] = append(em[n.Name], id)
+					ri.funcFile[id] = f
+				}
+			}
 			if !isMethod[id] {
 				d := path.Dir(f)
 				dm := ri.funcsInDir[d]
@@ -248,6 +302,10 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 		case graph.NodeDefinition:
 			if f := n.Attrs["file"]; f != "" {
 				ri.defs[n.Name] = append(ri.defs[n.Name], defRef{id: id, file: f})
+			}
+		case graph.NodeFile:
+			if d, u := n.Attrs["cs_declared"], n.Attrs["cs_uses"]; d != "" || u != "" {
+				ri.csNS[n.Name] = csNS{declared: strings.Fields(d), uses: strings.Fields(u)}
 			}
 		case graph.NodePackage:
 			ri.pkgName[id] = n.Name
@@ -325,7 +383,24 @@ func (ri *recvIndex) resolve(root, callerFile, recv, method string, namedImports
 	if len(tfiles) != 1 {
 		return nil
 	}
-	return ri.methodsIn(tdefs, tfiles, method)
+	if ids := ri.methodsIn(tdefs, tfiles, method); len(ids) > 0 {
+		return ids // an instance method always wins over an extension
+	}
+	// C#: the type has no such method, so `x.M()` binds to an extension method
+	// M(this T x) if there is one. Only for types defined in this repo: an
+	// extension on a library type could be shadowed by the library's own method.
+	if strings.HasSuffix(callerFile, ".cs") {
+		var ids []string
+		for _, id := range ri.extByType[typ][method] {
+			if f := ri.funcFile[id]; f == callerFile || ri.csVisible(callerFile, f) {
+				ids = append(ids, id) // the extension's namespace must be in scope
+			}
+		}
+		if len(ids) > 0 && len(ids) <= maxReceiverTargets {
+			return ids
+		}
+	}
+	return nil
 }
 
 // packageFunc: recv names a local package the caller imports (Go).
@@ -356,6 +431,14 @@ func (ri *recvIndex) visibleDefs(callerFile, name string, pyMod map[string]strin
 	}
 	var out []defRef
 	for _, d := range ri.defs[name] {
+		if strings.HasSuffix(callerFile, ".cs") && strings.HasSuffix(d.file, ".cs") {
+			// C# scoping: same file, or the type's namespace is imported with `using`,
+			// is the caller's namespace, or encloses it. Directories mean nothing here.
+			if d.file == callerFile || ri.csVisible(callerFile, d.file) {
+				out = append(out, d)
+			}
+			continue
+		}
 		if strings.HasSuffix(callerFile, ".py") && d.file != callerFile {
 			if _, bound := pyMod[name]; !bound {
 				continue // Python: another file's class is only visible through an import binding
@@ -366,6 +449,24 @@ func (ri *recvIndex) visibleDefs(callerFile, name string, pyMod map[string]strin
 		}
 	}
 	return out
+}
+
+// csVisible reports whether a type declared in targetFile is in scope in callerFile.
+func (ri *recvIndex) csVisible(callerFile, targetFile string) bool {
+	caller, target := ri.csNS[callerFile], ri.csNS[targetFile]
+	for _, t := range target.declared {
+		for _, u := range caller.uses {
+			if u == t {
+				return true
+			}
+		}
+		for _, c := range caller.declared {
+			if c == t || strings.HasPrefix(c, t+".") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // methodsIn finds functions called method that belong to the given definitions.
