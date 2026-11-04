@@ -41,3 +41,29 @@ gatt extract openapi swagger.json --code .   # endpoints/schemas link to their G
 gatt enrich .                                # re-link an existing graph after code edits,
                                              # without re-extracting the spec
 ```
+
+## Supported languages and limits
+
+Only these file types are parsed into functions, types and a call graph. Support is **not uniform**: the table shows what each one gets.
+
+| Language | Functions, types, calls | Local imports resolved against | HTTP routes detected | `exported` tag | ORM models |
+|---|---|---|---|---|---|
+| Go | yes | `go.mod` paths → `package` | gin, echo, chi, gorilla, `net/http` (incl. 1.22 `"GET /x"`) | yes (capitalised) | struct tags `gorm:` `db:` `bun:` `xorm:` |
+| TypeScript / TSX | yes | relative paths and `tsconfig` aliases → `file` | Express-style | — | Sequelize, TypeORM |
+| JavaScript / JSX | yes | relative paths and `tsconfig` aliases → `file` | Express-style | — | Sequelize, TypeORM |
+| Python | yes | absolute and relative dotted imports (PEP 420) | Flask, FastAPI decorators | yes (no leading `_`) | Django, SQLAlchemy, SQLModel |
+| Java | yes | dotted imports against `src/{main,test}/java` | Spring annotations | yes (`public`) | JPA / Hibernate |
+| Kotlin | yes | dotted imports against `src/{main,test}/kotlin` | — | yes (not `private`/`internal`) | JPA |
+| C# | yes | `using` against `.csproj` `<RootNamespace>` (best effort) | ASP.NET attributes | yes (`public`) | EF Core |
+| Rust | yes | `Cargo.toml` crate roots, `crate`/`self`/`super` → `file` | — | yes (bare `pub`) | — |
+| Swift | yes | external modules only (same-module files need no import) | — | — | Vapor / Fluent |
+
+A dash means not supported: for routes, tag the handler by hand with `annotate route_method=… route_path=…`.
+
+Beyond the table:
+
+- **JavaScript / TypeScript only:** module-scope `const` bindings as definitions, `READS`/`WRITES` of shared singleton state, and string-keyed dispatch edges (`queueJob("x")` against a lookup table).
+- **Client call sites** (`CALLS_ENDPOINT`) are detected in every parsed language.
+- **Also indexed, but not as code:** Markdown docs; JSON, YAML, SQL and CSS files (content-hashed, for `blast`); and template files such as `.vue`, `.html`, `.cshtml`, `.svelte` (detected by content; inline `<script>` is parsed as JS/TS).
+- **Not parsed:** every other language — C, C++, PHP, Ruby, Scala, Dart, Lua, Elixir, shell and so on. They produce no functions, call edges, routes or models. `gatt grep` still searches them, because it scans every file regardless of type.
+- Some detection is heuristic (route and model detection, `CALLS_ENDPOINT` matching, JS/TS state flow): treat a missing edge as "not found", and use `gatt grep` when you need proof of absence.
