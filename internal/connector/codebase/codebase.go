@@ -316,6 +316,9 @@ func (c *Connector) scanFiles() map[string]string {
 		if gitOK && !gitFiles[rel] {
 			return nil
 		}
+		if !readableFile(path, d) {
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			return nil
@@ -331,6 +334,20 @@ func (c *Connector) scanFiles() map[string]string {
 		return nil
 	})
 	return out
+}
+
+// readableFile reports whether a directory entry is something parseFiles can
+// read as a file: a regular file, or a symlink that resolves to one. Symlinks to
+// directories (swift-package-manager's Fixtures/.../packageD -> ../Direct/CFoo)
+// and dangling symlinks fail os.ReadFile, so parseFiles gives them no node; the
+// drift scan must not count them either, or it sees a "new" file on every query
+// and re-parses it forever.
+func readableFile(path string, d fs.DirEntry) bool {
+	if d.Type().IsRegular() {
+		return true
+	}
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
 }
 
 // HasDrift cheaply reports whether any parseable file changed, appeared, or
@@ -1562,6 +1579,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		}
 		if gitOK && !gitFiles[relPath] {
 			return nil
+		}
+		if !readableFile(path, d) {
+			return nil // same gate as scanFiles, so drift detection stays consistent
 		}
 		projID := findProject(g, path, c.dir)
 		fileID := "file:" + path
