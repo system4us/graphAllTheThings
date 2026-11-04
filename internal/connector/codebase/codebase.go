@@ -150,6 +150,10 @@ type Connector struct {
 	// `blast` report false "no callers" for a common service-facade
 	// pattern.
 	fileExports map[string]map[string]string
+	// recv is the receiver-resolution index, alive only during resolveAndWire.
+	recv *recvIndex
+	// pyBindings: file -> names bound by that Python file's import statements.
+	pyBindings map[string]map[string]bool
 }
 
 // exportSpecRaw is one `export { local as exported }` specifier queued
@@ -757,7 +761,7 @@ func langFor(ext string) *langConfig {
 			(function_declaration name: (identifier) @func.name)
 			(method_declaration receiver: (parameter_list) @method.receiver name: (field_identifier) @func.name)
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (selector_expression field: (field_identifier) @call.sel))
+			(call_expression function: (selector_expression operand: (_) @call.selobj field: (field_identifier) @call.sel))
 			(import_spec path: (interpreted_string_literal) @import.path)
 			(comment) @loose.comment
 			`,
@@ -963,6 +967,7 @@ func langFor(ext string) *langConfig {
 			(call function: (identifier) @call.func)
 			(call function: (attribute object: (_) @call.selobj attribute: (identifier) @call.sel))
 			(import_statement name: (dotted_name) @import.path)
+			(import_statement name: (aliased_import name: (dotted_name) @import.path))
 			(import_from_statement module_name: (dotted_name) @import.path)
 			(import_from_statement module_name: (relative_import) @import.path)
 			(comment) @loose.comment
@@ -1520,9 +1525,17 @@ func isExportedName(ext, name string, declNode *sitter.Node, src []byte) (export
 
 // receiverTypeName extracts the type name from a Go receiver node like "(e *Engine)" → "Engine".
 func receiverTypeName(recvNode *sitter.Node, src []byte) string {
-	text := strings.Trim(recvNode.Content(src), "()")
+	return receiverTypeFromText(recvNode.Content(src))
+}
+
+// receiverTypeFromText extracts the type from a Go receiver parameter list text.
+func receiverTypeFromText(list string) string {
+	text := strings.Trim(list, "()")
 	parts := strings.Fields(text)
-	if len(parts) >= 2 {
+	if len(parts) >= 1 {
+		// `(s *Set[T])` has a name and a type; `(*Set[T])` and `(Set)` have only
+		// the type (an unused receiver may be left unnamed). Either way the type
+		// is the last token.
 		return strings.TrimPrefix(parts[len(parts)-1], "*")
 	}
 	return ""
@@ -1536,6 +1549,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	funcsByName := map[string][]string{}
 	c.namedImports = map[string]map[string]string{}
 	c.nsImports = map[string]map[string]string{}
+	c.pyBindings = map[string]map[string]bool{}
 
 	if c.tsconfigs == nil {
 		c.loadTSConfigs()
@@ -1710,6 +1724,9 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// declaration's doc comment (or the file's leading doc), so the
 		// loose-comment pass below doesn't re-emit them as floating comments.
 		consumed := map[int]bool{}
+		if ext == ".py" {
+			c.pyBindings[relPath] = pythonImportBindings(data)
+		}
 
 		// fileAttrs is the same map the file node's Attrs already points at
 		// (AddNode stores it by reference), so this mutation is visible on
@@ -1958,6 +1975,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			var callNode *sitter.Node
 			callName := ""
 			skipSameFileSelector := false
+			recvToken := ""
 			if cn, ok := caps["call.func"]; ok {
 				callNode, callName = cn, cn.Content(data)
 			} else if cn, ok := caps["call.sel"]; ok {
@@ -1977,7 +1995,12 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				// query node (not Go: its selector_expression's receiver
 				// name is an arbitrary variable, not a fixed keyword).
 				if objNode, ok := caps["call.selobj"]; ok && !isSelfReceiver(ext, objNode, data) {
-					skipSameFileSelector = true
+					// Go's receiver is an arbitrary variable name and its
+					// same-file match stays as it was; elsewhere it is dropped.
+					skipSameFileSelector = ext != ".go"
+					// Cross-file: "@Recv.method", resolved against imports and
+					// visible types in resolveReceiverCall (receiver.go).
+					recvToken = receiverToken(objNode, cn, data)
 				}
 			}
 			if callName != "" {
@@ -1997,9 +2020,17 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					if !skipSameFileSelector {
 						funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
 					}
+					if recvToken != "" {
+						funcs[bestIdx].calls = append(funcs[bestIdx].calls, recvToken)
+					}
 					callerFuncID = funcs[bestIdx].id
-				} else if !skipSameFileSelector {
-					topLevelCalls = append(topLevelCalls, callName)
+				} else {
+					if !skipSameFileSelector {
+						topLevelCalls = append(topLevelCalls, callName)
+					}
+					if recvToken != "" {
+						topLevelCalls = append(topLevelCalls, recvToken)
+					}
 				}
 				// Same capture doubles as the native-route probe (Go/Python
 				// registrations, routes_native.go) and, when that declines,
@@ -3427,6 +3458,8 @@ func (c *Connector) resolveExports(g *graph.Graph) {
 }
 
 func (c *Connector) resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
+	c.recv = buildRecvIndex(g)
+	defer func() { c.recv = nil }()
 	for i := range funcs {
 		fi := &funcs[i]
 
@@ -3470,6 +3503,13 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 			continue
 		}
 		seen[calledName] = true
+
+		if rest, ok := strings.CutPrefix(calledName, "@"); ok {
+			if recv, method, ok := strings.Cut(rest, "."); ok {
+				c.resolveReceiverCall(g, callerID, callerFile, recv, method)
+			}
+			continue
+		}
 
 		if rest, ok := strings.CutPrefix(calledName, "#"); ok {
 			// Namespace-import member call (NS.method(...)): resolve NS
