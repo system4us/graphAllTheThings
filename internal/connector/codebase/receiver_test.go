@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"graphallthethings/internal/graph"
 )
@@ -296,4 +297,62 @@ func TestTypedReceiverThroughThisField(t *testing.T) {
 		"src/main/kotlin/com/poc/App.kt":             "package com.poc\nimport com.poc.svc.UserService\nclass App(private val svc: UserService) { fun run(): Int = this.svc.find() }\n",
 	})
 	wantEdges(t, kt, "run->find@src/main/kotlin/com/poc/svc/UserService.kt")
+}
+
+// An incremental refresh re-parses only changed files: the receiver edges of a
+// changed caller must be rebuilt, and those of untouched callers must survive.
+func TestReceiverEdgesSurviveIncrementalUpdate(t *testing.T) {
+	tmp := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(tmp, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("src/main/java/com/poc/util/Helper.java", "package com.poc.util;\npublic class Helper { public static String hello() { return \"x\"; } public static String bye() { return \"y\"; } }\n")
+	write("src/main/java/com/poc/A.java", "package com.poc;\nimport com.poc.util.Helper;\npublic class A { public String run() { return Helper.hello(); } }\n")
+	write("src/main/java/com/poc/B.java", "package com.poc;\nimport com.poc.util.Helper;\npublic class B { public String run() { return Helper.hello(); } }\n")
+
+	c := New(tmp)
+	g, err := c.Extract(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges := func(g *graph.Graph) []string {
+		var out []string
+		for _, e := range g.Edges {
+			if e.Type == graph.EdgeCalls && e.Attrs["via"] == "receiver" {
+				out = append(out, g.Nodes[e.From].Attrs["file"]+"->"+g.Nodes[e.To].Name)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	wantEdges(t, edges(g), "src/main/java/com/poc/A.java->hello", "src/main/java/com/poc/B.java->hello")
+
+	// Change A so that it calls bye() instead; B is untouched.
+	write("src/main/java/com/poc/A.java", "package com.poc;\nimport com.poc.util.Helper;\npublic class A { public String run() { return Helper.bye(); } }\n")
+	future := time.Now().Add(time.Hour)
+	os.Chtimes(filepath.Join(tmp, "src/main/java/com/poc/A.java"), future, future)
+
+	g2, summary, err := New(tmp).Update(context.Background(), g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary == "" {
+		t.Fatal("Update saw no drift")
+	}
+	wantEdges(t, edges(g2), "src/main/java/com/poc/A.java->bye", "src/main/java/com/poc/B.java->hello")
+
+	// Now change the TARGET file (its functions are evicted and re-added): callers
+	// that did not change must keep pointing at the re-parsed functions.
+	write("src/main/java/com/poc/util/Helper.java", "package com.poc.util;\n// edited\npublic class Helper { public static String hello() { return \"x2\"; } public static String bye() { return \"y2\"; } }\n")
+	later := time.Now().Add(2 * time.Hour)
+	os.Chtimes(filepath.Join(tmp, "src/main/java/com/poc/util/Helper.java"), later, later)
+	g3, summary, err := New(tmp).Update(context.Background(), g2)
+	if err != nil || summary == "" {
+		t.Fatalf("second Update: %q %v", summary, err)
+	}
+	wantEdges(t, edges(g3), "src/main/java/com/poc/A.java->bye", "src/main/java/com/poc/B.java->hello")
 }

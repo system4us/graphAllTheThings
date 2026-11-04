@@ -437,7 +437,10 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	// Remember CALLS edges from surviving callers into functions of dirty
 	// files, so they can be re-attached to the re-parsed nodes (whose ids
 	// change when line numbers shift).
-	type relink struct{ from, name, file, typ string }
+	type relink struct {
+		from, name, file, typ string
+		attrs                 map[string]string // kept: via/receiver/inferred must survive a relink
+	}
 	var relinks []relink
 	// File↔file edges touching dirty file nodes: file ids are path-stable, so
 	// these can be re-added verbatim once the node is re-created. IMPORTS from
@@ -465,7 +468,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 			}
 		case graph.EdgeCalls:
 			if dirty[tn.Attrs["file"]] && !dirty[fn.Attrs["file"]] {
-				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls})
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls, e.Attrs})
 			}
 		case graph.EdgeMentions:
 			// Doc unchanged, target evicted: function ids shift with line
@@ -474,7 +477,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 				continue // dirty doc re-parses and re-emits its mentions
 			}
 			if dirty[tn.Attrs["file"]] && strings.HasPrefix(e.To, "func:") {
-				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions})
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions, e.Attrs})
 			} else if (strings.HasPrefix(e.To, "def:") && dirty[tn.Attrs["file"]]) ||
 				(tn.Type == graph.NodeFile && dirty[tn.Name]) {
 				fileEdgeRelinks = append(fileEdgeRelinks, e)
@@ -596,7 +599,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 		}
 		seenRelink[key] = true
 		if target := byFileName[r.file+"\x00"+r.name]; target != "" {
-			prev.AddEdge(r.from, target, r.typ, nil)
+			prev.AddEdge(r.from, target, r.typ, r.attrs)
 		}
 	}
 
