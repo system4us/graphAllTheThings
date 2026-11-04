@@ -356,3 +356,26 @@ func TestReceiverEdgesSurviveIncrementalUpdate(t *testing.T) {
 	}
 	wantEdges(t, edges(g3), "src/main/java/com/poc/A.java->bye", "src/main/java/com/poc/B.java->hello")
 }
+
+// Found on Elasticsearch: `routing` is a ShardRouting variable, and the caller also
+// imports a package whose directory is named `routing`. The package must not capture it.
+func TestJavaPackageNamedLikeAVariableDoesNotCaptureIt(t *testing.T) {
+	got := extractFiles(t, map[string]string{
+		"src/main/java/com/poc/routing/Shard.java": "package com.poc.routing;\npublic class Shard { public String index() { return \"s\"; } }\n",
+		"src/main/java/com/poc/routing/Table.java": "package com.poc.routing;\npublic class Table { public String index() { return \"t\"; } public String other() { return \"o\"; } }\n",
+		"src/main/java/com/poc/Use.java":           "package com.poc;\nimport com.poc.routing.Shard;\nimport com.poc.routing.Table;\npublic class Use { void m(Shard routing) { routing.index(); } }\n",
+	})
+	// Only the declared type's method, not every index() of the `routing` package.
+	wantEdges(t, got, "m->index@src/main/java/com/poc/routing/Shard.java")
+}
+
+// In Go a variable declared in the file shadows an imported package of that name.
+func TestGoVariableShadowsImportedPackage(t *testing.T) {
+	got := extractFiles(t, map[string]string{
+		"go.mod":       "module example.com/v\n\ngo 1.22\n",
+		"util/util.go": "package util\n\nfunc Helper() string { return \"x\" }\n",
+		"main.go":      "package main\n\nimport \"example.com/v/util\"\n\nfunc a() string { return util.Helper() }\nfunc b() string { util := makeThing(); return util.Helper() }\n",
+	})
+	// `util` is both an import and a local variable in this file: neither call is provable.
+	wantEdges(t, got)
+}

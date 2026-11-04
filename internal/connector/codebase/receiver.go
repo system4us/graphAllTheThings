@@ -276,8 +276,15 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 // pyMod the file each of its Python import bindings resolves to, types its declared variable types.
 func (ri *recvIndex) resolve(root, callerFile, recv, method string, namedImports map[string]string, pyMod map[string]string, types map[string]string) []string {
 	// Go: recv is the name of an imported local package -> a package-level function.
-	if ids := ri.packageFunc(callerFile, recv, method); len(ids) > 0 {
-		return ids
+	// Only Go qualifies a call with a package name (Java/C#/Kotlin cannot: there a
+	// directory named like a variable would capture it), and a variable declared in
+	// this file with the same name shadows the package.
+	if strings.HasSuffix(callerFile, ".go") {
+		if _, shadowed := types[recv]; !shadowed {
+			if ids := ri.packageFunc(callerFile, recv, method); len(ids) > 0 {
+				return ids
+			}
+		}
 	}
 
 	// recv is itself a type (static call), a JS/TS import binding or a Python module.
