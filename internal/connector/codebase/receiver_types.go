@@ -62,6 +62,22 @@ func declQueryFor(ext string) string {
 		(variable_declarator name: (identifier) @decl.any)
 		(arrow_function parameter: (identifier) @decl.any)
 		`
+	case ".py":
+		// Python has no declared types worth trusting, but every binding of a name
+		// is needed: a parameter or local that shares its name with an imported
+		// module shadows it, so the module reading of `name.f()` is then ambiguous.
+		return `
+		(parameters (identifier) @decl.any)
+		(typed_parameter (identifier) @decl.any)
+		(default_parameter name: (identifier) @decl.any)
+		(typed_default_parameter name: (identifier) @decl.any)
+		(assignment left: (identifier) @decl.any)
+		(augmented_assignment left: (identifier) @decl.any)
+		(for_statement left: (identifier) @decl.any)
+		(for_in_clause left: (identifier) @decl.any)
+		(lambda_parameters (identifier) @decl.any)
+		(named_expression name: (identifier) @decl.any)
+		`
 	case ".go":
 		return `
 		(parameter_declaration name: (identifier) @decl.name type: (_) @decl.type)

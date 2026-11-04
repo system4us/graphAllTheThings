@@ -475,3 +475,23 @@ func TestCSharpNamespaceVisibilityAndIncrementalUpdate(t *testing.T) {
 	}
 	wantEdges(t, edges(g2), want...)
 }
+
+// A Python parameter (or local) with the same name as an imported module shadows it.
+func TestPythonLocalShadowsImportedModule(t *testing.T) {
+	got := extractFiles(t, map[string]string{
+		"pkg/__init__.py": "",
+		"pkg/graph.py":    "def add_node(n):\n    return n\n",
+		"use.py": "from pkg import graph\n\n" +
+			"def uses_module():\n    return graph.add_node(1)\n\n" +
+			"def uses_param(graph):\n    return graph.add_node(2)\n",
+	})
+	// `graph` is both the module and a parameter name in this file: neither call is provable.
+	wantEdges(t, got)
+
+	clean := extractFiles(t, map[string]string{
+		"pkg/__init__.py": "",
+		"pkg/graph.py":    "def add_node(n):\n    return n\n",
+		"use.py":          "from pkg import graph\n\ndef uses_module():\n    return graph.add_node(1)\n",
+	})
+	wantEdges(t, clean, "uses_module->add_node@pkg/graph.py")
+}

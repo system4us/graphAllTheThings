@@ -345,6 +345,13 @@ func (ri *recvIndex) resolve(root, callerFile, recv, method string, namedImports
 		}
 	}
 
+	// Python: a parameter or local of this name shadows an imported module/class.
+	if strings.HasSuffix(callerFile, ".py") {
+		if _, shadowed := types[recv]; shadowed {
+			return nil
+		}
+	}
+
 	// recv is itself a type (static call), a JS/TS import binding or a Python module.
 	defs := ri.visibleDefs(callerFile, recv, pyMod)
 	files := map[string]bool{}
