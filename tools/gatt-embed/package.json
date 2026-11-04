@@ -13,5 +13,6 @@
   "scripts": {
     "postinstall": "node prune.mjs"
   },
-  "license": "AGPL-3.0-or-later"
+  "license": "AGPL-3.0-or-later",
+  "author": "Leandro Fusco <leandrofusdev@gmail.com>"
 }
