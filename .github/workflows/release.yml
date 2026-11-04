@@ -20,7 +20,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             goos: darwin
             goarch: amd64
           - runner: macos-latest
@@ -65,3 +65,21 @@ jobs:
             dist/gatt-*
             dist/checksums.txt
           generate_release_notes: true
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/npm-publish.mjs "${GITHUB_REF_NAME#v}" dist
