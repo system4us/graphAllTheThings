@@ -212,8 +212,7 @@ func (g *Graph) AddNode(n *Node) {
 	if n.Attrs == nil {
 		n.Attrs = map[string]string{}
 	}
-	g.Nodes[n.ID] = n
-	g.adj = nil
+	g.Nodes[n.ID] = n // adj indexes edges only, so a new node never invalidates it
 	if g.journal != nil {
 		g.journal.addedNodes[n.ID] = true
 	}
@@ -222,7 +221,16 @@ func (g *Graph) AddNode(n *Node) {
 func (g *Graph) AddEdge(from, to, typ string, attrs map[string]string) {
 	e := Edge{From: from, To: to, Type: typ, Attrs: attrs}
 	g.Edges = append(g.Edges, e)
-	g.adj = nil
+	// Keep a built adjacency index in sync instead of dropping it: callers that
+	// interleave EdgesOf with AddEdge (resolveAndWire) would otherwise rebuild
+	// the whole index per call, which is quadratic on large graphs.
+	if g.adj != nil {
+		i := len(g.Edges) - 1
+		g.adj[from] = append(g.adj[from], i)
+		if to != from { // self-loop recorded once, as in buildAdj
+			g.adj[to] = append(g.adj[to], i)
+		}
+	}
 	if g.journal != nil {
 		g.journal.addedEdges = append(g.journal.addedEdges, e)
 	}

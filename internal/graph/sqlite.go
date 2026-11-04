@@ -211,28 +211,49 @@ func applyDelta(tx *sql.Tx, g *Graph, j *journal) error {
 		}
 	}
 
-	fd, err := tx.Prepare(`DELETE FROM fts WHERE id = ?`)
+	// fts.id is UNINDEXED, so `DELETE FROM fts WHERE id = ?` scans the whole
+	// table. One per changed node is quadratic on a large refresh; delete the
+	// whole set in a single statement (one scan) instead.
+	if _, err := tx.Exec(`CREATE TEMP TABLE IF NOT EXISTS fts_stale(id TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM fts_stale`); err != nil {
+		return err
+	}
+	ins, err := tx.Prepare(`INSERT OR IGNORE INTO fts_stale(id) VALUES(?)`)
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
+	defer ins.Close()
+	for id := range j.removedNodes {
+		if _, err := ins.Exec(id); err != nil {
+			return err
+		}
+	}
+	for id := range j.addedNodes {
+		if g.Nodes[id] == nil {
+			continue
+		}
+		if _, err := ins.Exec(id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM fts WHERE id IN (SELECT id FROM fts_stale)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE fts_stale`); err != nil {
+		return err
+	}
+
 	fi, err := tx.Prepare(`INSERT INTO fts(id,type,text) VALUES(?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer fi.Close()
-	for id := range j.removedNodes {
-		if _, err := fd.Exec(id); err != nil {
-			return err
-		}
-	}
 	for id := range j.addedNodes {
 		n := g.Nodes[id]
 		if n == nil {
 			continue
-		}
-		if _, err := fd.Exec(id); err != nil {
-			return err
 		}
 		if _, err := fi.Exec(id, n.Type, g.NodeText(id)); err != nil {
 			return err
