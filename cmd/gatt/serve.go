@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -57,6 +58,15 @@ type coalescer struct {
 	last    *syncStatus
 	work    func() syncStatus
 	done    chan struct{} // closed-and-replaced after each pass (tests wait on it)
+
+	// Progress of the embedding step of the running pass (0/0 when idle).
+	pDone, pTotal atomic.Int64
+}
+
+// SetProgress records embedding progress for GET /status.
+func (c *coalescer) SetProgress(done, total int) {
+	c.pDone.Store(int64(done))
+	c.pTotal.Store(int64(total))
 }
 
 func newCoalescer(work func() syncStatus) *coalescer {
@@ -80,6 +90,7 @@ func (c *coalescer) Trigger() string {
 func (c *coalescer) loop() {
 	for {
 		st := c.work()
+		c.SetProgress(0, 0)
 		c.mu.Lock()
 		c.last = &st
 		old := c.done
@@ -145,7 +156,11 @@ func newServeHandler(c *coalescer) http.Handler {
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		running, queued, last := c.Status()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"running": running, "queued": queued, "last": last})
+		out := map[string]any{"running": running, "queued": queued, "last": last}
+		if running && c.pTotal.Load() > 0 {
+			out["progress"] = map[string]int64{"done": c.pDone.Load(), "total": c.pTotal.Load()}
+		}
+		json.NewEncoder(w).Encode(out)
 	})
 	return guard(mux)
 }
@@ -189,7 +204,9 @@ func cmdServe(ctx context.Context, args []string) error {
 			sc.embModel = w.Model
 		}
 	}
-	c := newCoalescer(func() syncStatus { return syncOnce(passCtx, sc) })
+	var c *coalescer
+	c = newCoalescer(func() syncStatus { return syncOnce(passCtx, sc) })
+	sc.progress = c.SetProgress
 	srv := &http.Server{Addr: *addr, Handler: newServeHandler(c), ReadHeaderTimeout: 5 * time.Second}
 
 	sig := make(chan os.Signal, 1)
@@ -218,6 +235,8 @@ type syncConfig struct {
 	// safe with a local embedder (--onnx): with a remote or slow one, the first
 	// full embedding would be a surprise, so it stays an explicit `gatt index`.
 	initIndex bool
+	// progress, if set, is called after each embedded batch.
+	progress func(done, total int)
 }
 
 // syncOnce is one background pass: refresh the graph, then catch the vectors up.
@@ -254,7 +273,7 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 		st.Note = fmt.Sprintf("vectors were built with %q, not %q; skipped (run `gatt index --full` to switch)", stored, model)
 		return st
 	}
-	r, err := indexer.Reindex(ctx, g, vs, embed.New(embURL, model), model, false, nil)
+	r, err := indexer.Reindex(ctx, g, vs, embed.New(embURL, model), model, false, c.progress)
 	if err != nil {
 		st.Note = "embedding skipped: " + err.Error() // an unreachable embedder is not fatal
 		return st

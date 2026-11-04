@@ -178,7 +178,7 @@ gatt index                             # re-embed only the nodes whose text chan
 Queries refresh the *graph* (cheap) but never embed. Vectors catch up in the background:
 
 ```sh
-(cd tools/gatt-embed && npm install)      # once: local ONNX worker (Node >= 18)
+(cd tools/gatt-embed && npm install)      # once: local ONNX worker (Node >= 18); a postinstall prune leaves ~120 MB
 gatt serve --onnx tools/gatt-embed        # keeps graph + vectors fresh, starts/stops the worker
 export GATT_EMBED_URL=http://127.0.0.1:7801/v1   # so queries embed with the same model
 ```
@@ -191,6 +191,7 @@ Wire the agent's hook to `gatt notify` (silent, exits 0 when nothing is listenin
 
 - **`serve`** listens on `127.0.0.1:7788` (`POST /refresh`, `GET /status`), rejects non-loopback `Host` and any `Origin` header, and coalesces a burst of hooks into one extra pass. Each pass re-parses drifted files and re-embeds only nodes whose text hash changed.
 - **`--onnx`** runs `tools/gatt-embed`: `@huggingface/transformers` + ONNX Runtime on CPU, an OpenAI-compatible `/v1/embeddings`. The default model (multilingual MiniLM, 384-d) is downloaded on first use (~130 MB) and cached. Any other server works with `--embed-url http://host:port/v1` (TEI, llama.cpp, LM Studio) or Ollama (default).
+- **Speed:** ~60 nodes/s on 12 cores; a 21,830-node graph embeds in ~5 min once, then each hook pass is incremental (a no-change pass over that graph takes ~3 s, mostly loading `vectors.json`). Texts are truncated to 128 tokens (what the model was trained on) and embedded in length-sorted sub-batches, because padding to the longest text made one long node slow its whole batch 7x. `GET /status` shows `progress` while it runs. Tunables: `GATT_EMBED_MAX_TOKENS`, `GATT_EMBED_SUB_BATCH`.
 - The model name is stored next to the vectors; a different model is refused rather than silently replacing the index (`gatt index --full` to switch).
 - `gatt serve --no-embed` refreshes the graph only.
 

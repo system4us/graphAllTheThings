@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -193,5 +194,38 @@ func TestOnnxWorkerLifecycle(t *testing.T) {
 func TestOnnxWorkerBadPath(t *testing.T) {
 	if _, err := startOnnxWorker(context.Background(), "/nonexistent/dir", 7999, ""); err == nil {
 		t.Error("expected an error for a missing worker path")
+	}
+}
+
+func TestStatusReportsProgressWhileRunning(t *testing.T) {
+	gate := make(chan struct{})
+	var c *coalescer
+	c = newCoalescer(func() syncStatus {
+		c.SetProgress(30, 100)
+		<-gate
+		return syncStatus{}
+	})
+	srv := httptest.NewServer(newServeHandler(c))
+	defer srv.Close()
+	c.Trigger()
+	waitFor(t, func() bool { return c.pTotal.Load() == 100 })
+
+	resp, err := http.Get(srv.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Running  bool                        `json:"running"`
+		Progress struct{ Done, Total int64 } `json:"progress"`
+	}
+	json.NewDecoder(resp.Body).Decode(&got)
+	resp.Body.Close()
+	if !got.Running || got.Progress.Done != 30 || got.Progress.Total != 100 {
+		t.Errorf("status = %+v, want running with 30/100", got)
+	}
+	close(gate)
+	waitFor(t, func() bool { r, _, _ := c.Status(); return !r })
+	if c.pTotal.Load() != 0 {
+		t.Error("progress not reset after the pass")
 	}
 }

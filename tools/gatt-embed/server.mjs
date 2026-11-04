@@ -16,6 +16,12 @@ const opt = (name, dflt) => {
 const MODEL = opt('model', process.env.GATT_EMBED_MODEL || 'Xenova/paraphrase-multilingual-MiniLM-L12-v2');
 const PORT = Number(opt('port', process.env.GATT_EMBED_PORT || 0));
 const MAX_BODY = 8 * 1024 * 1024;
+// Padding dominates cost: a batch is padded to its longest text, so one long
+// text slows all its neighbours (64 x 400 chars: 1.3s; plus one 4500-char text: 8.8s).
+// Two guards: truncate to the length the model was trained on, and embed in
+// length-sorted sub-batches so short texts never pay for long ones.
+const MAX_TOKENS = Number(process.env.GATT_EMBED_MAX_TOKENS || 128);
+const SUB_BATCH = Number(process.env.GATT_EMBED_SUB_BATCH || 16);
 const MAX_BATCH = 256;
 if (process.env.GATT_EMBED_CACHE) env.cacheDir = process.env.GATT_EMBED_CACHE;
 
@@ -23,7 +29,8 @@ let extractor = null; // loaded lazily so /health answers while the model downlo
 let loading = null;
 let loadError = null;
 const load = () => (loading ??= pipeline('feature-extraction', MODEL, { dtype: 'q8' })
-  .then((p) => { extractor = p; })
+  .then((p) => { p.tokenizer._tokenizerConfig.model_max_length = MAX_TOKENS; // getter-only, so set the backing config (dependency version is pinned)
+    extractor = p; })
   .catch((e) => { loadError = String(e?.message || e); loading = null; throw e; }));
 
 const loopback = (host) => ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host);
@@ -54,11 +61,15 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: { message: `input must be 1..${MAX_BATCH} strings` } });
       }
       await load();
-      const out = await extractor(input, { pooling: 'mean', normalize: true });
-      const [n, dim] = out.dims;
-      const data = [];
-      for (let i = 0; i < n; i++) {
-        data.push({ object: 'embedding', index: i, embedding: Array.from(out.data.subarray(i * dim, (i + 1) * dim)) });
+      const order = input.map((_, i) => i).sort((a, b) => input[a].length - input[b].length);
+      const data = new Array(input.length);
+      for (let i = 0; i < order.length; i += SUB_BATCH) {
+        const idx = order.slice(i, i + SUB_BATCH);
+        const out = await extractor(idx.map((j) => input[j]), { pooling: 'mean', normalize: true });
+        const dim = out.dims[1];
+        idx.forEach((j, k) => {
+          data[j] = { object: 'embedding', index: j, embedding: Array.from(out.data.subarray(k * dim, (k + 1) * dim)) };
+        });
       }
       return json(res, 200, { object: 'list', model: MODEL, data });
     } catch (e) {
