@@ -1340,7 +1340,7 @@ func emitLooseComments(g *graph.Graph, comments []*sitter.Node, consumed map[int
 		}
 		name := text
 		if len(name) > 60 {
-			name = name[:60] + "…"
+			name = truncateUTF8(name, 60) + "…"
 		}
 		id := fmt.Sprintf("comment:%s:%d", relPath, bl.startLine)
 		g.AddNode(&graph.Node{
@@ -3488,4 +3488,17 @@ func findProject(g *graph.Graph, path string, root string) string {
 		return id
 	}
 	return ""
+}
+
+// truncateUTF8 shortens s to at most max bytes without cutting a multi-byte
+// character in half. Slicing by bytes (s[:max]) produced invalid UTF-8 in 84
+// comment names on Elasticsearch, which other tools then fail to decode.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
