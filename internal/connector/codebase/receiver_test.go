@@ -379,3 +379,15 @@ func TestGoVariableShadowsImportedPackage(t *testing.T) {
 	// `util` is both an import and a local variable in this file: neither call is provable.
 	wantEdges(t, got)
 }
+
+// Same Java shape, but `routing` is an inherited field: nothing in the caller's file
+// declares it, so only "package-qualified receivers are Go-only" keeps the imported
+// package `routing` from capturing it.
+func TestJavaImportedPackageNeverQualifiesACall(t *testing.T) {
+	got := extractFiles(t, map[string]string{
+		"src/main/java/com/poc/routing/Table.java": "package com.poc.routing;\npublic class Table { public String index() { return \"t\"; } }\n",
+		"src/main/java/com/poc/Base.java":          "package com.poc;\npublic class Base { protected Object routing; }\n",
+		"src/main/java/com/poc/Use.java":           "package com.poc;\nimport com.poc.routing.Table;\npublic class Use extends Base { void m() { routing.index(); } }\n",
+	})
+	wantEdges(t, got)
+}
