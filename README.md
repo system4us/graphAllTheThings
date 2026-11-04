@@ -116,7 +116,7 @@ The agent-workflow commands:
 - **`gatt doc-drift`** — which documentation lies: markdown docs whose inline-code references no longer resolve (a symbol deleted/renamed, a cited file moved) or point at code whose last git commit postdates the doc's. Run it after refactors to get the list of docs needing an update, and before trusting a doc.
 - **`gatt diff [ref]`** — structural diff of the working tree against a git ref (default `HEAD`): added/removed/changed/renamed/moved functions and types, detected by matching signatures across two extractions (not a textual diff), plus the current callers of anything that changed. Reuses git's own rename detection (`git diff -M`) for whole-file renames; function-level renames/moves are a same-file (then cross-file) signature-match heuristic.
 
-**Never stale:** every query command (and the MCP server) checks file mtimes before answering (~60ms), re-parses only the files that changed since the last extract, evicts deleted entities, re-wires cross-file edges (calls, imports, mentions, associations, route models), and re-embeds just the changed nodes. Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exceptions that refresh only on full re-extract: `CO_CHANGED` edges — git history has no incremental delta worth mining — and `CALLS_ENDPOINT` edges from files that didn't themselves change.)
+**Never stale:** every query command (and the MCP server) checks file mtimes before answering (~60ms), re-parses only the files that changed since the last extract, evicts deleted entities, re-wires cross-file edges (calls, imports, mentions, associations, route models), and re-embeds just the changed nodes — by default only via `gatt serve` / `gatt index` (see *Background refresh*), so a query never waits on an embedding server (`GATT_EMBED_ON_REFRESH=1` restores the old inline behaviour). Wrong line numbers are worse than no graph, so you never re-run `extract` by hand mid-session. (Exceptions that refresh only on full re-extract: `CO_CHANGED` edges — git history has no incremental delta worth mining — and `CALLS_ENDPOINT` edges from files that didn't themselves change.)
 
 ### Semantic overlay (`.gatt/`)
 
@@ -172,6 +172,27 @@ gatt index                             # re-embed only the nodes whose text chan
 - **Codebase graphs refresh themselves.** `code-query`, `impact`, and the MCP server detect changed files by mtime and re-parse only those before answering — no manual re-extract.
 - **Re-extraction is non-destructive to curated knowledge.** Annotations live in their sidecar and are re-applied on load; if a re-extract removes a node an annotation targeted, you get a warning naming the orphaned annotation. The `.gatt/` overlay is merged fresh on every extract.
 - **Re-indexing is incremental.** `index` reuses cached vectors for nodes whose embedding text is unchanged (content-hashed) and only embeds what actually moved — so re-indexing a 113-table CRM after a one-column migration embeds two nodes, not two thousand.
+
+## Background refresh and local ONNX embeddings
+
+Queries refresh the *graph* (cheap) but never embed. Vectors catch up in the background:
+
+```sh
+(cd tools/gatt-embed && npm install)      # once: local ONNX worker (Node >= 18)
+gatt serve --onnx tools/gatt-embed        # keeps graph + vectors fresh, starts/stops the worker
+export GATT_EMBED_URL=http://127.0.0.1:7801/v1   # so queries embed with the same model
+```
+
+Wire the agent's hook to `gatt notify` (silent, exits 0 when nothing is listening, so it can never fail a hook):
+
+```json
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"gatt notify"}]}]}}
+```
+
+- **`serve`** listens on `127.0.0.1:7788` (`POST /refresh`, `GET /status`), rejects non-loopback `Host` and any `Origin` header, and coalesces a burst of hooks into one extra pass. Each pass re-parses drifted files and re-embeds only nodes whose text hash changed.
+- **`--onnx`** runs `tools/gatt-embed`: `@huggingface/transformers` + ONNX Runtime on CPU, an OpenAI-compatible `/v1/embeddings`. The default model (multilingual MiniLM, 384-d) is downloaded on first use (~130 MB) and cached. Any other server works with `--embed-url http://host:port/v1` (TEI, llama.cpp, LM Studio) or Ollama (default).
+- The model name is stored next to the vectors; a different model is refused rather than silently replacing the index (`gatt index --full` to switch).
+- `gatt serve --no-embed` refreshes the graph only.
 
 ## MCP tools
 
