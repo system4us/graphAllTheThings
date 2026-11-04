@@ -226,7 +226,7 @@ func (c *Connector) wireStyles(g *graph.Graph) {
 			existing[fromID+"\x00"+cssID] = true
 			list := strings.Join(cls, ",")
 			if len(list) > 200 {
-				list = list[:200] + "…"
+				list = truncateUTF8(list, 200) + "…"
 			}
 			g.AddEdge(fromID, cssID, graph.EdgeUsesStyle, map[string]string{"selectors": list})
 		}

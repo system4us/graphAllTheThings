@@ -62,6 +62,7 @@ Only nodes whose text changed are re-embedded: on a 21,830-node graph the first 
 | [Command reference](docs/cli.md) | every query command with examples |
 | [MCP tools](docs/mcp-tools.md) | what the agent can call |
 | [Embeddings and background refresh](docs/embeddings.md) | backends, `serve`, hook setup, performance, env vars |
+| [The call graph](docs/call-graph.md) | what a `CALLS` edge means, what is left out, measured accuracy |
 | [Codebase graphs](docs/codebase-graphs.md) | impact/blast/routes/models/doc-drift, the `.gatt/` overlay |
 | [Annotations and freshness](docs/annotations-and-freshness.md) | curated business knowledge, drift checks |
 | [Graph model](docs/graph-model.md) | node and edge types per source |

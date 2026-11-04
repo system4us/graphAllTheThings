@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"time"
 
@@ -61,6 +62,15 @@ func main() {
 		os.Exit(2)
 	}
 	ctx := context.Background()
+	// GATT_CPUPROFILE=file writes a CPU profile of the whole command
+	// (`go tool pprof file`), to find where a slow extraction spends its time.
+	if path := os.Getenv("GATT_CPUPROFILE"); path != "" {
+		if f, err := os.Create(path); err == nil {
+			if pprof.StartCPUProfile(f) == nil {
+				stopProfile = func() { pprof.StopCPUProfile(); f.Close() }
+			}
+		}
+	}
 	var err error
 	switch os.Args[1] {
 	case "extract":
@@ -115,11 +125,16 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	stopProfile()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
+
+// stopProfile flushes the optional CPU profile; it is a no-op unless
+// GATT_CPUPROFILE was set. Called before every os.Exit that follows real work.
+var stopProfile = func() {}
 
 func usage() {
 	fmt.Fprint(os.Stderr, `gatt — turn any source's metadata into a semantic graph for AI agents
@@ -1066,10 +1081,10 @@ func cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 	files := map[string]string{
-		"gatt.spec.json": "{\n  \"version\": \"1.0\",\n  \"project\": \"\",\n  \"namespaces\": [],\n  \"manifests\": {\n    \"definitions\": \"./definitions.json\",\n    \"relations\": \"./relations.json\",\n    \"contracts\": \"./contracts.json\"\n  }\n}",
+		"gatt.spec.json":   "{\n  \"version\": \"1.0\",\n  \"project\": \"\",\n  \"namespaces\": [],\n  \"manifests\": {\n    \"definitions\": \"./definitions.json\",\n    \"relations\": \"./relations.json\",\n    \"contracts\": \"./contracts.json\"\n  }\n}",
 		"definitions.json": "{\n  \"entities\": {}\n}",
-		"relations.json": "{\n  \"features\": []\n}",
-		"contracts.json": "{\n  \"api\": {},\n  \"database\": {}\n}",
+		"relations.json":   "{\n  \"features\": []\n}",
+		"contracts.json":   "{\n  \"api\": {},\n  \"database\": {}\n}",
 		"prompt.md": `# GATT Initialization Directive
 
 You have been invoked to initialize the .gatt/ semantic graph for this repository. 
@@ -1330,4 +1345,3 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 	fmt.Print(out)
 	return nil
 }
-

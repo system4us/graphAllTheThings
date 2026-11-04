@@ -86,6 +86,11 @@ type Connector struct {
 	// every file's own package declaration first. Loaded lazily.
 	jvmSourceRoots []string
 	jvmRootsLoaded bool
+	// jvmDirIndex maps a directory path relative to a source root ("" = the root
+	// itself) to the indexes, in jvmSourceRoots order, of the roots that contain it.
+	// Built once in loadJVMRoots so resolving an import is a map lookup instead of
+	// two os.Stat calls per root (Elasticsearch: 537 roots x 556k imports).
+	jvmDirIndex map[string][]int
 	// csharpRoots holds one entry per .csproj found in the tree (its
 	// directory + root namespace) plus a namespace-less fallback rooted at
 	// the extraction root, used to resolve `using X.Y.Z;` best-effort (C#
@@ -145,6 +150,13 @@ type Connector struct {
 	// `blast` report false "no callers" for a common service-facade
 	// pattern.
 	fileExports map[string]map[string]string
+	// recv is the receiver-resolution index, alive only during resolveAndWire.
+	recv *recvIndex
+	// pyBindings: file -> name bound by a Python import -> the file that import
+	// resolves to ("" when it resolves to no local file, e.g. the stdlib).
+	pyBindings map[string]map[string]string
+	// fileTypes: file -> variable/parameter/field name -> declared type name.
+	fileTypes map[string]map[string]string
 }
 
 // exportSpecRaw is one `export { local as exported }` specifier queued
@@ -311,6 +323,9 @@ func (c *Connector) scanFiles() map[string]string {
 		if gitOK && !gitFiles[rel] {
 			return nil
 		}
+		if !readableFile(path, d) {
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			return nil
@@ -326,6 +341,20 @@ func (c *Connector) scanFiles() map[string]string {
 		return nil
 	})
 	return out
+}
+
+// readableFile reports whether a directory entry is something parseFiles can
+// read as a file: a regular file, or a symlink that resolves to one. Symlinks to
+// directories (swift-package-manager's Fixtures/.../packageD -> ../Direct/CFoo)
+// and dangling symlinks fail os.ReadFile, so parseFiles gives them no node; the
+// drift scan must not count them either, or it sees a "new" file on every query
+// and re-parses it forever.
+func readableFile(path string, d fs.DirEntry) bool {
+	if d.Type().IsRegular() {
+		return true
+	}
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
 }
 
 // HasDrift cheaply reports whether any parseable file changed, appeared, or
@@ -408,7 +437,10 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	// Remember CALLS edges from surviving callers into functions of dirty
 	// files, so they can be re-attached to the re-parsed nodes (whose ids
 	// change when line numbers shift).
-	type relink struct{ from, name, file, typ string }
+	type relink struct {
+		from, name, file, typ string
+		attrs                 map[string]string // kept: via/receiver/inferred must survive a relink
+	}
 	var relinks []relink
 	// File↔file edges touching dirty file nodes: file ids are path-stable, so
 	// these can be re-added verbatim once the node is re-created. IMPORTS from
@@ -436,7 +468,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 			}
 		case graph.EdgeCalls:
 			if dirty[tn.Attrs["file"]] && !dirty[fn.Attrs["file"]] {
-				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls})
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls, e.Attrs})
 			}
 		case graph.EdgeMentions:
 			// Doc unchanged, target evicted: function ids shift with line
@@ -445,7 +477,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 				continue // dirty doc re-parses and re-emits its mentions
 			}
 			if dirty[tn.Attrs["file"]] && strings.HasPrefix(e.To, "func:") {
-				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions})
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions, e.Attrs})
 			} else if (strings.HasPrefix(e.To, "def:") && dirty[tn.Attrs["file"]]) ||
 				(tn.Type == graph.NodeFile && dirty[tn.Name]) {
 				fileEdgeRelinks = append(fileEdgeRelinks, e)
@@ -567,7 +599,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 		}
 		seenRelink[key] = true
 		if target := byFileName[r.file+"\x00"+r.name]; target != "" {
-			prev.AddEdge(r.from, target, r.typ, nil)
+			prev.AddEdge(r.from, target, r.typ, r.attrs)
 		}
 	}
 
@@ -717,6 +749,9 @@ type langConfig struct {
 	// Line ranges come from navigating cap.Node.Parent() to the declaration node.
 	queryStr string
 	query    *sitter.Query // compiled once in parseFiles, reused per file
+	// declQuery collects declared variable types (receiver_types.go); nil when
+	// the language has none or its pattern failed to compile.
+	declQuery *sitter.Query
 }
 
 func langFor(ext string) *langConfig {
@@ -735,7 +770,7 @@ func langFor(ext string) *langConfig {
 			(function_declaration name: (identifier) @func.name)
 			(method_declaration receiver: (parameter_list) @method.receiver name: (field_identifier) @func.name)
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (selector_expression field: (field_identifier) @call.sel))
+			(call_expression function: (selector_expression operand: (_) @call.selobj field: (field_identifier) @call.sel))
 			(import_spec path: (interpreted_string_literal) @import.path)
 			(comment) @loose.comment
 			`,
@@ -941,6 +976,7 @@ func langFor(ext string) *langConfig {
 			(call function: (identifier) @call.func)
 			(call function: (attribute object: (_) @call.selobj attribute: (identifier) @call.sel))
 			(import_statement name: (dotted_name) @import.path)
+			(import_statement name: (aliased_import name: (dotted_name) @import.path))
 			(import_from_statement module_name: (dotted_name) @import.path)
 			(import_from_statement module_name: (relative_import) @import.path)
 			(comment) @loose.comment
@@ -1335,7 +1371,7 @@ func emitLooseComments(g *graph.Graph, comments []*sitter.Node, consumed map[int
 		}
 		name := text
 		if len(name) > 60 {
-			name = name[:60] + "…"
+			name = truncateUTF8(name, 60) + "…"
 		}
 		id := fmt.Sprintf("comment:%s:%d", relPath, bl.startLine)
 		g.AddNode(&graph.Node{
@@ -1498,9 +1534,17 @@ func isExportedName(ext, name string, declNode *sitter.Node, src []byte) (export
 
 // receiverTypeName extracts the type name from a Go receiver node like "(e *Engine)" → "Engine".
 func receiverTypeName(recvNode *sitter.Node, src []byte) string {
-	text := strings.Trim(recvNode.Content(src), "()")
+	return receiverTypeFromText(recvNode.Content(src))
+}
+
+// receiverTypeFromText extracts the type from a Go receiver parameter list text.
+func receiverTypeFromText(list string) string {
+	text := strings.Trim(list, "()")
 	parts := strings.Fields(text)
-	if len(parts) >= 2 {
+	if len(parts) >= 1 {
+		// `(s *Set[T])` has a name and a type; `(*Set[T])` and `(Set)` have only
+		// the type (an unused receiver may be left unnamed). Either way the type
+		// is the last token.
 		return strings.TrimPrefix(parts[len(parts)-1], "*")
 	}
 	return ""
@@ -1514,6 +1558,8 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	funcsByName := map[string][]string{}
 	c.namedImports = map[string]map[string]string{}
 	c.nsImports = map[string]map[string]string{}
+	c.pyBindings = map[string]map[string]string{}
+	c.fileTypes = map[string]map[string]string{}
 
 	if c.tsconfigs == nil {
 		c.loadTSConfigs()
@@ -1537,6 +1583,13 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			continue
 		}
 		lc.query = q
+		if ds := declQueryFor(ext); ds != "" {
+			if dq, err := sitter.NewQuery([]byte(ds), lc.lang); err == nil {
+				lc.declQuery = dq
+			} else {
+				fmt.Fprintf(os.Stderr, "gatt: %s declaration query failed to compile, typed receivers off: %v\n", ext, err)
+			}
+		}
 		compiledLangs[ext] = lc
 	}
 
@@ -1558,8 +1611,16 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		if gitOK && !gitFiles[relPath] {
 			return nil
 		}
+		if !readableFile(path, d) {
+			return nil // same gate as scanFiles, so drift detection stays consistent
+		}
 		projID := findProject(g, path, c.dir)
 		fileID := "file:" + path
+		// Functions of this file are appended after everything seen so far, so a
+		// call can only be attributed to a function at index >= fileStart. Scanning
+		// all of funcs for every call made extraction quadratic (Django: 40% of the
+		// time; Elasticsearch: hours).
+		fileStart := len(funcs)
 
 		mtime := ""
 		var size int64
@@ -1680,6 +1741,29 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// declaration's doc comment (or the file's leading doc), so the
 		// loose-comment pass below doesn't re-emit them as floating comments.
 		consumed := map[int]bool{}
+		if ext == ".py" {
+			bound := map[string]string{}
+			for name, cands := range pythonImportBindings(data) {
+				bound[name] = ""
+				for _, spec := range cands {
+					if f := c.pyModuleFile(path, spec); f != "" {
+						bound[name] = f
+						break
+					}
+				}
+			}
+			c.pyBindings[relPath] = bound
+		}
+		if lc.declQuery != nil {
+			c.fileTypes[relPath] = collectDecls(tree, lc.declQuery, data)
+		}
+		if ext == ".cs" {
+			// Persisted on the file node so an incremental refresh still knows the
+			// namespaces of files it does not re-parse.
+			ns := parseCSharpNamespaces(data)
+			fileAttrs["cs_declared"] = strings.Join(ns.declared, " ")
+			fileAttrs["cs_uses"] = strings.Join(ns.uses, " ")
+		}
 
 		// fileAttrs is the same map the file node's Attrs already points at
 		// (AddNode stores it by reference), so this mutation is visible on
@@ -1928,6 +2012,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			var callNode *sitter.Node
 			callName := ""
 			skipSameFileSelector := false
+			recvToken := ""
 			if cn, ok := caps["call.func"]; ok {
 				callNode, callName = cn, cn.Content(data)
 			} else if cn, ok := caps["call.sel"]; ok {
@@ -1947,7 +2032,12 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				// query node (not Go: its selector_expression's receiver
 				// name is an arbitrary variable, not a fixed keyword).
 				if objNode, ok := caps["call.selobj"]; ok && !isSelfReceiver(ext, objNode, data) {
-					skipSameFileSelector = true
+					// Go's receiver is an arbitrary variable name and its
+					// same-file match stays as it was; elsewhere it is dropped.
+					skipSameFileSelector = ext != ".go"
+					// Cross-file: "@Recv.method", resolved against imports and
+					// visible types in resolveReceiverCall (receiver.go).
+					recvToken = receiverToken(objNode, cn, data)
 				}
 			}
 			if callName != "" {
@@ -1955,7 +2045,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				// contains the call site.
 				callLine := int(callNode.StartPoint().Row) + 1
 				bestIdx := -1
-				for i := range funcs {
+				for i := fileStart; i < len(funcs); i++ {
 					if funcs[i].file == relPath && funcs[i].lineStart <= callLine {
 						if bestIdx == -1 || funcs[i].lineStart > funcs[bestIdx].lineStart {
 							bestIdx = i
@@ -1967,9 +2057,17 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					if !skipSameFileSelector {
 						funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
 					}
+					if recvToken != "" {
+						funcs[bestIdx].calls = append(funcs[bestIdx].calls, recvToken)
+					}
 					callerFuncID = funcs[bestIdx].id
-				} else if !skipSameFileSelector {
-					topLevelCalls = append(topLevelCalls, callName)
+				} else {
+					if !skipSameFileSelector {
+						topLevelCalls = append(topLevelCalls, callName)
+					}
+					if recvToken != "" {
+						topLevelCalls = append(topLevelCalls, recvToken)
+					}
 				}
 				// Same capture doubles as the native-route probe (Go/Python
 				// registrations, routes_native.go) and, when that declines,
@@ -2198,7 +2296,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if methodNode := caps["nsref.method"]; methodNode != nil {
 					callLine := int(objNode.StartPoint().Row) + 1
 					bestIdx := -1
-					for i := range funcs {
+					for i := fileStart; i < len(funcs); i++ {
 						if funcs[i].file == relPath && funcs[i].lineStart <= callLine {
 							if bestIdx == -1 || funcs[i].lineStart > funcs[bestIdx].lineStart {
 								bestIdx = i
@@ -2254,7 +2352,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 		}
 
-		emitLooseComments(g, looseComments, consumed, funcs, relPath, fileID, data)
+		emitLooseComments(g, looseComments, consumed, funcs[fileStart:], relPath, fileID, data)
 		c.emitAnnotationRoutes(g, &anns, relPath, fileID)
 		emitStateAccess(g, stateAccesses, singletons, funcs, relPath)
 		if len(singletons) > 0 {
@@ -2956,6 +3054,29 @@ func (c *Connector) loadJVMRoots() {
 		}
 		return nil
 	})
+
+	c.jvmDirIndex = make(map[string][]int)
+	for i, root := range c.jvmSourceRoots {
+		root := root
+		filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return nil
+			}
+			if graph.SkipDir(d.Name(), path == root) {
+				return filepath.SkipDir
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return nil
+			}
+			key := filepath.ToSlash(rel)
+			if key == "." {
+				key = ""
+			}
+			c.jvmDirIndex[key] = append(c.jvmDirIndex[key], i)
+			return nil
+		})
+	}
 }
 
 // resolveJVMImport resolves a Java or Kotlin import spec (a dotted path,
@@ -2980,14 +3101,20 @@ func (c *Connector) resolveJVMImport(g *graph.Graph, importPath string) string {
 	if len(segments) > 1 {
 		tries = append(tries, segments[:len(segments)-1])
 	}
-	for _, root := range c.jvmSourceRoots {
-		for _, segs := range tries {
-			if id := c.resolveDirSegments(g, root, segs, strings.Join(segs, ".")); id != "" {
-				return id
-			}
+	// Same result as trying every root in order, full path first and then the
+	// path minus its last segment: the earliest root wins, and within one root
+	// the full path wins. Done against the directory index, not the disk.
+	best, bestTry := -1, -1
+	for ti, segs := range tries {
+		if roots := c.jvmDirIndex[strings.Join(segs, "/")]; len(roots) > 0 && (best < 0 || roots[0] < best) {
+			best, bestTry = roots[0], ti
 		}
 	}
-	return ""
+	if best < 0 {
+		return ""
+	}
+	segs := tries[bestTry]
+	return c.resolveDirSegments(g, c.jvmSourceRoots[best], segs, strings.Join(segs, "."))
 }
 
 // csharpRootNamespaceRe extracts a .csproj's <RootNamespace> value.
@@ -3368,6 +3495,8 @@ func (c *Connector) resolveExports(g *graph.Graph) {
 }
 
 func (c *Connector) resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
+	c.recv = buildRecvIndex(g)
+	defer func() { c.recv = nil }()
 	for i := range funcs {
 		fi := &funcs[i]
 
@@ -3411,6 +3540,13 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 			continue
 		}
 		seen[calledName] = true
+
+		if rest, ok := strings.CutPrefix(calledName, "@"); ok {
+			if recv, method, ok := strings.Cut(rest, "."); ok {
+				c.resolveReceiverCall(g, callerID, callerFile, recv, method)
+			}
+			continue
+		}
 
 		if rest, ok := strings.CutPrefix(calledName, "#"); ok {
 			// Namespace-import member call (NS.method(...)): resolve NS
@@ -3493,4 +3629,17 @@ func findProject(g *graph.Graph, path string, root string) string {
 		return id
 	}
 	return ""
+}
+
+// truncateUTF8 shortens s to at most max bytes without cutting a multi-byte
+// character in half. Slicing by bytes (s[:max]) produced invalid UTF-8 in 84
+// comment names on Elasticsearch, which other tools then fail to decode.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
