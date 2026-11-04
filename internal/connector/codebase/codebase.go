@@ -150,6 +150,13 @@ type Connector struct {
 	// `blast` report false "no callers" for a common service-facade
 	// pattern.
 	fileExports map[string]map[string]string
+	// recv is the receiver-resolution index, alive only during resolveAndWire.
+	recv *recvIndex
+	// pyBindings: file -> name bound by a Python import -> the file that import
+	// resolves to ("" when it resolves to no local file, e.g. the stdlib).
+	pyBindings map[string]map[string]string
+	// fileTypes: file -> variable/parameter/field name -> declared type name.
+	fileTypes map[string]map[string]string
 }
 
 // exportSpecRaw is one `export { local as exported }` specifier queued
@@ -430,7 +437,10 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	// Remember CALLS edges from surviving callers into functions of dirty
 	// files, so they can be re-attached to the re-parsed nodes (whose ids
 	// change when line numbers shift).
-	type relink struct{ from, name, file, typ string }
+	type relink struct {
+		from, name, file, typ string
+		attrs                 map[string]string // kept: via/receiver/inferred must survive a relink
+	}
 	var relinks []relink
 	// File↔file edges touching dirty file nodes: file ids are path-stable, so
 	// these can be re-added verbatim once the node is re-created. IMPORTS from
@@ -458,7 +468,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 			}
 		case graph.EdgeCalls:
 			if dirty[tn.Attrs["file"]] && !dirty[fn.Attrs["file"]] {
-				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls})
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeCalls, e.Attrs})
 			}
 		case graph.EdgeMentions:
 			// Doc unchanged, target evicted: function ids shift with line
@@ -467,7 +477,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 				continue // dirty doc re-parses and re-emits its mentions
 			}
 			if dirty[tn.Attrs["file"]] && strings.HasPrefix(e.To, "func:") {
-				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions})
+				relinks = append(relinks, relink{e.From, tn.Name, tn.Attrs["file"], graph.EdgeMentions, e.Attrs})
 			} else if (strings.HasPrefix(e.To, "def:") && dirty[tn.Attrs["file"]]) ||
 				(tn.Type == graph.NodeFile && dirty[tn.Name]) {
 				fileEdgeRelinks = append(fileEdgeRelinks, e)
@@ -589,7 +599,7 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 		}
 		seenRelink[key] = true
 		if target := byFileName[r.file+"\x00"+r.name]; target != "" {
-			prev.AddEdge(r.from, target, r.typ, nil)
+			prev.AddEdge(r.from, target, r.typ, r.attrs)
 		}
 	}
 
@@ -739,6 +749,9 @@ type langConfig struct {
 	// Line ranges come from navigating cap.Node.Parent() to the declaration node.
 	queryStr string
 	query    *sitter.Query // compiled once in parseFiles, reused per file
+	// declQuery collects declared variable types (receiver_types.go); nil when
+	// the language has none or its pattern failed to compile.
+	declQuery *sitter.Query
 }
 
 func langFor(ext string) *langConfig {
@@ -757,7 +770,7 @@ func langFor(ext string) *langConfig {
 			(function_declaration name: (identifier) @func.name)
 			(method_declaration receiver: (parameter_list) @method.receiver name: (field_identifier) @func.name)
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (selector_expression field: (field_identifier) @call.sel))
+			(call_expression function: (selector_expression operand: (_) @call.selobj field: (field_identifier) @call.sel))
 			(import_spec path: (interpreted_string_literal) @import.path)
 			(comment) @loose.comment
 			`,
@@ -772,7 +785,7 @@ func langFor(ext string) *langConfig {
 			(variable_declarator name: (identifier) @func.name value: (arrow_function))
 			(variable_declarator name: (identifier) @func.name value: (function_expression))
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (member_expression property: (property_identifier) @call.sel))
+			(call_expression function: (member_expression object: (_) @call.selobj property: (property_identifier) @call.sel))
 			(import_statement source: (string) @import.path)
 			(comment) @loose.comment
 			(call_expression
@@ -866,7 +879,7 @@ func langFor(ext string) *langConfig {
 			(variable_declarator name: (identifier) @func.name value: (arrow_function))
 			(variable_declarator name: (identifier) @func.name value: (function_expression))
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (member_expression property: (property_identifier) @call.sel))
+			(call_expression function: (member_expression object: (_) @call.selobj property: (property_identifier) @call.sel))
 			(import_statement source: (string) @import.path)
 			(comment) @loose.comment
 			(call_expression
@@ -961,8 +974,9 @@ func langFor(ext string) *langConfig {
 			  body: (block) @pymodel.body) @pymodel.class
 			(function_definition name: (identifier) @func.name)
 			(call function: (identifier) @call.func)
-			(call function: (attribute attribute: (identifier) @call.sel))
+			(call function: (attribute object: (_) @call.selobj attribute: (identifier) @call.sel))
 			(import_statement name: (dotted_name) @import.path)
+			(import_statement name: (aliased_import name: (dotted_name) @import.path))
 			(import_from_statement module_name: (dotted_name) @import.path)
 			(import_from_statement module_name: (relative_import) @import.path)
 			(comment) @loose.comment
@@ -975,7 +989,7 @@ func langFor(ext string) *langConfig {
 			(struct_item name: (type_identifier) @def.name)
 			(function_item name: (identifier) @func.name)
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (field_expression field: (field_identifier) @call.sel))
+			(call_expression function: (field_expression value: (_) @call.selobj field: (field_identifier) @call.sel))
 			(use_declaration argument: (scoped_identifier) @import.path)
 			(line_comment) @loose.comment
 			(block_comment) @loose.comment
@@ -992,7 +1006,7 @@ func langFor(ext string) *langConfig {
 			(method_declaration name: (identifier) @func.name)
 			(constructor_declaration name: (identifier) @func.name)
 			(method_invocation !object name: (identifier) @call.func)
-			(method_invocation object: (_) name: (identifier) @call.sel)
+			(method_invocation object: (_) @call.selobj name: (identifier) @call.sel)
 			(import_declaration (scoped_identifier) @import.path)
 			(line_comment) @loose.comment
 			(block_comment) @loose.comment
@@ -1017,7 +1031,7 @@ func langFor(ext string) *langConfig {
 			(object_declaration (type_identifier) @def.name)
 			(function_declaration (simple_identifier) @func.name)
 			(call_expression (simple_identifier) @call.func)
-			(call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.sel)))
+			(call_expression (navigation_expression . (_) @call.selobj (navigation_suffix (simple_identifier) @call.sel)))
 			(import_header (identifier) @import.path)
 			(line_comment) @loose.comment
 			(multiline_comment) @loose.comment
@@ -1039,7 +1053,7 @@ func langFor(ext string) *langConfig {
 			(class_declaration (type_identifier) @def.name)
 			(function_declaration (simple_identifier) @func.name)
 			(call_expression (simple_identifier) @call.func)
-			(call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.sel)))
+			(call_expression (navigation_expression target: (_) @call.selobj suffix: (navigation_suffix (simple_identifier) @call.sel)))
 			(import_declaration (identifier) @import.path)
 			(comment) @loose.comment
 			(multiline_comment) @loose.comment
@@ -1061,7 +1075,7 @@ func langFor(ext string) *langConfig {
 			(constructor_declaration name: (identifier) @func.name)
 			(local_function_statement name: (identifier) @func.name)
 			(invocation_expression function: (identifier) @call.func)
-			(invocation_expression function: (member_access_expression name: (identifier) @call.sel))
+			(invocation_expression function: (member_access_expression expression: (_) @call.selobj name: (identifier) @call.sel))
 			(using_directive [(qualified_name) (identifier)] @import.path)
 			(comment) @loose.comment
 			(method_declaration (attribute_list (attribute (identifier) @cattr.name (attribute_argument_list)? @cattr.args)) name: (identifier) @cattr.method)
@@ -1520,9 +1534,17 @@ func isExportedName(ext, name string, declNode *sitter.Node, src []byte) (export
 
 // receiverTypeName extracts the type name from a Go receiver node like "(e *Engine)" → "Engine".
 func receiverTypeName(recvNode *sitter.Node, src []byte) string {
-	text := strings.Trim(recvNode.Content(src), "()")
+	return receiverTypeFromText(recvNode.Content(src))
+}
+
+// receiverTypeFromText extracts the type from a Go receiver parameter list text.
+func receiverTypeFromText(list string) string {
+	text := strings.Trim(list, "()")
 	parts := strings.Fields(text)
-	if len(parts) >= 2 {
+	if len(parts) >= 1 {
+		// `(s *Set[T])` has a name and a type; `(*Set[T])` and `(Set)` have only
+		// the type (an unused receiver may be left unnamed). Either way the type
+		// is the last token.
 		return strings.TrimPrefix(parts[len(parts)-1], "*")
 	}
 	return ""
@@ -1536,6 +1558,8 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	funcsByName := map[string][]string{}
 	c.namedImports = map[string]map[string]string{}
 	c.nsImports = map[string]map[string]string{}
+	c.pyBindings = map[string]map[string]string{}
+	c.fileTypes = map[string]map[string]string{}
 
 	if c.tsconfigs == nil {
 		c.loadTSConfigs()
@@ -1559,6 +1583,13 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			continue
 		}
 		lc.query = q
+		if ds := declQueryFor(ext); ds != "" {
+			if dq, err := sitter.NewQuery([]byte(ds), lc.lang); err == nil {
+				lc.declQuery = dq
+			} else {
+				fmt.Fprintf(os.Stderr, "gatt: %s declaration query failed to compile, typed receivers off: %v\n", ext, err)
+			}
+		}
 		compiledLangs[ext] = lc
 	}
 
@@ -1710,6 +1741,29 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// declaration's doc comment (or the file's leading doc), so the
 		// loose-comment pass below doesn't re-emit them as floating comments.
 		consumed := map[int]bool{}
+		if ext == ".py" {
+			bound := map[string]string{}
+			for name, cands := range pythonImportBindings(data) {
+				bound[name] = ""
+				for _, spec := range cands {
+					if f := c.pyModuleFile(path, spec); f != "" {
+						bound[name] = f
+						break
+					}
+				}
+			}
+			c.pyBindings[relPath] = bound
+		}
+		if lc.declQuery != nil {
+			c.fileTypes[relPath] = collectDecls(tree, lc.declQuery, data)
+		}
+		if ext == ".cs" {
+			// Persisted on the file node so an incremental refresh still knows the
+			// namespaces of files it does not re-parse.
+			ns := parseCSharpNamespaces(data)
+			fileAttrs["cs_declared"] = strings.Join(ns.declared, " ")
+			fileAttrs["cs_uses"] = strings.Join(ns.uses, " ")
+		}
 
 		// fileAttrs is the same map the file node's Attrs already points at
 		// (AddNode stores it by reference), so this mutation is visible on
@@ -1957,10 +2011,34 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			// same-file locals in resolveAndWire to avoid cross-package false hits).
 			var callNode *sitter.Node
 			callName := ""
+			skipSameFileSelector := false
+			recvToken := ""
 			if cn, ok := caps["call.func"]; ok {
 				callNode, callName = cn, cn.Content(data)
 			} else if cn, ok := caps["call.sel"]; ok {
 				callNode, callName = cn, "."+cn.Content(data)
+				// A selector's same-file match is only trustworthy when the
+				// receiver is exactly the language's own self-reference
+				// keyword (this/self) — the enclosing instance, whose method
+				// set is what we're actually searching. Anything else (a
+				// field like "this.http", another variable, a static class
+				// name) can coincidentally share a bare method name with an
+				// unrelated same-file function (e.g. "this.http.get()"
+				// colliding with a same-class "get()"), producing a
+				// confidently-wrong CALLS edge rather than the honest "can't
+				// resolve" — so skip local resolution entirely rather than
+				// risk it (no edge beats a wrong one). call.selobj is only
+				// captured by grammars where the receiver is a distinct
+				// query node (not Go: its selector_expression's receiver
+				// name is an arbitrary variable, not a fixed keyword).
+				if objNode, ok := caps["call.selobj"]; ok && !isSelfReceiver(ext, objNode, data) {
+					// Go's receiver is an arbitrary variable name and its
+					// same-file match stays as it was; elsewhere it is dropped.
+					skipSameFileSelector = ext != ".go"
+					// Cross-file: "@Recv.method", resolved against imports and
+					// visible types in resolveReceiverCall (receiver.go).
+					recvToken = receiverToken(objNode, cn, data)
+				}
 			}
 			if callName != "" {
 				// Attribute the call to the innermost function whose line range
@@ -1976,10 +2054,20 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				}
 				callerFuncID := ""
 				if bestIdx >= 0 && funcs[bestIdx].lineEnd >= callLine {
-					funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
+					if !skipSameFileSelector {
+						funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
+					}
+					if recvToken != "" {
+						funcs[bestIdx].calls = append(funcs[bestIdx].calls, recvToken)
+					}
 					callerFuncID = funcs[bestIdx].id
 				} else {
-					topLevelCalls = append(topLevelCalls, callName)
+					if !skipSameFileSelector {
+						topLevelCalls = append(topLevelCalls, callName)
+					}
+					if recvToken != "" {
+						topLevelCalls = append(topLevelCalls, recvToken)
+					}
 				}
 				// Same capture doubles as the native-route probe (Go/Python
 				// registrations, routes_native.go) and, when that declines,
@@ -2581,6 +2669,30 @@ func resolveMention(tok string, fileByName map[string]string, defIDs, funcIDs ma
 		return ids
 	}
 	return funcIDs[tok]
+}
+
+// selfReceiverType maps a language extension to the tree-sitter node type
+// its grammar gives the bare "enclosing instance" keyword (this/self) when
+// it appears as a selector call's receiver. Python has no dedicated node
+// type for "self" (it's ordinary-identifier by convention, not syntax), so
+// it's absent here and handled by a text check in isSelfReceiver instead.
+// Go is deliberately absent: a method's receiver variable is an arbitrary
+// programmer-chosen name, not a fixed keyword, so this check doesn't apply.
+var selfReceiverType = map[string]string{
+	".ts": "this", ".tsx": "this", ".js": "this", ".jsx": "this",
+	".java": "this", ".kt": "this_expression", ".swift": "self_expression",
+	".cs": "this", ".rs": "self",
+}
+
+// isSelfReceiver reports whether a selector call's receiver node (call.selobj)
+// is the language's own bare self-reference keyword — as opposed to a field,
+// alias, or other variable that merely happens to share a same-file
+// function's name. Used to gate resolveCall's same-file selector heuristic.
+func isSelfReceiver(ext string, n *sitter.Node, data []byte) bool {
+	if ext == ".py" {
+		return n.Type() == "identifier" && n.Content(data) == "self"
+	}
+	return n.Type() == selfReceiverType[ext]
 }
 
 // builtinNames are language builtins that never deserve a call stub node.
@@ -3383,6 +3495,8 @@ func (c *Connector) resolveExports(g *graph.Graph) {
 }
 
 func (c *Connector) resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName map[string][]string) {
+	c.recv = buildRecvIndex(g)
+	defer func() { c.recv = nil }()
 	for i := range funcs {
 		fi := &funcs[i]
 
@@ -3426,6 +3540,13 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 			continue
 		}
 		seen[calledName] = true
+
+		if rest, ok := strings.CutPrefix(calledName, "@"); ok {
+			if recv, method, ok := strings.Cut(rest, "."); ok {
+				c.resolveReceiverCall(g, callerID, callerFile, recv, method)
+			}
+			continue
+		}
 
 		if rest, ok := strings.CutPrefix(calledName, "#"); ok {
 			// Namespace-import member call (NS.method(...)): resolve NS
