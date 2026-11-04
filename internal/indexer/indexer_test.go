@@ -116,8 +116,12 @@ func TestUpsertIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 || entries[0].Name() != "vectors.json" {
-		t.Errorf("leftover temp files after upsert: %v", entries)
+	names := map[string]bool{}
+	for _, e := range entries {
+		names[e.Name()] = true
+	}
+	if len(entries) != 2 || !names["vectors.json"] || !names["vectors.bin"] {
+		t.Errorf("want exactly vectors.json + vectors.bin, got %v", entries)
 	}
 }
 

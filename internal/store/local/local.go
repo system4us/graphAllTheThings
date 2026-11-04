@@ -6,7 +6,9 @@ package local
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"graphallthethings/internal/lock"
@@ -24,15 +27,26 @@ type entry struct {
 	NodeID string    `json:"id"`
 	Type   string    `json:"type"`
 	Name   string    `json:"name"`
-	Hash   string    `json:"h,omitempty"` // hash of the text this vector was embedded from
-	Vector []float32 `json:"vector"`
+	Hash   string    `json:"h,omitempty"`      // hash of the text this vector was embedded from
+	Vector []float32 `json:"vector,omitempty"` // legacy files only; "split-1" keeps vectors in vectors.bin
 }
 
 type file struct {
-	Model   string  `json:"model"` // embedding model used at index time
-	Dim     int     `json:"dim"`
+	Model string `json:"model"` // embedding model used at index time
+	Dim   int    `json:"dim"`
+	// Format "split-1": entries carry no vectors; they are float32 little-endian
+	// in the sibling vectors.bin (16-byte Gen header, then entries in order).
+	// Parsing 8M floats from JSON dominated every pass; raw floats are ~3x
+	// smaller and load in milliseconds. Empty Format = legacy all-in-JSON.
+	Format  string  `json:"format,omitempty"`
+	Gen     string  `json:"gen,omitempty"`
 	Entries []entry `json:"entries"`
 }
+
+const splitFormat = "split-1"
+
+// binPath is the vector blob next to the metadata file.
+func binPath(path string) string { return strings.TrimSuffix(path, filepath.Ext(path)) + ".bin" }
 
 type Store struct {
 	Path string // e.g. gatt-out/vectors.json
@@ -122,21 +136,79 @@ func (s *Store) write(points []store.Point, merge bool) error {
 		}
 		f.Dim = len(p.Vector)
 	}
-	data, err := json.Marshal(f)
+	for _, e := range f.Entries {
+		if len(e.Vector) != f.Dim {
+			return fmt.Errorf("vector index: node %q has %d dims, index has %d (embedding model changed? run `gatt index --full`)", e.NodeID, len(e.Vector), f.Dim)
+		}
+	}
+	var genRaw [8]byte
+	if _, err := rand.Read(genRaw[:]); err != nil {
+		return err
+	}
+	gen := hex.EncodeToString(genRaw[:]) // 16 ASCII bytes
+	bin := make([]byte, 0, len(gen)+4*f.Dim*len(f.Entries))
+	bin = append(bin, gen...)
+	meta := make([]entry, len(f.Entries))
+	for i, e := range f.Entries {
+		for _, x := range e.Vector {
+			bin = binary.LittleEndian.AppendUint32(bin, math.Float32bits(x))
+		}
+		e.Vector = nil
+		meta[i] = e
+	}
+	data, err := json.Marshal(file{Model: f.Model, Dim: f.Dim, Format: splitFormat, Gen: gen, Entries: meta})
 	if err != nil {
 		return err
 	}
-	// Write to a temp file and rename: a crash mid-write, or a concurrent
-	// reader (a query running while `gatt serve` re-embeds), must never see a
-	// truncated vectors.json.
-	tmp, err := os.CreateTemp(filepath.Dir(s.Path), ".vectors-*.tmp")
+	// Each file is written to a temp name and renamed, so a crash or a concurrent
+	// reader never sees a truncated file. The blob goes first: a reader that
+	// catches the gap sees a Gen mismatch and retries (see load).
+	if err := atomicWrite(binPath(s.Path), bin); err != nil {
+		return err
+	}
+	if err := atomicWrite(s.Path, data); err != nil {
+		return err
+	}
+	s.entries = f.Entries
+	s.loaded = true
+	return nil
+}
+
+// attachVectors fills f.Entries[i].Vector from the blob, verifying it belongs to
+// the same write as the metadata.
+func attachVectors(f *file, path string) error {
+	if f.Format != splitFormat {
+		return fmt.Errorf("vector index: unknown format %q (written by a newer gatt?)", f.Format)
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("vector blob missing: %w", err)
+	}
+	const genLen = 16
+	want := genLen + 4*f.Dim*len(f.Entries)
+	if len(blob) != want || string(blob[:genLen]) != f.Gen {
+		return fmt.Errorf("vector blob does not match its index (gen/size mismatch); run `gatt index --full`")
+	}
+	floats := blob[genLen:]
+	for i := range f.Entries {
+		v := make([]float32, f.Dim)
+		off := i * 4 * f.Dim
+		for j := range v {
+			v[j] = math.Float32frombits(binary.LittleEndian.Uint32(floats[off+4*j:]))
+		}
+		f.Entries[i].Vector = v
+	}
+	return nil
+}
+
+func atomicWrite(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".vectors-*.tmp")
 	if err != nil {
 		return err
 	}
+	fail := func(err error) error { tmp.Close(); os.Remove(tmp.Name()); return err }
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return err
+		return fail(err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmp.Name())
@@ -146,12 +218,10 @@ func (s *Store) write(points []store.Point, merge bool) error {
 		os.Remove(tmp.Name())
 		return err
 	}
-	if err := os.Rename(tmp.Name(), s.Path); err != nil {
+	if err := os.Rename(tmp.Name(), path); err != nil {
 		os.Remove(tmp.Name())
 		return err
 	}
-	s.entries = f.Entries
-	s.loaded = true
 	return nil
 }
 
@@ -159,13 +229,29 @@ func (s *Store) load() error {
 	if s.loaded {
 		return nil
 	}
-	data, err := os.ReadFile(s.Path)
-	if err != nil {
-		return fmt.Errorf("vector index not found (run `gatt index` first): %w", err)
-	}
 	var f file
-	if err := json.Unmarshal(data, &f); err != nil {
-		return err
+	// A writer replaces vectors.bin before vectors.json; if we read in between,
+	// the generations differ. That window is milliseconds, so retry briefly.
+	for attempt := 0; ; attempt++ {
+		data, err := os.ReadFile(s.Path)
+		if err != nil {
+			return fmt.Errorf("vector index not found (run `gatt index` first): %w", err)
+		}
+		f = file{}
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		if f.Format == "" {
+			break // legacy: vectors are inline in the JSON
+		}
+		err = attachVectors(&f, binPath(s.Path))
+		if err == nil {
+			break
+		}
+		if attempt >= 20 {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	s.entries = f.Entries
 	s.Model = f.Model
