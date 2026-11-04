@@ -86,6 +86,11 @@ type Connector struct {
 	// every file's own package declaration first. Loaded lazily.
 	jvmSourceRoots []string
 	jvmRootsLoaded bool
+	// jvmDirIndex maps a directory path relative to a source root ("" = the root
+	// itself) to the indexes, in jvmSourceRoots order, of the roots that contain it.
+	// Built once in loadJVMRoots so resolving an import is a map lookup instead of
+	// two os.Stat calls per root (Elasticsearch: 537 roots x 556k imports).
+	jvmDirIndex map[string][]int
 	// csharpRoots holds one entry per .csproj found in the tree (its
 	// directory + root namespace) plus a namespace-less fallback rooted at
 	// the extraction root, used to resolve `using X.Y.Z;` best-effort (C#
@@ -1560,6 +1565,11 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		}
 		projID := findProject(g, path, c.dir)
 		fileID := "file:" + path
+		// Functions of this file are appended after everything seen so far, so a
+		// call can only be attributed to a function at index >= fileStart. Scanning
+		// all of funcs for every call made extraction quadratic (Django: 40% of the
+		// time; Elasticsearch: hours).
+		fileStart := len(funcs)
 
 		mtime := ""
 		var size int64
@@ -1937,7 +1947,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				// contains the call site.
 				callLine := int(callNode.StartPoint().Row) + 1
 				bestIdx := -1
-				for i := range funcs {
+				for i := fileStart; i < len(funcs); i++ {
 					if funcs[i].file == relPath && funcs[i].lineStart <= callLine {
 						if bestIdx == -1 || funcs[i].lineStart > funcs[bestIdx].lineStart {
 							bestIdx = i
@@ -2178,7 +2188,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if methodNode := caps["nsref.method"]; methodNode != nil {
 					callLine := int(objNode.StartPoint().Row) + 1
 					bestIdx := -1
-					for i := range funcs {
+					for i := fileStart; i < len(funcs); i++ {
 						if funcs[i].file == relPath && funcs[i].lineStart <= callLine {
 							if bestIdx == -1 || funcs[i].lineStart > funcs[bestIdx].lineStart {
 								bestIdx = i
@@ -2234,7 +2244,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			}
 		}
 
-		emitLooseComments(g, looseComments, consumed, funcs, relPath, fileID, data)
+		emitLooseComments(g, looseComments, consumed, funcs[fileStart:], relPath, fileID, data)
 		c.emitAnnotationRoutes(g, &anns, relPath, fileID)
 		emitStateAccess(g, stateAccesses, singletons, funcs, relPath)
 		if len(singletons) > 0 {
@@ -2912,6 +2922,29 @@ func (c *Connector) loadJVMRoots() {
 		}
 		return nil
 	})
+
+	c.jvmDirIndex = make(map[string][]int)
+	for i, root := range c.jvmSourceRoots {
+		root := root
+		filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return nil
+			}
+			if graph.SkipDir(d.Name(), path == root) {
+				return filepath.SkipDir
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return nil
+			}
+			key := filepath.ToSlash(rel)
+			if key == "." {
+				key = ""
+			}
+			c.jvmDirIndex[key] = append(c.jvmDirIndex[key], i)
+			return nil
+		})
+	}
 }
 
 // resolveJVMImport resolves a Java or Kotlin import spec (a dotted path,
@@ -2936,14 +2969,20 @@ func (c *Connector) resolveJVMImport(g *graph.Graph, importPath string) string {
 	if len(segments) > 1 {
 		tries = append(tries, segments[:len(segments)-1])
 	}
-	for _, root := range c.jvmSourceRoots {
-		for _, segs := range tries {
-			if id := c.resolveDirSegments(g, root, segs, strings.Join(segs, ".")); id != "" {
-				return id
-			}
+	// Same result as trying every root in order, full path first and then the
+	// path minus its last segment: the earliest root wins, and within one root
+	// the full path wins. Done against the directory index, not the disk.
+	best, bestTry := -1, -1
+	for ti, segs := range tries {
+		if roots := c.jvmDirIndex[strings.Join(segs, "/")]; len(roots) > 0 && (best < 0 || roots[0] < best) {
+			best, bestTry = roots[0], ti
 		}
 	}
-	return ""
+	if best < 0 {
+		return ""
+	}
+	segs := tries[bestTry]
+	return c.resolveDirSegments(g, c.jvmSourceRoots[best], segs, strings.Join(segs, "."))
 }
 
 // csharpRootNamespaceRe extracts a .csproj's <RootNamespace> value.
