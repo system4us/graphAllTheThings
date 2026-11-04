@@ -10,6 +10,8 @@ Turn any source's metadata into a knowledge graph that your AI agent queries thr
 
 Extract once, index semantically, and the agent gets tools that answer *which tables? how do I join them? who calls this?* in a single call. On a real 113-table CRM that is ~2.3k tokens in 1 tool call instead of ~7.8k across 6 introspection queries; on a codebase one `code-query` (~3 KB) replaces a 20–50k-token Grep/Read exploration.
 
+Codebase parsing covers nine languages with uneven depth; see [supported languages and limits](docs/codebase-graphs.md#supported-languages-and-limits).
+
 ## Install
 
 Requires Go 1.25+.
