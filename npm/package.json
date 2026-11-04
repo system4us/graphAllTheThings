@@ -1,0 +1,12 @@
+{
+  "name": "graph-all-the-things",
+  "version": "0.0.0",
+  "description": "gatt: build a metadata graph of your codebase and query it from the CLI or as an MCP server",
+  "license": "AGPL-3.0-or-later",
+  "author": "Leandro Fusco",
+  "repository": { "type": "git", "url": "git+https://github.com/system4us/graphAllTheThings.git" },
+  "bin": { "gatt": "bin/gatt.js" },
+  "files": ["bin", "README.md", "LICENSE"],
+  "engines": { "node": ">=16" },
+  "optionalDependencies": {}
+}
