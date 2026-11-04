@@ -750,7 +750,7 @@ func langFor(ext string) *langConfig {
 			(variable_declarator name: (identifier) @func.name value: (arrow_function))
 			(variable_declarator name: (identifier) @func.name value: (function_expression))
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (member_expression property: (property_identifier) @call.sel))
+			(call_expression function: (member_expression object: (_) @call.selobj property: (property_identifier) @call.sel))
 			(import_statement source: (string) @import.path)
 			(comment) @loose.comment
 			(call_expression
@@ -844,7 +844,7 @@ func langFor(ext string) *langConfig {
 			(variable_declarator name: (identifier) @func.name value: (arrow_function))
 			(variable_declarator name: (identifier) @func.name value: (function_expression))
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (member_expression property: (property_identifier) @call.sel))
+			(call_expression function: (member_expression object: (_) @call.selobj property: (property_identifier) @call.sel))
 			(import_statement source: (string) @import.path)
 			(comment) @loose.comment
 			(call_expression
@@ -939,7 +939,7 @@ func langFor(ext string) *langConfig {
 			  body: (block) @pymodel.body) @pymodel.class
 			(function_definition name: (identifier) @func.name)
 			(call function: (identifier) @call.func)
-			(call function: (attribute attribute: (identifier) @call.sel))
+			(call function: (attribute object: (_) @call.selobj attribute: (identifier) @call.sel))
 			(import_statement name: (dotted_name) @import.path)
 			(import_from_statement module_name: (dotted_name) @import.path)
 			(import_from_statement module_name: (relative_import) @import.path)
@@ -953,7 +953,7 @@ func langFor(ext string) *langConfig {
 			(struct_item name: (type_identifier) @def.name)
 			(function_item name: (identifier) @func.name)
 			(call_expression function: (identifier) @call.func)
-			(call_expression function: (field_expression field: (field_identifier) @call.sel))
+			(call_expression function: (field_expression value: (_) @call.selobj field: (field_identifier) @call.sel))
 			(use_declaration argument: (scoped_identifier) @import.path)
 			(line_comment) @loose.comment
 			(block_comment) @loose.comment
@@ -970,7 +970,7 @@ func langFor(ext string) *langConfig {
 			(method_declaration name: (identifier) @func.name)
 			(constructor_declaration name: (identifier) @func.name)
 			(method_invocation !object name: (identifier) @call.func)
-			(method_invocation object: (_) name: (identifier) @call.sel)
+			(method_invocation object: (_) @call.selobj name: (identifier) @call.sel)
 			(import_declaration (scoped_identifier) @import.path)
 			(line_comment) @loose.comment
 			(block_comment) @loose.comment
@@ -995,7 +995,7 @@ func langFor(ext string) *langConfig {
 			(object_declaration (type_identifier) @def.name)
 			(function_declaration (simple_identifier) @func.name)
 			(call_expression (simple_identifier) @call.func)
-			(call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.sel)))
+			(call_expression (navigation_expression . (_) @call.selobj (navigation_suffix (simple_identifier) @call.sel)))
 			(import_header (identifier) @import.path)
 			(line_comment) @loose.comment
 			(multiline_comment) @loose.comment
@@ -1017,7 +1017,7 @@ func langFor(ext string) *langConfig {
 			(class_declaration (type_identifier) @def.name)
 			(function_declaration (simple_identifier) @func.name)
 			(call_expression (simple_identifier) @call.func)
-			(call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.sel)))
+			(call_expression (navigation_expression target: (_) @call.selobj suffix: (navigation_suffix (simple_identifier) @call.sel)))
 			(import_declaration (identifier) @import.path)
 			(comment) @loose.comment
 			(multiline_comment) @loose.comment
@@ -1039,7 +1039,7 @@ func langFor(ext string) *langConfig {
 			(constructor_declaration name: (identifier) @func.name)
 			(local_function_statement name: (identifier) @func.name)
 			(invocation_expression function: (identifier) @call.func)
-			(invocation_expression function: (member_access_expression name: (identifier) @call.sel))
+			(invocation_expression function: (member_access_expression expression: (_) @call.selobj name: (identifier) @call.sel))
 			(using_directive [(qualified_name) (identifier)] @import.path)
 			(comment) @loose.comment
 			(method_declaration (attribute_list (attribute (identifier) @cattr.name (attribute_argument_list)? @cattr.args)) name: (identifier) @cattr.method)
@@ -1927,10 +1927,28 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			// same-file locals in resolveAndWire to avoid cross-package false hits).
 			var callNode *sitter.Node
 			callName := ""
+			skipSameFileSelector := false
 			if cn, ok := caps["call.func"]; ok {
 				callNode, callName = cn, cn.Content(data)
 			} else if cn, ok := caps["call.sel"]; ok {
 				callNode, callName = cn, "."+cn.Content(data)
+				// A selector's same-file match is only trustworthy when the
+				// receiver is exactly the language's own self-reference
+				// keyword (this/self) — the enclosing instance, whose method
+				// set is what we're actually searching. Anything else (a
+				// field like "this.http", another variable, a static class
+				// name) can coincidentally share a bare method name with an
+				// unrelated same-file function (e.g. "this.http.get()"
+				// colliding with a same-class "get()"), producing a
+				// confidently-wrong CALLS edge rather than the honest "can't
+				// resolve" — so skip local resolution entirely rather than
+				// risk it (no edge beats a wrong one). call.selobj is only
+				// captured by grammars where the receiver is a distinct
+				// query node (not Go: its selector_expression's receiver
+				// name is an arbitrary variable, not a fixed keyword).
+				if objNode, ok := caps["call.selobj"]; ok && !isSelfReceiver(ext, objNode, data) {
+					skipSameFileSelector = true
+				}
 			}
 			if callName != "" {
 				// Attribute the call to the innermost function whose line range
@@ -1946,9 +1964,11 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				}
 				callerFuncID := ""
 				if bestIdx >= 0 && funcs[bestIdx].lineEnd >= callLine {
-					funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
+					if !skipSameFileSelector {
+						funcs[bestIdx].calls = append(funcs[bestIdx].calls, callName)
+					}
 					callerFuncID = funcs[bestIdx].id
-				} else {
+				} else if !skipSameFileSelector {
 					topLevelCalls = append(topLevelCalls, callName)
 				}
 				// Same capture doubles as the native-route probe (Go/Python
@@ -2551,6 +2571,30 @@ func resolveMention(tok string, fileByName map[string]string, defIDs, funcIDs ma
 		return ids
 	}
 	return funcIDs[tok]
+}
+
+// selfReceiverType maps a language extension to the tree-sitter node type
+// its grammar gives the bare "enclosing instance" keyword (this/self) when
+// it appears as a selector call's receiver. Python has no dedicated node
+// type for "self" (it's ordinary-identifier by convention, not syntax), so
+// it's absent here and handled by a text check in isSelfReceiver instead.
+// Go is deliberately absent: a method's receiver variable is an arbitrary
+// programmer-chosen name, not a fixed keyword, so this check doesn't apply.
+var selfReceiverType = map[string]string{
+	".ts": "this", ".tsx": "this", ".js": "this", ".jsx": "this",
+	".java": "this", ".kt": "this_expression", ".swift": "self_expression",
+	".cs": "this", ".rs": "self",
+}
+
+// isSelfReceiver reports whether a selector call's receiver node (call.selobj)
+// is the language's own bare self-reference keyword — as opposed to a field,
+// alias, or other variable that merely happens to share a same-file
+// function's name. Used to gate resolveCall's same-file selector heuristic.
+func isSelfReceiver(ext string, n *sitter.Node, data []byte) bool {
+	if ext == ".py" {
+		return n.Type() == "identifier" && n.Content(data) == "self"
+	}
+	return n.Type() == selfReceiverType[ext]
 }
 
 // builtinNames are language builtins that never deserve a call stub node.
