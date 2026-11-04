@@ -236,18 +236,37 @@ func TestVectorsFresh(t *testing.T) {
 	if vectorsFresh(graphPath) {
 		t.Error("no files: must not be fresh")
 	}
-	os.WriteFile(graphPath, []byte("g"), 0o644)
-	if vectorsFresh(graphPath) {
-		t.Error("no vectors.json: must not be fresh")
-	}
+	os.WriteFile(graphPath, []byte("g1"), 0o644)
 	os.WriteFile(vectorsPath(graphPath), []byte("{}"), 0o644)
-	old := time.Now().Add(-time.Hour)
-	os.Chtimes(vectorsPath(graphPath), old, old)
 	if vectorsFresh(graphPath) {
-		t.Error("vectors older than the graph: a query-time refresh left them behind")
+		t.Error("vectors present but never caught up (no stamp): must not be fresh")
 	}
-	touchVectors(graphPath)
+	markVectorsFresh(graphPath, graphSig(graphPath))
 	if !vectorsFresh(graphPath) {
-		t.Error("after catching up (touch) vectors must be fresh")
+		t.Error("after catching up the vectors must be fresh")
+	}
+
+	// A query-time refresh rewrites the graph: no longer fresh.
+	os.WriteFile(graphPath, []byte("g2-longer"), 0o644)
+	if vectorsFresh(graphPath) {
+		t.Error("graph changed after the catch-up: must not be fresh")
+	}
+
+	// Restoring an OLDER graph with the same size must not look fresh either
+	// (an mtime comparison with vectors.json would have said it was).
+	markVectorsFresh(graphPath, graphSig(graphPath))
+	old := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(graphPath, old, old)
+	if vectorsFresh(graphPath) {
+		t.Error("graph restored from an older copy: must not be fresh")
+	}
+
+	// The graph changing WHILE we embed must leave it stale: stamp the signature
+	// taken before reading, not the one after.
+	sigBefore := graphSig(graphPath)
+	os.WriteFile(graphPath, []byte("changed during embedding"), 0o644)
+	markVectorsFresh(graphPath, sigBefore)
+	if vectorsFresh(graphPath) {
+		t.Error("graph changed during the catch-up: stamp must not match")
 	}
 }

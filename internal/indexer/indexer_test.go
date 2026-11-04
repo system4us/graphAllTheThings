@@ -17,6 +17,8 @@ import (
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
+	"graphallthethings/internal/store/qdrant"
+	"graphallthethings/internal/store/qdrant/qdranttest"
 )
 
 // fakeEmbedder counts how many texts reach the embedding server.
@@ -186,5 +188,49 @@ func TestReindexSkipsWriteWhenNothingChanged(t *testing.T) {
 	after, _ := os.Stat(path)
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Error("vectors.json was rewritten although nothing changed")
+	}
+}
+
+func TestReindexQdrantIsIncrementalByHash(t *testing.T) {
+	srv := qdranttest.New()
+	defer srv.Close()
+	var sent atomic.Int64
+	emb := fakeEmbedder(t, &sent)
+	vs := qdrant.New(srv.URL, "gatt")
+	ctx := context.Background()
+	g := testGraph("a", "b", "c", "d")
+
+	if res, err := Reindex(ctx, g, vs, emb, "m1", false, nil); err != nil || res.Embedded != 4 {
+		t.Fatalf("first pass: %+v %v, want 4 embedded", res, err)
+	}
+	sent.Store(0)
+	if res, err := Reindex(ctx, g, vs, emb, "m1", false, nil); err != nil || res.Embedded != 0 || sent.Load() != 0 {
+		t.Fatalf("unchanged pass: %+v sent=%d err=%v, want 0", res, sent.Load(), err)
+	}
+
+	// One node changes, one is deleted, one is new.
+	g.Nodes["func:b"].Name = "b_renamed"
+	delete(g.Nodes, "func:c")
+	g.AddNode(&graph.Node{ID: "func:e", Type: graph.NodeFunction, Name: "e"})
+	sent.Store(0)
+	res, err := Reindex(ctx, g, vs, emb, "m1", false, nil)
+	if err != nil || res.Embedded != 2 || sent.Load() != 2 {
+		t.Fatalf("changed pass: %+v sent=%d err=%v, want 2 embedded (b changed, e new)", res, sent.Load(), err)
+	}
+	got := srv.Points("gatt")
+	if _, stale := got["func:c"]; stale || len(got) != 4 {
+		t.Errorf("collection has %d points, deleted node present=%v (want 4: a,b,d,e)", len(got), stale)
+	}
+	if srv.Recreates != 0 {
+		t.Errorf("collection recreated %d times during incremental passes, want 0", srv.Recreates)
+	}
+
+	// The post-refresh path must not wipe the collection either.
+	g.Nodes["func:a"].Name = "a2"
+	if n, err := ReindexNodes(ctx, g, vs, emb, "m1", []string{"func:a", "func:d"}); err != nil || n != 1 {
+		t.Fatalf("ReindexNodes: n=%d err=%v, want 1 (a changed, d unchanged)", n, err)
+	}
+	if got := srv.Points("gatt"); len(got) != 4 {
+		t.Errorf("ReindexNodes left %d points, want 4 (it wiped the rest)", len(got))
 	}
 }

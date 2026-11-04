@@ -246,15 +246,13 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 	st.At = start
 	defer func() { st.Duration = time.Since(start).Round(time.Millisecond).String() }()
 
-	// Qdrant has no per-node hash cache, so keep its inline (added-nodes) path.
-	inline := qdURL != "" && !noEmbed
-	res, err := refreshCodebase(ctx, graphPath, qdURL, coll, embURL, embModel, inline)
+	res, err := refreshCodebase(ctx, graphPath, qdURL, coll, embURL, embModel, false)
 	if err != nil {
 		st.Error = err.Error()
 		return st
 	}
 	st.Summary, st.Embedded = res.Summary, res.Embedded
-	if noEmbed || inline {
+	if noEmbed {
 		return st
 	}
 	if !vectorsExist(graphPath, qdURL) && !c.initIndex {
@@ -269,6 +267,7 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 	if res.Summary == "" && qdURL == "" && vectorsFresh(graphPath) {
 		return st
 	}
+	sig := graphSig(graphPath)
 	g, err := graph.Load(graphPath)
 	if err != nil {
 		st.Error = err.Error()
@@ -287,7 +286,7 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 	}
 	st.Embedded += r.Embedded
 	if qdURL == "" {
-		touchVectors(graphPath) // mark "caught up" even when nothing needed embedding
+		markVectorsFresh(graphPath, sig) // also when nothing needed embedding
 	}
 	return st
 }
@@ -296,22 +295,38 @@ func vectorsPath(graphPath string) string {
 	return filepath.Join(filepath.Dir(graphPath), "vectors.json")
 }
 
-// vectorsFresh reports whether vectors.json is at least as new as the graph.
-func vectorsFresh(graphPath string) bool {
-	v, err := os.Stat(vectorsPath(graphPath))
+// graphSig identifies the exact graph file a catch-up ran against (size and
+// mtime in ns). Unlike comparing mtimes with vectors.json it is immune to clock
+// changes and to restoring an older copy of either file.
+func graphSig(graphPath string) string {
+	st, err := os.Stat(graphPath)
 	if err != nil {
-		return false
+		return ""
 	}
-	g, err := os.Stat(graphPath)
-	if err != nil {
-		return false
-	}
-	return !v.ModTime().Before(g.ModTime())
+	return fmt.Sprintf("%d:%d", st.Size(), st.ModTime().UnixNano())
 }
 
-func touchVectors(graphPath string) {
-	now := time.Now()
-	_ = os.Chtimes(vectorsPath(graphPath), now, now)
+func stampPath(graphPath string) string {
+	return filepath.Join(filepath.Dir(graphPath), ".vectors-stamp")
+}
+
+// vectorsFresh reports whether the vectors were caught up against this very graph.
+func vectorsFresh(graphPath string) bool {
+	if _, err := os.Stat(vectorsPath(graphPath)); err != nil {
+		return false
+	}
+	want := graphSig(graphPath)
+	got, err := os.ReadFile(stampPath(graphPath))
+	return want != "" && err == nil && string(got) == want
+}
+
+// markVectorsFresh records that the vectors are caught up with the graph whose
+// signature was sig. Take sig BEFORE reading the graph: if it changes while we
+// embed, the stamp then no longer matches and the next pass catches up again.
+func markVectorsFresh(graphPath, sig string) {
+	if sig != "" {
+		_ = os.WriteFile(stampPath(graphPath), []byte(sig), 0o644)
+	}
 }
 
 // localStoredModel returns the model recorded in a local vector index, or ""
