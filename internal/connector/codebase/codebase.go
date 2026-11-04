@@ -152,8 +152,11 @@ type Connector struct {
 	fileExports map[string]map[string]string
 	// recv is the receiver-resolution index, alive only during resolveAndWire.
 	recv *recvIndex
-	// pyBindings: file -> names bound by that Python file's import statements.
-	pyBindings map[string]map[string]bool
+	// pyBindings: file -> name bound by a Python import -> the file that import
+	// resolves to ("" when it resolves to no local file, e.g. the stdlib).
+	pyBindings map[string]map[string]string
+	// fileTypes: file -> variable/parameter/field name -> declared type name.
+	fileTypes map[string]map[string]string
 }
 
 // exportSpecRaw is one `export { local as exported }` specifier queued
@@ -743,6 +746,9 @@ type langConfig struct {
 	// Line ranges come from navigating cap.Node.Parent() to the declaration node.
 	queryStr string
 	query    *sitter.Query // compiled once in parseFiles, reused per file
+	// declQuery collects declared variable types (receiver_types.go); nil when
+	// the language has none or its pattern failed to compile.
+	declQuery *sitter.Query
 }
 
 func langFor(ext string) *langConfig {
@@ -1549,7 +1555,8 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 	funcsByName := map[string][]string{}
 	c.namedImports = map[string]map[string]string{}
 	c.nsImports = map[string]map[string]string{}
-	c.pyBindings = map[string]map[string]bool{}
+	c.pyBindings = map[string]map[string]string{}
+	c.fileTypes = map[string]map[string]string{}
 
 	if c.tsconfigs == nil {
 		c.loadTSConfigs()
@@ -1573,6 +1580,13 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 			continue
 		}
 		lc.query = q
+		if ds := declQueryFor(ext); ds != "" {
+			if dq, err := sitter.NewQuery([]byte(ds), lc.lang); err == nil {
+				lc.declQuery = dq
+			} else {
+				fmt.Fprintf(os.Stderr, "gatt: %s declaration query failed to compile, typed receivers off: %v\n", ext, err)
+			}
+		}
 		compiledLangs[ext] = lc
 	}
 
@@ -1725,7 +1739,20 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		// loose-comment pass below doesn't re-emit them as floating comments.
 		consumed := map[int]bool{}
 		if ext == ".py" {
-			c.pyBindings[relPath] = pythonImportBindings(data)
+			bound := map[string]string{}
+			for name, cands := range pythonImportBindings(data) {
+				bound[name] = ""
+				for _, spec := range cands {
+					if f := c.pyModuleFile(path, spec); f != "" {
+						bound[name] = f
+						break
+					}
+				}
+			}
+			c.pyBindings[relPath] = bound
+		}
+		if lc.declQuery != nil {
+			c.fileTypes[relPath] = collectDecls(tree, lc.declQuery, data)
 		}
 
 		// fileAttrs is the same map the file node's Attrs already points at

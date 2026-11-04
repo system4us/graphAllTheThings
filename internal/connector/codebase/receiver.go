@@ -16,7 +16,9 @@ package codebase
 // every `list.add()`.
 
 import (
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -27,38 +29,94 @@ import (
 
 var (
 	pyImportRe = regexp.MustCompile(`(?m)^[ \t]*import[ \t]+([^\n#]+)`)
-	pyFromRe   = regexp.MustCompile(`(?m)^[ \t]*from[ \t]+[\w.]+[ \t]+import[ \t]+(\([^)]*\)|[^\n#]+)`)
+	pyFromRe   = regexp.MustCompile(`(?m)^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n#]+)`)
 )
 
-// pythonImportBindings returns the names that import statements bind in a
-// Python file: `import a.b` binds a, `import a.b as c` binds c, `from m import
-// x, y as z` binds x and z. A receiver is only trusted to be a module/class when
-// an import actually binds its name; otherwise `graph.add_node()` could be a local
-// variable that merely shares a name with an imported module.
-func pythonImportBindings(src []byte) map[string]bool {
-	out := map[string]bool{}
-	add := func(item string) {
+// pythonImportBindings returns, for each name the import statements of a Python
+// file bind, the dotted module paths it may refer to, most specific first:
+// `import a.b` binds a -> [a], `import a.b as c` binds c -> [a.b], and
+// `from m import x as z` binds z -> [m.x, m] (x is a submodule, or an object
+// defined in m). The path is what lets a receiver be tied to the SAME import:
+// `html.escape()` after `import html` (the stdlib) must not be linked to some
+// other file named html.py that a different statement imported.
+func pythonImportBindings(src []byte) map[string][]string {
+	out := map[string][]string{}
+	add := func(prefix, item string) {
 		item = strings.TrimSpace(strings.Trim(strings.TrimSpace(item), "()\\"))
 		if item == "" || item == "*" {
 			return
 		}
-		if _, alias, ok := strings.Cut(item, " as "); ok {
-			out[strings.TrimSpace(alias)] = true
+		name, alias, hasAlias := strings.Cut(item, " as ")
+		name = strings.TrimSpace(name)
+		if prefix == "" { // import a.b[.c] [as d]
+			if hasAlias {
+				out[strings.TrimSpace(alias)] = []string{name}
+			} else {
+				first := strings.SplitN(name, ".", 2)[0]
+				out[first] = []string{first}
+			}
 			return
 		}
-		out[strings.SplitN(item, ".", 2)[0]] = true
+		bind := name
+		if hasAlias {
+			bind = strings.TrimSpace(alias)
+		}
+		sep := "."
+		if strings.HasSuffix(prefix, ".") { // from . import x, from .. import x
+			sep = ""
+		}
+		out[bind] = []string{prefix + sep + name, prefix}
 	}
 	for _, m := range pyImportRe.FindAllSubmatch(src, -1) {
 		for _, it := range strings.Split(string(m[1]), ",") {
-			add(it)
+			add("", it)
 		}
 	}
 	for _, m := range pyFromRe.FindAllSubmatch(src, -1) {
-		for _, it := range strings.Split(strings.NewReplacer("\n", " ", "(", " ", ")", " ").Replace(string(m[1])), ",") {
-			add(it)
+		prefix := string(m[1])
+		for _, it := range strings.Split(strings.NewReplacer("\n", " ", "(", " ", ")", " ").Replace(string(m[2])), ",") {
+			add(prefix, it)
 		}
 	}
 	return out
+}
+
+// pyModuleFile resolves a Python module path ("a.b", ".c", "..d.e") to the
+// relative path of its file (a.py or a/__init__.py) under the extraction root,
+// or "". Unlike resolvePythonImport it creates no graph nodes.
+func (c *Connector) pyModuleFile(fromAbs, spec string) string {
+	try := func(base string, segs []string) string {
+		target := filepath.Join(append([]string{base}, segs...)...)
+		for _, cand := range []string{target + ".py", filepath.Join(target, "__init__.py")} {
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				if rel, err := filepath.Rel(c.dir, cand); err == nil && !strings.HasPrefix(rel, "..") {
+					return filepath.ToSlash(rel)
+				}
+			}
+		}
+		return ""
+	}
+	if strings.HasPrefix(spec, ".") {
+		dots := 0
+		for dots < len(spec) && spec[dots] == '.' {
+			dots++
+		}
+		base := filepath.Dir(fromAbs)
+		for i := 1; i < dots; i++ {
+			base = filepath.Dir(base)
+		}
+		var segs []string
+		if rest := spec[dots:]; rest != "" {
+			segs = strings.Split(rest, ".")
+		}
+		return try(base, segs)
+	}
+	for _, root := range c.pyRoots() {
+		if f := try(root, strings.Split(spec, ".")); f != "" {
+			return f
+		}
+	}
+	return ""
 }
 
 // maxReceiverTargets bounds how many same-named functions in the resolved file
@@ -67,27 +125,72 @@ func pythonImportBindings(src []byte) map[string]bool {
 const maxReceiverTargets = 6
 
 // receiverToken is the raw-call token for a selector call whose receiver is a
-// single plain identifier: "@Recv.method". Anything else (a chain, a call
-// result, an index expression) cannot be resolved from names alone.
+// single plain identifier, or `this.field` / `self.field` (which can only name
+// that field): "@Recv.method". Anything else (a longer chain, a call result, an
+// index expression) cannot be resolved from names alone.
 func receiverToken(obj, name *sitter.Node, data []byte) string {
+	recv := ""
 	switch obj.Type() {
 	case "identifier", "type_identifier", "simple_identifier", "name":
-	default:
-		return ""
+		recv = obj.Content(data)
+	case "field_access", "member_expression", "member_access_expression", "navigation_expression":
+		recv = thisFieldName(obj, data)
 	}
-	recv, method := obj.Content(data), name.Content(data)
+	method := name.Content(data)
 	if recv == "" || method == "" || strings.ContainsAny(recv, ". \t\n") {
 		return ""
 	}
 	return "@" + recv + "." + method
 }
 
+// thisFieldName returns "f" for the expression this.f / self.f, else "".
+func thisFieldName(n *sitter.Node, data []byte) string {
+	isSelf := func(c *sitter.Node) bool {
+		switch c.Type() {
+		case "this", "this_expression", "self_expression", "self":
+			return true
+		}
+		return false
+	}
+	var object, field *sitter.Node
+	switch n.Type() {
+	case "field_access": // Java
+		object, field = n.ChildByFieldName("object"), n.ChildByFieldName("field")
+	case "member_expression": // TS / JS
+		object, field = n.ChildByFieldName("object"), n.ChildByFieldName("property")
+	case "member_access_expression": // C#
+		object, field = n.ChildByFieldName("expression"), n.ChildByFieldName("name")
+	case "navigation_expression": // Kotlin / Swift: <target> <navigation_suffix>
+		if n.NamedChildCount() == 2 {
+			object = n.NamedChild(0)
+			if suf := n.NamedChild(1); suf != nil && suf.Type() == "navigation_suffix" {
+				field = suf.NamedChild(0)
+				if suf.NamedChildCount() == 0 {
+					field = nil
+				}
+			}
+		}
+	}
+	if object == nil || field == nil || !isSelf(object) {
+		return ""
+	}
+	switch field.Type() {
+	case "identifier", "property_identifier", "simple_identifier", "field_identifier":
+		return field.Content(data)
+	}
+	return ""
+}
+
+// defRef is a type definition and the file that holds it.
+type defRef struct{ id, file string }
+
 // recvIndex is the lookup data for receiver resolution, built once per
 // resolveAndWire from the finished graph.
 type recvIndex struct {
 	funcsInFile   map[string]map[string][]string // rel file -> function name -> ids
 	funcsInDir    map[string]map[string][]string // rel dir -> name -> ids (package-level, not methods)
-	defFiles      map[string][]string            // type name -> rel files that define it
+	defs          map[string][]defRef            // type name -> definitions
+	methodsOf     map[string]map[string][]string // definition id -> method name -> function ids (Go: HAS_METHOD)
 	pkgName       map[string]string              // package node id -> name
 	importedPkgs  map[string][]string            // caller rel file -> imported local package node ids
 	importedFiles map[string][]string            // caller rel file -> imported local rel files
@@ -97,7 +200,8 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 	ri := &recvIndex{
 		funcsInFile:   map[string]map[string][]string{},
 		funcsInDir:    map[string]map[string][]string{},
-		defFiles:      map[string][]string{},
+		defs:          map[string][]defRef{},
+		methodsOf:     map[string]map[string][]string{},
 		pkgName:       map[string]string{},
 		importedPkgs:  map[string][]string{},
 		importedFiles: map[string][]string{},
@@ -106,6 +210,14 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 	for _, e := range g.Edges {
 		if e.Type == graph.EdgeHasMethod {
 			isMethod[e.To] = true
+			if fn := g.Nodes[e.To]; fn != nil {
+				m := ri.methodsOf[e.From]
+				if m == nil {
+					m = map[string][]string{}
+					ri.methodsOf[e.From] = m
+				}
+				m[fn.Name] = append(m[fn.Name], e.To)
+			}
 		}
 	}
 	for id, n := range g.Nodes {
@@ -135,7 +247,7 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 			}
 		case graph.NodeDefinition:
 			if f := n.Attrs["file"]; f != "" {
-				ri.defFiles[n.Name] = append(ri.defFiles[n.Name], f)
+				ri.defs[n.Name] = append(ri.defs[n.Name], defRef{id: id, file: f})
 			}
 		case graph.NodePackage:
 			ri.pkgName[id] = n.Name
@@ -160,23 +272,72 @@ func buildRecvIndex(g *graph.Graph) *recvIndex {
 }
 
 // resolve returns the function ids that recv.method provably refers to, or nil.
-// namedImports is the caller file's JS/TS import map (binding -> "file:<abs>").
-func (ri *recvIndex) resolve(root, callerFile, recv, method string, namedImports map[string]string, pyBound map[string]bool) []string {
+// namedImports is the caller file's JS/TS import map (binding -> "file:<abs>"),
+// pyMod the file each of its Python import bindings resolves to, types its declared variable types.
+func (ri *recvIndex) resolve(root, callerFile, recv, method string, namedImports map[string]string, pyMod map[string]string, types map[string]string) []string {
 	// Go: recv is the name of an imported local package -> a package-level function.
+	if ids := ri.packageFunc(callerFile, recv, method); len(ids) > 0 {
+		return ids
+	}
+
+	// recv is itself a type (static call), a JS/TS import binding or a Python module.
+	defs := ri.visibleDefs(callerFile, recv, pyMod)
+	files := map[string]bool{}
+	for _, d := range defs {
+		files[d.file] = true
+	}
+	if target, ok := namedImports[recv]; ok { // `import { Foo } from './foo'` binds Foo to that exact file
+		if rel, ok := relFromFileID(root, target); ok {
+			files[rel] = true
+		}
+	}
+	if f := pyMod[recv]; f != "" && strings.HasSuffix(callerFile, ".py") { // `import util` then util.func()
+		files[f] = true
+	}
+	if len(files) == 1 {
+		return ri.methodsIn(defs, files, method)
+	}
+	if len(files) > 1 {
+		return nil // ambiguous between files
+	}
+
+	// recv is a variable whose declared type is in this file: svc.find() with
+	// `UserService svc`. "" marks a name declared with conflicting types.
+	typ := types[recv]
+	if typ == "" {
+		return nil
+	}
+	if pkg, name, ok := strings.Cut(typ, "."); ok { // Go: util.Repo
+		return ri.qualifiedTypeMethods(callerFile, pkg, name, method)
+	}
+	tdefs := ri.visibleDefs(callerFile, typ, pyMod)
+	tfiles := map[string]bool{}
+	for _, d := range tdefs {
+		tfiles[d.file] = true
+	}
+	if len(tfiles) != 1 {
+		return nil
+	}
+	return ri.methodsIn(tdefs, tfiles, method)
+}
+
+// packageFunc: recv names a local package the caller imports (Go).
+func (ri *recvIndex) packageFunc(callerFile, recv, method string) []string {
 	for _, pid := range ri.importedPkgs[callerFile] {
 		if ri.pkgName[pid] != recv {
 			continue
 		}
-		dir := strings.TrimPrefix(pid, "pkg:")
-		if ids := ri.funcsInDir[dir][method]; len(ids) > 0 && len(ids) <= maxReceiverTargets {
+		if ids := ri.funcsInDir[strings.TrimPrefix(pid, "pkg:")][method]; len(ids) > 0 && len(ids) <= maxReceiverTargets {
 			return ids
 		}
 	}
+	return nil
+}
 
-	cand := map[string]bool{}
-
-	// Type name visible from the caller: same file, same directory (package /
-	// namespace), or a directory / file the caller imports.
+// visibleDefs returns the definitions named name that the caller can see: in
+// its own file, in its own directory (same package / namespace), or in a
+// directory or file it imports.
+func (ri *recvIndex) visibleDefs(callerFile, name string, pyMod map[string]string) []defRef {
 	callerDir := path.Dir(callerFile)
 	impDirs := map[string]bool{}
 	for _, pid := range ri.importedPkgs[callerFile] {
@@ -186,41 +347,61 @@ func (ri *recvIndex) resolve(root, callerFile, recv, method string, namedImports
 	for _, f := range ri.importedFiles[callerFile] {
 		impFiles[f] = true
 	}
-	for _, f := range ri.defFiles[recv] {
-		if strings.HasSuffix(callerFile, ".py") && f != callerFile && !pyBound[recv] {
-			continue // Python: another file's class is only visible through an import binding
-		}
-		if f == callerFile || path.Dir(f) == callerDir || impDirs[path.Dir(f)] || impFiles[f] {
-			cand[f] = true
-		}
-	}
-
-	// JS/TS: `import { Foo } from './foo'` binds Foo to that exact file.
-	if target, ok := namedImports[recv]; ok {
-		if rel, ok := relFromFileID(root, target); ok {
-			cand[rel] = true
-		}
-	}
-
-	// Python: `import util` / `from pkg import util` then util.func().
-	if strings.HasSuffix(callerFile, ".py") && pyBound[recv] {
-		for _, f := range ri.importedFiles[callerFile] {
-			base := strings.TrimSuffix(path.Base(f), ".py")
-			if base == "__init__" {
-				base = path.Base(path.Dir(f))
-			}
-			if base == recv {
-				cand[f] = true
+	var out []defRef
+	for _, d := range ri.defs[name] {
+		if strings.HasSuffix(callerFile, ".py") && d.file != callerFile {
+			if _, bound := pyMod[name]; !bound {
+				continue // Python: another file's class is only visible through an import binding
 			}
 		}
+		if d.file == callerFile || path.Dir(d.file) == callerDir || impDirs[path.Dir(d.file)] || impFiles[d.file] {
+			out = append(out, d)
+		}
 	}
+	return out
+}
 
-	if len(cand) != 1 {
-		return nil // nothing demonstrable, or ambiguous between files
+// methodsIn finds functions called method that belong to the given definitions.
+// Where methods are linked to their type (Go: HAS_METHOD) only those count;
+// elsewhere every function of that name in the defining file does (overloads).
+func (ri *recvIndex) methodsIn(defs []defRef, files map[string]bool, method string) []string {
+	var out []string
+	linked := false
+	for _, d := range defs {
+		if len(ri.methodsOf[d.id]) > 0 {
+			linked = true
+			out = append(out, ri.methodsOf[d.id][method]...)
+		}
 	}
-	for f := range cand {
-		if ids := ri.funcsInFile[f][method]; len(ids) > 0 && len(ids) <= maxReceiverTargets {
-			return ids
+	if !linked {
+		for f := range files {
+			out = append(out, ri.funcsInFile[f][method]...)
+		}
+	}
+	if len(out) == 0 || len(out) > maxReceiverTargets {
+		return nil
+	}
+	return out
+}
+
+// qualifiedTypeMethods: a Go variable declared as pkg.Type, where pkg is an
+// imported local package.
+func (ri *recvIndex) qualifiedTypeMethods(callerFile, pkg, name, method string) []string {
+	for _, pid := range ri.importedPkgs[callerFile] {
+		if ri.pkgName[pid] != pkg {
+			continue
+		}
+		dir := strings.TrimPrefix(pid, "pkg:")
+		var defs []defRef
+		files := map[string]bool{}
+		for _, d := range ri.defs[name] {
+			if path.Dir(d.file) == dir {
+				defs = append(defs, d)
+				files[d.file] = true
+			}
+		}
+		if len(defs) == 1 {
+			return ri.methodsIn(defs, files, method)
 		}
 	}
 	return nil
@@ -244,7 +425,7 @@ func (c *Connector) resolveReceiverCall(g *graph.Graph, callerID, callerFile, re
 	if c.recv == nil {
 		return
 	}
-	for _, target := range c.recv.resolve(c.dir, callerFile, recv, method, c.namedImports[callerFile], c.pyBindings[callerFile]) {
+	for _, target := range c.recv.resolve(c.dir, callerFile, recv, method, c.namedImports[callerFile], c.pyBindings[callerFile], c.fileTypes[callerFile]) {
 		if target != callerID {
 			g.AddEdge(callerID, target, graph.EdgeCalls, map[string]string{"inferred": "true", "via": "receiver", "receiver": recv})
 		}
