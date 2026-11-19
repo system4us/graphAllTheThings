@@ -69,15 +69,15 @@ type Connector struct {
 	gitFiles      map[string]bool
 	gitFilesOK    bool
 	gitFilesKnown bool
-	// goModuleRoot/goModulePath are the enclosing go.mod's directory and
-	// `module` path, used to resolve a Go import spec that names a package
-	// of this project (as opposed to stdlib/a third-party dependency) to a
-	// local "pkg:<dir>" node instead of an opaque external one. Loaded
-	// lazily by loadGoModule; goModuleChecked distinguishes "not looked up
-	// yet" from "looked up, no go.mod found" (goModulePath == "").
-	goModuleRoot    string
-	goModulePath    string
+	// goModules holds every go.mod discovered inside c.dir (up to depth 3,
+	// supporting monorepos like api/go.mod) or in an enclosing ancestor when
+	// c.dir is a subdirectory of a module. Loaded lazily by loadGoModule.
+	goModules       []goModule
 	goModuleChecked bool
+	// goPkgImports records per-Go-file local package imports (alias + "pkg:<dir>")
+	// so package-qualified calls like `localization.ParseDay(...)` or
+	// `database.InTenant(...)` resolve to the imported package's functions.
+	goPkgImports map[string][]goPkgImport
 	// jvmSourceRoots holds every conventional Maven/Gradle source directory
 	// found in the tree (the extraction root itself, plus any
 	// src/main/java, src/main/kotlin, src/test/java, src/test/kotlin at any
@@ -2095,6 +2095,20 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				switch ext {
 				case ".go":
 					resolved = c.resolveGoPackageImport(g, importStr)
+					if resolved != "" {
+						alias := ""
+						if sp := importNode.Parent(); sp != nil && sp.Type() == "import_spec" {
+							if an := sp.ChildByFieldName("name"); an != nil {
+								alias = an.Content(data)
+							}
+						}
+						if alias != "_" {
+							if c.goPkgImports == nil {
+								c.goPkgImports = map[string][]goPkgImport{}
+							}
+							c.goPkgImports[relPath] = append(c.goPkgImports[relPath], goPkgImport{alias: alias, pkgID: resolved})
+						}
+					}
 				case ".py":
 					resolved = c.resolvePythonImport(g, path, importStr)
 				case ".java", ".kt":
@@ -2730,9 +2744,36 @@ func resolveCall(g *graph.Graph, fromFile, raw string, funcsByName map[string][]
 			break
 		}
 	}
-	switch {
-	case sameFile != "":
+	if sameFile != "" {
 		return sameFile
+	}
+	// Go: all files in the same directory share one package namespace, so a
+	// unique match in the same directory (excluding *_test.go for non-test
+	// callers) resolves even when another package or language (e.g. TS) has a
+	// function with the same name.
+	if strings.HasSuffix(fromFile, ".go") && len(targets) > 0 {
+		fromDir := filepath.Dir(fromFile)
+		fromTest := strings.HasSuffix(fromFile, "_test.go")
+		var samePkg []string
+		for _, tid := range targets {
+			tn := g.Nodes[tid]
+			if tn == nil {
+				continue
+			}
+			tf := tn.Attrs["file"]
+			if !strings.HasSuffix(tf, ".go") || filepath.Dir(tf) != fromDir {
+				continue
+			}
+			if !fromTest && strings.HasSuffix(tf, "_test.go") {
+				continue
+			}
+			samePkg = append(samePkg, tid)
+		}
+		if len(samePkg) == 1 {
+			return samePkg[0]
+		}
+	}
+	switch {
 	case isSelector:
 		return ""
 	case len(targets) == 1:
@@ -2811,29 +2852,79 @@ func (c *Connector) resolveLocalImport(fromPath, spec string) string {
 // fields empty when no go.mod is found — not an error, just means Go import
 // specs in this tree can't be told apart from third-party packages, and fall
 // back to the generic external-node path like every other language.
+type goModule struct {
+	root string // absolute directory containing go.mod
+	path string // module path from go.mod
+}
+
+type goPkgImport struct {
+	alias string // explicit import alias ("" = default package name)
+	pkgID string // "pkg:<relDir>"
+}
+
+func parseGoModPath(modFile string) string {
+	data, err := os.ReadFile(modFile)
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if s := strings.TrimSpace(line); strings.HasPrefix(s, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(s, "module "))
+		}
+	}
+	return ""
+}
+
 func (c *Connector) loadGoModule() {
-	dir, err := filepath.Abs(c.dir)
+	rootAbs, err := filepath.Abs(c.dir)
 	if err != nil {
 		return
 	}
-	for {
-		data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
-		if err == nil {
-			for line := range strings.SplitSeq(string(data), "\n") {
-				if s := strings.TrimSpace(line); strings.HasPrefix(s, "module ") {
-					c.goModuleRoot = dir
-					c.goModulePath = strings.TrimSpace(strings.TrimPrefix(s, "module "))
-					return
-				}
+	seen := map[string]bool{}
+	// 1. Discover go.mod files inside c.dir up to depth 3 (handles monorepos
+	// like api/go.mod as well as single-module repos with ./go.mod).
+	_ = filepath.WalkDir(rootAbs, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != rootAbs && graph.SkipDir(d.Name(), false) {
+				return filepath.SkipDir
 			}
-			return // go.mod with no module line — malformed, treat as absent
+			rel, rerr := filepath.Rel(rootAbs, p)
+			if rerr == nil && rel != "." && strings.Count(filepath.ToSlash(rel), "/")+1 > 3 {
+				return filepath.SkipDir
+			}
+			return nil
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return
+		if d.Name() == "go.mod" {
+			modDir := filepath.Dir(p)
+			if mp := parseGoModPath(p); mp != "" && !seen[modDir] {
+				seen[modDir] = true
+				c.goModules = append(c.goModules, goModule{root: modDir, path: mp})
+			}
 		}
-		dir = parent
+		return nil
+	})
+	// 2. Fallback: walk up ancestors if c.dir itself is a subdirectory of a Go module.
+	if len(c.goModules) == 0 {
+		dir := rootAbs
+		for {
+			if mp := parseGoModPath(filepath.Join(dir, "go.mod")); mp != "" {
+				c.goModules = append(c.goModules, goModule{root: dir, path: mp})
+				break
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
 	}
+	// Longest module path first so nested modules win over parent modules.
+	sort.Slice(c.goModules, func(i, j int) bool {
+		return len(c.goModules[i].path) > len(c.goModules[j].path)
+	})
 }
 
 // getOrCreatePackageNode returns (creating if absent) the "pkg:<dirRel>"
@@ -2881,28 +2972,28 @@ func (c *Connector) resolveGoPackageImport(g *graph.Graph, importPath string) st
 		c.loadGoModule()
 		c.goModuleChecked = true
 	}
-	if c.goModulePath == "" {
-		return ""
+	for _, mod := range c.goModules {
+		var rel string
+		switch {
+		case importPath == mod.path:
+			rel = "."
+		case strings.HasPrefix(importPath, mod.path+"/"):
+			rel = strings.TrimPrefix(importPath, mod.path+"/")
+		default:
+			continue
+		}
+		pkgDirAbs := filepath.Join(mod.root, rel)
+		pkgDirRel, err := filepath.Rel(c.dir, pkgDirAbs)
+		if err != nil || pkgDirRel == ".." || strings.HasPrefix(pkgDirRel, ".."+string(filepath.Separator)) {
+			continue // package lives outside the extraction root
+		}
+		name := filepath.Base(pkgDirRel)
+		if pkgDirRel == "." {
+			name = filepath.Base(mod.path)
+		}
+		return c.getOrCreatePackageNode(g, filepath.ToSlash(pkgDirRel), name, importPath)
 	}
-	var rel string
-	switch {
-	case importPath == c.goModulePath:
-		rel = "."
-	case strings.HasPrefix(importPath, c.goModulePath+"/"):
-		rel = strings.TrimPrefix(importPath, c.goModulePath+"/")
-	default:
-		return "" // not this project's module — stdlib or third-party
-	}
-	pkgDirAbs := filepath.Join(c.goModuleRoot, rel)
-	pkgDirRel, err := filepath.Rel(c.dir, pkgDirAbs)
-	if err != nil || pkgDirRel == ".." || strings.HasPrefix(pkgDirRel, ".."+string(filepath.Separator)) {
-		return "" // package lives outside the extraction root
-	}
-	name := filepath.Base(pkgDirRel)
-	if pkgDirRel == "." {
-		name = filepath.Base(c.goModulePath)
-	}
-	return c.getOrCreatePackageNode(g, filepath.ToSlash(pkgDirRel), name, importPath)
+	return ""
 }
 
 // wireGoPackage links a Go file to its package node (one per directory,
@@ -2919,11 +3010,17 @@ func (c *Connector) wireGoPackage(g *graph.Graph, fileID, relPath, pkgName strin
 			c.loadGoModule()
 			c.goModuleChecked = true
 		}
-		if c.goModulePath != "" {
-			if dir == "." {
-				importPath = c.goModulePath
-			} else {
-				importPath = c.goModulePath + "/" + dir
+		dirAbs, err := filepath.Abs(filepath.Join(c.dir, filepath.FromSlash(dir)))
+		if err == nil {
+			for _, mod := range c.goModules {
+				if rel, err := filepath.Rel(mod.root, dirAbs); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					if rel == "." {
+						importPath = mod.path
+					} else {
+						importPath = mod.path + "/" + filepath.ToSlash(rel)
+					}
+					break
+				}
 			}
 		}
 		c.getOrCreatePackageNode(g, dir, pkgName, importPath)
@@ -3544,7 +3641,9 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 
 		if rest, ok := strings.CutPrefix(calledName, "@"); ok {
 			if recv, method, ok := strings.Cut(rest, "."); ok {
-				c.resolveReceiverCall(g, callerID, callerFile, recv, method)
+				if !c.resolveGoPackageCall(g, callerID, callerFile, recv, method, funcsByName) {
+					c.resolveReceiverCall(g, callerID, callerFile, recv, method)
+				}
 			}
 			continue
 		}
@@ -3593,6 +3692,57 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 		}
 		g.AddEdge(callerID, stubID, graph.EdgeCalls, nil)
 	}
+}
+
+// resolveGoPackageCall wires a CALLS edge for a Go package-qualified call
+// (`localization.ParseDay(...)`, `database.InTenant(...)`) by matching recv
+// against the caller file's imported local Go packages and locating the target
+// function in that package's directory.
+func (c *Connector) resolveGoPackageCall(g *graph.Graph, callerID, callerFile, recv, method string, funcsByName map[string][]string) bool {
+	if !strings.HasSuffix(callerFile, ".go") {
+		return false
+	}
+	imps := c.goPkgImports[callerFile]
+	if len(imps) == 0 {
+		return false
+	}
+	var matchedDirs []string
+	for _, imp := range imps {
+		dir := strings.TrimPrefix(imp.pkgID, "pkg:")
+		pkgName := ""
+		if pn := g.Nodes[imp.pkgID]; pn != nil {
+			pkgName = pn.Name
+		}
+		if imp.alias == recv || (imp.alias == "" && (pkgName == recv || filepath.Base(dir) == recv)) {
+			matchedDirs = append(matchedDirs, dir)
+		}
+	}
+	if len(matchedDirs) == 0 {
+		return false
+	}
+	var targets []string
+	for _, tid := range funcsByName[method] {
+		tn := g.Nodes[tid]
+		if tn == nil {
+			continue
+		}
+		tf := tn.Attrs["file"]
+		if !strings.HasSuffix(tf, ".go") || strings.HasSuffix(tf, "_test.go") {
+			continue
+		}
+		tdir := filepath.ToSlash(filepath.Dir(tf))
+		for _, md := range matchedDirs {
+			if tdir == md {
+				targets = append(targets, tid)
+				break
+			}
+		}
+	}
+	if len(targets) != 1 || targets[0] == callerID {
+		return false
+	}
+	g.AddEdge(callerID, targets[0], graph.EdgeCalls, map[string]string{"inferred": "true", "via": "go-package"})
+	return true
 }
 
 // resolveTopLevelCalls wires CALLS edges for every call collected at module

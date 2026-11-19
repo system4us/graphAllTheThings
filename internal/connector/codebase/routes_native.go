@@ -45,6 +45,9 @@ func (c *Connector) detectNativeRoute(g *graph.Graph, nameNode *sitter.Node, cal
 }
 
 func (c *Connector) detectGoRoute(g *graph.Graph, nameNode *sitter.Node, callName, relPath, fileID string, data []byte) bool {
+	if strings.HasSuffix(relPath, "_test.go") {
+		return false
+	}
 	if !strings.HasPrefix(callName, ".") {
 		return false
 	}
@@ -101,6 +104,9 @@ func (c *Connector) detectGoRoute(g *graph.Graph, nameNode *sitter.Node, callNam
 		}
 		// still "": net/http handler that serves any method — wildcard route.
 	}
+	if prefix := goChiRoutePrefix(callNode, data); prefix != "" {
+		rawPath = joinRoutePaths(prefix, rawPath)
+	}
 	path := normalizeClientPath(`"` + rawPath + `"`) // chi {id} → :param; gin/echo :id stays
 	if !strings.HasPrefix(path, "/") {
 		return false
@@ -118,6 +124,61 @@ func (c *Connector) detectGoRoute(g *graph.Graph, nameNode *sitter.Node, callNam
 	}
 	c.emitNativeRoute(g, method, path, relPath, fileID, int(callNode.StartPoint().Row)+1, rargs)
 	return true
+}
+
+// goChiRoutePrefix collects enclosing chi `r.Route("/prefix", func(...) { ... })`
+// path prefixes from outermost to innermost so nested registrations like
+// `r.Route("/cajas/{id}", func(r chi.Router) { r.Get("/turno-actual", ...) })`
+// emit `/cajas/{id}/turno-actual` instead of `/turno-actual`.
+func goChiRoutePrefix(callNode *sitter.Node, data []byte) string {
+	var prefixes []string
+	for p := callNode.Parent(); p != nil; p = p.Parent() {
+		if p.Type() != "call_expression" {
+			continue
+		}
+		fn := p.ChildByFieldName("function")
+		if fn == nil || fn.Type() != "selector_expression" {
+			continue
+		}
+		fld := fn.ChildByFieldName("field")
+		if fld == nil || fld.Content(data) != "Route" {
+			continue
+		}
+		argsNode := callArguments(p)
+		if argsNode == nil {
+			continue
+		}
+		argNodes := unwrapArgs(argsNode)
+		if len(argNodes) >= 2 && isStringNode(argNodes[0]) {
+			if seg := strings.Trim(argNodes[0].Content(data), "\"`"); seg != "" {
+				prefixes = append(prefixes, seg)
+			}
+		}
+	}
+	if len(prefixes) == 0 {
+		return ""
+	}
+	// Collected innermost-first; join outermost-first.
+	out := ""
+	for i := len(prefixes) - 1; i >= 0; i-- {
+		out = joinRoutePaths(out, prefixes[i])
+	}
+	return out
+}
+
+func joinRoutePaths(prefix, suffix string) string {
+	if prefix == "" {
+		return suffix
+	}
+	p := strings.TrimRight(prefix, "/")
+	s := strings.TrimLeft(suffix, "/")
+	if s == "" {
+		if p == "" {
+			return "/"
+		}
+		return p
+	}
+	return p + "/" + s
 }
 
 func (c *Connector) detectPyRoute(g *graph.Graph, nameNode *sitter.Node, callName, relPath, fileID string, data []byte) bool {

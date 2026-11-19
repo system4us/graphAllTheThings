@@ -56,7 +56,7 @@ func (c *Connector) detectRoute(g *graph.Graph, caps map[string]*sitter.Node, re
 	if !ok {
 		return
 	}
-	method, ok := httpMethods[methodNode.Content(data)]
+	method, ok := httpMethods[strings.ToLower(methodNode.Content(data))]
 	if !ok {
 		return
 	}

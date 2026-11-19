@@ -172,6 +172,13 @@ func receiverToken(obj, name *sitter.Node, data []byte) string {
 		recv = obj.Content(data)
 	case "field_access", "member_expression", "member_access_expression", "navigation_expression":
 		recv = thisFieldName(obj, data)
+	case "selector_expression":
+		// Go: `s.DB.InTenant(...)` — obj is `s.DB` (operand=s, field=DB).
+		// Extract the field identifier (`DB`) when the operand is a simple
+		// receiver variable so `@DB.InTenant` resolves via struct field types.
+		if op, fld := obj.ChildByFieldName("operand"), obj.ChildByFieldName("field"); op != nil && fld != nil && op.Type() == "identifier" {
+			recv = fld.Content(data)
+		}
 	}
 	method := name.Content(data)
 	if recv == "" || method == "" || strings.ContainsAny(recv, ". \t\n") {
