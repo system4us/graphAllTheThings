@@ -1,5 +1,5 @@
 {
-  "name": "graph-all-the-things",
+  "name": "gatt-graph",
   "version": "0.0.0",
   "description": "gatt: build a metadata graph of your codebase and query it from the CLI or as an MCP server",
   "license": "AGPL-3.0-or-later",

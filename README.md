@@ -14,7 +14,13 @@ Codebase parsing covers nine languages with uneven depth; see [supported languag
 
 ## Install
 
-Requires Go 1.25+.
+Via npm (Node 18+):
+
+```bash
+npm install -g gatt-graph
+```
+
+Or build from source (requires Go 1.25+):
 
 ```bash
 go build -o ~/.local/bin/gatt ./cmd/gatt
