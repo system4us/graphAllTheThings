@@ -176,8 +176,14 @@ type joinIn struct {
 }
 
 type contextIn struct {
-	Question string `json:"question" jsonschema:"the user's natural-language question about the data or API"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"max tables/schemas to include, default 4"`
+	Question  string `json:"question" jsonschema:"the user's natural-language question about the data or API"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"max tables/schemas to include, default 4"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget (e.g. 1500 for compact, 4000 for deep); 0 = default"`
+}
+
+type affectedTestsIn struct {
+	Target string `json:"target,omitempty" jsonschema:"file path, symbol name, node id, or 'diff:HEAD' (default when omitted: git working-tree changes vs HEAD)"`
+	Depth  int    `json:"depth,omitempty" jsonschema:"dependency hops to walk, default 3"`
 }
 
 type impactIn struct {
@@ -240,7 +246,7 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, nil, err
 		}
-		out, err := e.ContextPack(ctx, in.Question, in.Limit)
+		out, err := e.ContextPackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -249,18 +255,34 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "code_context",
-		Description: "PREFERRED FIRST CALL for any code question on a codebase graph. Returns the most relevant functions (with signatures, file:line locations, callers, and callees), types/structs (with all their methods), and relevant docs/files — all in one compact block. Use this before reading source files directly; it tells you exactly what exists and where so you can navigate with precision. Works with find_entities and describe_entity for follow-up detail.",
+		Description: "PREFERRED FIRST CALL for any code question on a codebase graph. Returns the most relevant functions (with signatures, file:line locations, callers, and callees), types/structs (with all their methods), and relevant docs/files — all in one compact block. Use this before reading source files directly; it tells you exactly what exists and where so you can navigate with precision. Supports optional max_tokens budget.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, any, error) {
 		note := s.autoRefreshCodebase(ctx)
 		e, err := s.requireEngine()
 		if err != nil {
 			return nil, nil, err
 		}
-		out, err := e.CodeContextPack(ctx, in.Question, in.Limit)
+		out, err := e.CodeContextPackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
 		if err != nil {
 			return nil, nil, err
 		}
 		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "affected_tests",
+		Description: "Minimal set of test files, direct test functions, and ready-to-run test commands (go test, vitest, pytest, cargo test) impacted by modifying a file, function, or the current git diff (omit target for working-tree changes vs HEAD). Run after edits to verify changes without running the entire suite.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in affectedTestsIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		res, err := e.AffectedTests(ctx, in.Target, in.Depth)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + res.Text), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{

@@ -8,6 +8,7 @@ import {
   type GraphView,
   type LayoutName,
   type OverviewResponse,
+  type SavedBookmark,
   type TreeNode,
 } from './types';
 
@@ -23,6 +24,7 @@ interface SidebarProps {
   layout: LayoutName;
   includeExternal: boolean;
   selectedNodeTypes: string[];
+  bookmarks: SavedBookmark[];
   onSelectPkg: (pkg: string) => void;
   onSelectFileNode: (nodeId: string) => void;
   onFocusImpact: (nodeId: string) => void;
@@ -32,6 +34,9 @@ interface SidebarProps {
   onToggleExternal: (v: boolean) => void;
   onToggleNodeType: (t: string) => void;
   onClearFilters: () => void;
+  onSaveBookmark: (name: string) => void;
+  onApplyBookmark: (b: SavedBookmark) => void;
+  onDeleteBookmark: (id: string) => void;
   onShowOverlay: (view: GraphView, nodes: GraphNode[], edges: GraphEdge[], label?: string) => void;
 }
 
@@ -110,6 +115,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   layout,
   includeExternal,
   selectedNodeTypes,
+  bookmarks,
   onSelectPkg,
   onSelectFileNode,
   onFocusImpact,
@@ -119,9 +125,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleExternal,
   onToggleNodeType,
   onClearFilters,
+  onSaveBookmark,
+  onApplyBookmark,
+  onDeleteBookmark,
   onShowOverlay,
 }) => {
   const [tab, setTab] = useState<SidebarTab>('explorer');
+  const [bmName, setBmName] = useState('');
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
     y: number;
@@ -165,7 +175,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
     : [];
 
   const isToolTab = (t: SidebarTab): t is ToolTab =>
-    t === 'grep' || t === 'diff' || t === 'ask' || t === 'drift' || t === 'join';
+    t === 'grep' ||
+    t === 'diff' ||
+    t === 'ask' ||
+    t === 'tests' ||
+    t === 'hotspots' ||
+    t === 'drift' ||
+    t === 'join';
 
   return (
     <aside className="sidebar">
@@ -175,9 +191,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
             ['explorer', 'Explorer'],
             ['packages', 'Packages'],
             ['filters', 'Filters'],
+            ['ask', 'Ask'],
             ['grep', 'Grep'],
             ['diff', 'Diff'],
-            ['ask', 'Ask'],
+            ['tests', 'Tests'],
+            ['hotspots', 'Hotspots'],
             ['drift', 'Drift'],
             ['join', 'Join'],
           ] as [SidebarTab, string][]
@@ -261,6 +279,54 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {tab === 'filters' && (
           <div className="filters-pane">
+            <div className="filter-group">
+              <label>Saved Views / Bookmarks</label>
+              <form
+                className="tool-row"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!bmName.trim()) return;
+                  onSaveBookmark(bmName.trim());
+                  setBmName('');
+                }}
+              >
+                <input
+                  type="text"
+                  placeholder="Save current view as…"
+                  value={bmName}
+                  onChange={(e) => setBmName(e.target.value)}
+                  className="bm-input"
+                />
+                <button type="submit" className="secondary-btn">
+                  Save
+                </button>
+              </form>
+              {bookmarks.length > 0 && (
+                <div className="bm-list">
+                  {bookmarks.map((b) => (
+                    <div key={b.id} className="bm-item">
+                      <button
+                        type="button"
+                        className="bm-load"
+                        onClick={() => onApplyBookmark(b)}
+                        title={`${b.view}${b.pkg ? ' · ' + b.pkg : ''}`}
+                      >
+                        ★ {b.name}
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => onDeleteBookmark(b.id)}
+                        title="Delete bookmark"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <div className="filter-group">
               <label>Layout</label>
               <select

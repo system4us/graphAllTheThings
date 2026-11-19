@@ -200,6 +200,14 @@ export interface SourcePreview {
   truncated?: boolean;
 }
 
+export interface CommitEntry {
+  sha: string;
+  date: string;
+  author: string;
+  subject: string;
+  issues?: string[];
+}
+
 export interface NodeDetailResponse {
   repo: string;
   id: string;
@@ -212,6 +220,56 @@ export interface NodeDetailResponse {
   incoming: NeighborSummary[] | null;
   outgoing: NeighborSummary[] | null;
   source?: SourcePreview | null;
+  history?: CommitEntry[] | null;
+}
+
+export interface TestRef {
+  id: string;
+  name: string;
+  file: string;
+  line?: string;
+}
+
+export interface AffectedTestsResponse {
+  repo: string;
+  target: string;
+  test_files: string[];
+  test_functions: TestRef[];
+  commands: string[];
+  text: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface HotspotEntry {
+  node_id: string;
+  path: string;
+  commits: number;
+  degree: number;
+  score: number;
+}
+
+export interface HotspotsResponse {
+  repo: string;
+  hotspots: HotspotEntry[];
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface NodeDiffResponse {
+  repo: string;
+  file: string;
+  ref: string;
+  diff: string;
+}
+
+export interface SavedBookmark {
+  id: string;
+  name: string;
+  view: GraphView;
+  pkg: string;
+  layout: LayoutName;
+  groupByPackage: boolean;
 }
 
 export interface SearchHit {

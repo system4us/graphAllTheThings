@@ -11,6 +11,7 @@ interface InspectorProps {
   onFocusNeighbors: (id: string) => void;
   onFocusImpact: (id: string) => void;
   onFocusCalls: (id: string) => void;
+  onFindTests: (id: string) => void;
   onOpenPackage: (pkg: string) => void;
   onAnnotated: () => void;
 }
@@ -24,6 +25,7 @@ export const Inspector: React.FC<InspectorProps> = ({
   onFocusNeighbors,
   onFocusImpact,
   onFocusCalls,
+  onFindTests,
   onOpenPackage,
   onAnnotated,
 }) => {
@@ -35,6 +37,9 @@ export const Inspector: React.FC<InspectorProps> = ({
   const [modelTable, setModelTable] = useState('');
   const [saving, setSaving] = useState(false);
   const [annMsg, setAnnMsg] = useState<string | null>(null);
+  const [diffOpen, setDiffOpen] = useState(false);
+  const [diffText, setDiffText] = useState<string | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
 
   useEffect(() => {
     setEntityNote(detail?.attrs?.entity_note ?? '');
@@ -43,7 +48,27 @@ export const Inspector: React.FC<InspectorProps> = ({
     setRoutePath(detail?.attrs?.route_path ?? '');
     setModelTable(detail?.attrs?.model_table ?? '');
     setAnnMsg(null);
+    setDiffOpen(false);
+    setDiffText(null);
   }, [detail]);
+
+  const toggleGitDiff = async () => {
+    if (!detail?.file) return;
+    if (diffOpen) {
+      setDiffOpen(false);
+      return;
+    }
+    setDiffOpen(true);
+    setDiffLoading(true);
+    try {
+      const res = await api.nodeDiff(detail.file, 'HEAD', repo);
+      setDiffText(res.diff || 'No uncommitted changes vs HEAD.');
+    } catch (err: unknown) {
+      setDiffText(err instanceof Error ? err.message : 'Failed to load git diff');
+    } finally {
+      setDiffLoading(false);
+    }
+  };
 
   if (!detail && !loading) return null;
 
@@ -137,6 +162,18 @@ export const Inspector: React.FC<InspectorProps> = ({
                     Call Graph
                   </button>
                 )}
+                <button type="button" onClick={() => onFindTests(detail.id)}>
+                  Affected Tests
+                </button>
+                {detail.file && (
+                  <button
+                    type="button"
+                    className={diffOpen ? 'active-btn' : ''}
+                    onClick={toggleGitDiff}
+                  >
+                    ± Git Diff
+                  </button>
+                )}
                 <button
                   type="button"
                   className={annOpen ? 'active-btn' : ''}
@@ -147,6 +184,34 @@ export const Inspector: React.FC<InspectorProps> = ({
               </>
             )}
           </div>
+
+          {diffOpen && (
+            <section className="inspector-section">
+              <div className="section-title">Git Diff vs HEAD</div>
+              {diffLoading ? (
+                <div className="muted-note">Loading diff…</div>
+              ) : (
+                <div className="code-box diff-box">
+                  <pre>
+                    {(diffText ?? '').split('\n').map((line, idx) => {
+                      const cls = line.startsWith('+') && !line.startsWith('+++')
+                        ? 'diff-add'
+                        : line.startsWith('-') && !line.startsWith('---')
+                          ? 'diff-del'
+                          : line.startsWith('@@')
+                            ? 'diff-hunk'
+                            : '';
+                      return (
+                        <div key={idx} className={`code-line ${cls}`}>
+                          <span className="line-txt">{line}</span>
+                        </div>
+                      );
+                    })}
+                  </pre>
+                </div>
+              )}
+            </section>
+          )}
 
           {annOpen && (
             <section className="annotate-box">
@@ -282,6 +347,35 @@ export const Inspector: React.FC<InspectorProps> = ({
               </div>
             )}
           </section>
+
+          {detail.history && detail.history.length > 0 && (
+            <section className="inspector-section">
+              <div className="section-title">
+                Git History <span className="section-meta">{detail.history.length} commits</span>
+              </div>
+              <div className="history-list">
+                {detail.history.map((c) => (
+                  <div key={c.sha} className="history-item">
+                    <div className="history-head">
+                      <code>{c.sha}</code>
+                      <span>{c.date}</span>
+                      <span className="history-author">{c.author}</span>
+                    </div>
+                    <div className="history-subj">{c.subject}</div>
+                    {c.issues && c.issues.length > 0 && (
+                      <div className="history-issues">
+                        {c.issues.map((iss) => (
+                          <span key={iss} className="issue-chip">
+                            {iss}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           {attrEntries.length > 0 && (
             <section className="inspector-section">

@@ -22,9 +22,16 @@ type globalRepoOnlyIn struct {
 }
 
 type globalContextIn struct {
-	Repo     string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
-	Question string `json:"question" jsonschema:"natural-language question about the code"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"max items to include, default 6"`
+	Repo      string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Question  string `json:"question" jsonschema:"natural-language question about the code"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"max items to include, default 6"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget (e.g. 1500 for compact, 4000 for deep); 0 = default"`
+}
+
+type globalTestsIn struct {
+	Repo   string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Target string `json:"target,omitempty" jsonschema:"file path, symbol name, node id, or 'diff:HEAD' (default: current git diff vs HEAD)"`
+	Depth  int    `json:"depth,omitempty" jsonschema:"dependency hops to walk, default 3"`
 }
 
 type globalImpactIn struct {
@@ -134,11 +141,26 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 		if err != nil {
 			return nil, nil, err
 		}
-		out, err := e.CodeContextPack(ctx, in.Question, in.Limit)
+		out, err := e.CodeContextPackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
 		if err != nil {
 			return nil, nil, err
 		}
 		return mcpText(note + out), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "affected_tests",
+		Description: "Minimal set of test files, direct test functions, and ready-to-run test commands impacted by a file, symbol, or current git diff. Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalTestsIn) (*mcp.CallToolResult, any, error) {
+		e, note, err := resolveEngine(ctx, in.Repo, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		res, err := e.AffectedTests(ctx, in.Target, in.Depth)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mcpText(note + res.Text), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

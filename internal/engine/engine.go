@@ -199,60 +199,90 @@ func (e *Engine) Find(ctx context.Context, query, nodeType string, limit int) (F
 		}
 	}
 	if e.VS != nil && e.Emb != nil {
-		method, hits, err := e.semanticSearch(ctx, query, nodeType, limit)
+		fetchLimit := limit
+		if fetchLimit < 20 {
+			fetchLimit = 20
+		}
+		method, hits, err := e.semanticSearch(ctx, query, nodeType, fetchLimit)
 		if err == nil {
-			out := FindResult{Method: method}
-			seen := map[string]bool{}
-			for _, h := range hits {
-				// Skip vectors for nodes no longer in the graph (stale index).
+			kwRes := e.keywordFind(query, nodeType, fetchLimit)
+			terms := strings.Fields(strings.ToLower(query))
+
+			type fused struct {
+				hit   FindHit
+				rrf   float32
+				fromK bool
+			}
+			byID := map[string]*fused{}
+			const rrfK = 60.0
+
+			for rank, h := range hits {
 				if e.G.Nodes[h.NodeID] == nil {
 					continue
 				}
-				seen[h.NodeID] = true
-				out.Hits = append(out.Hits, FindHit{
-					ID: h.NodeID, Type: h.Type, Name: h.Name,
-					Score: h.Score, Text: e.G.NodeText(h.NodeID),
-				})
-			}
-			// Hybrid: nodes added after the last index run have no vector,
-			// so a pure semantic answer silently misses them. Merge keyword
-			// hits — a query term matching the node *name* is high-signal
-			// and may evict the semantic tail; others only fill spare slots.
-			var nameHits, textHits []FindHit
-			terms := strings.Fields(strings.ToLower(query))
-			for _, kh := range e.keywordFind(query, nodeType, limit).Hits {
-				if seen[kh.ID] {
-					continue
+				byID[h.NodeID] = &fused{
+					hit: FindHit{
+						ID: h.NodeID, Type: h.Type, Name: h.Name,
+						Score: h.Score, Text: e.G.NodeText(h.NodeID),
+					},
+					rrf: float32(1.0 / (rrfK + float64(rank+1))),
 				}
-				lname := strings.ToLower(kh.Name)
-				matched := false
-				for _, t := range terms {
-					if strings.Contains(lname, t) {
-						matched = true
-						break
+			}
+
+			merged := false
+			for rank, kh := range kwRes.Hits {
+				if f, ok := byID[kh.ID]; ok {
+					f.rrf += float32(1.0 / (rrfK + float64(rank+1)))
+					f.fromK = true
+					merged = true
+				} else {
+					byID[kh.ID] = &fused{
+						hit:   kh,
+						rrf:   float32(0.85 / (rrfK + float64(rank+1))),
+						fromK: true,
+					}
+					merged = true
+				}
+			}
+
+			// Rerank with mild symbol-type prior (when nodeType is unrestricted)
+			// and exact query-term match in node name.
+			ranked := make([]*fused, 0, len(byID))
+			for _, f := range byID {
+				mult := float32(1.0)
+				if nodeType == "" {
+					switch f.hit.Type {
+					case graph.NodeFunction, graph.NodeDefinition, graph.NodeRoute, graph.NodeModel, graph.NodeEndpoint:
+						mult = 1.15
+					case graph.NodeFile, graph.NodePackage, graph.NodeTable, graph.NodeSchema:
+						mult = 1.05
+					case graph.NodeComment:
+						mult = 0.72
 					}
 				}
-				if matched {
-					nameHits = append(nameHits, kh)
-				} else {
-					textHits = append(textHits, kh)
+				lname := strings.ToLower(f.hit.Name)
+				var nameBoost float32
+				for _, t := range terms {
+					if len(t) >= 3 && strings.Contains(lname, t) {
+						nameBoost += 0.008
+					}
 				}
+				f.rrf = f.rrf*mult + nameBoost
+				ranked = append(ranked, f)
 			}
-			if reserve := min(len(nameHits), 3); len(out.Hits) > limit-reserve {
-				out.Hits = out.Hits[:limit-reserve]
-			}
-			merged := false
-			for _, kh := range append(nameHits, textHits...) {
-				if len(out.Hits) >= limit {
-					break
+			sort.Slice(ranked, func(i, j int) bool {
+				if ranked[i].rrf != ranked[j].rrf {
+					return ranked[i].rrf > ranked[j].rrf
 				}
-				out.Hits = append(out.Hits, kh)
-				merged = true
+				return ranked[i].hit.Name < ranked[j].hit.Name
+			})
+			if len(ranked) > limit {
+				ranked = ranked[:limit]
 			}
-			// "hybrid" replaces "semantic", but must not erase "+expanded" —
-			// that tag is what tells a caller "some of these hits came from
-			// a paraphrase, not your literal words," which stays true
-			// whether or not keyword hits also got merged in.
+			out := FindResult{Method: method, Hits: make([]FindHit, 0, len(ranked))}
+			for _, f := range ranked {
+				out.Hits = append(out.Hits, f.hit)
+			}
 			if merged {
 				out.Method = strings.Replace(out.Method, "semantic", "hybrid", 1)
 			}

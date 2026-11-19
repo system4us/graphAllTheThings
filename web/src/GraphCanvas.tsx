@@ -31,6 +31,7 @@ interface GraphCanvasProps {
   onExpandNode: (id: string) => void;
   onFocusImpact: (id: string) => void;
   onFocusCalls: (id: string) => void;
+  onFindTests: (id: string) => void;
   onOpenPackage: (pkg: string) => void;
   onChangeLayout: (l: LayoutName) => void;
   onToggleGroup: () => void;
@@ -154,6 +155,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   onExpandNode,
   onFocusImpact,
   onFocusCalls,
+  onFindTests,
   onOpenPackage,
   onChangeLayout,
   onToggleGroup,
@@ -169,6 +171,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   const [showLegend, setShowLegend] = useState(false);
   const [zoomPct, setZoomPct] = useState(100);
   const [isPanning, setIsPanning] = useState(false);
+  const [canvasFilter, setCanvasFilter] = useState('');
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
     y: number;
@@ -180,6 +183,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   const onExpandRef = useRef(onExpandNode);
   const onImpactRef = useRef(onFocusImpact);
   const onCallsRef = useRef(onFocusCalls);
+  const onTestsRef = useRef(onFindTests);
   const onOpenPkgRef = useRef(onOpenPackage);
   const onLayoutRef = useRef(onChangeLayout);
   const onToggleGroupRef = useRef(onToggleGroup);
@@ -187,6 +191,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   onExpandRef.current = onExpandNode;
   onImpactRef.current = onFocusImpact;
   onCallsRef.current = onFocusCalls;
+  onTestsRef.current = onFindTests;
   onOpenPkgRef.current = onOpenPackage;
   onLayoutRef.current = onChangeLayout;
   onToggleGroupRef.current = onToggleGroup;
@@ -396,6 +401,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           { label: 'Inspect Code & Details', onClick: () => onSelectRef.current(id) },
           { label: 'Expand Neighbors', shortcut: '2×Click', onClick: () => onExpandRef.current(id) },
           { label: 'Blast / Impact Radius', danger: true, onClick: () => onImpactRef.current(id) },
+          { label: 'Find Affected Tests', onClick: () => onTestsRef.current(id) },
         ];
         if (nodeObj && (nodeObj.type === 'function' || nodeObj.type === 'definition')) {
           items.push({ label: 'Call Graph', onClick: () => onCallsRef.current(id) });
@@ -653,14 +659,25 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     }
   }, [nodes, edges, view, layout, groupByPackage]);
 
-  // Highlight selected node + 1-hop neighborhood.
+  // Highlight selected node + 1-hop neighborhood, or live in-canvas spotlight filter.
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
+    const q = canvasFilter.trim().toLowerCase();
     cy.batch(() => {
       cy.elements().removeClass('selected dimmed hovered highlighted');
       if (view === 'join') {
         cy.edges().addClass('highlighted');
+      }
+      if (q) {
+        const matched = cy.nodes('[!isGroup]').filter((el) => {
+          const lbl = String(el.data('fullLabel') || el.data('label') || '').toLowerCase();
+          return lbl.includes(q) || el.id().toLowerCase().includes(q);
+        });
+        cy.elements().not(matched).not(matched.connectedEdges()).not('node[?isGroup]').addClass('dimmed');
+        matched.addClass('hovered');
+        matched.connectedEdges().addClass('highlighted');
+        return;
       }
       if (!selectedId) return;
       const target = cy.getElementById(selectedId);
@@ -670,7 +687,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       target.addClass('selected');
       hood.edges().addClass('highlighted');
     });
-  }, [selectedId, nodes, view]);
+  }, [selectedId, nodes, view, canvasFilter]);
 
   const handleFit = () => cyRef.current?.fit(undefined, 40);
   const handleZoom = (factor: number) => {
@@ -726,6 +743,15 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           </p>
         </div>
       )}
+
+      <div className="canvas-spotlight">
+        <input
+          type="search"
+          placeholder="Filter visible nodes…"
+          value={canvasFilter}
+          onChange={(e) => setCanvasFilter(e.target.value)}
+        />
+      </div>
 
       {selectedPkg && (
         <div className="canvas-breadcrumb">

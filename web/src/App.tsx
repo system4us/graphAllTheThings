@@ -14,6 +14,7 @@ import {
   type NodeDetailResponse,
   type OverviewResponse,
   type RepoStatus,
+  type SavedBookmark,
   type SearchHit,
   type TreeNode,
 } from './types';
@@ -61,6 +62,23 @@ export default function App() {
   const [repoStatus, setRepoStatus] = useState<RepoStatus | null>(null);
   const [overlayLabel, setOverlayLabel] = useState<string>('');
   const [nodeRefreshTick, setNodeRefreshTick] = useState(0);
+  const [bookmarks, setBookmarks] = useState<SavedBookmark[]>(() => {
+    try {
+      const raw = localStorage.getItem('gatt.bookmarks.v1');
+      return raw ? (JSON.parse(raw) as SavedBookmark[]) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const saveBookmarks = (next: SavedBookmark[]) => {
+    setBookmarks(next);
+    try {
+      localStorage.setItem('gatt.bookmarks.v1', JSON.stringify(next));
+    } catch {
+      // ignore storage quota errors
+    }
+  };
 
   // Initial load: server info & repos
   useEffect(() => {
@@ -253,6 +271,22 @@ export default function App() {
     setFocusId(id);
     setView('calls');
   }, []);
+
+  const handleFindTests = useCallback(
+    async (id: string) => {
+      try {
+        const res = await api.tests(id, repo || undefined, 3);
+        if (res.nodes.length > 0) {
+          handleShowOverlay('diff', res.nodes, res.edges, `Tests (${res.test_files?.length ?? 0})`);
+        } else {
+          setError(`No affected tests found for ${id}`);
+        }
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : 'affected_tests failed');
+      }
+    },
+    [repo, handleShowOverlay],
+  );
 
   const handleNavigateNode = useCallback(
     (id: string) => {
@@ -478,6 +512,7 @@ export default function App() {
           layout={layout}
           includeExternal={includeExternal}
           selectedNodeTypes={selectedNodeTypes}
+          bookmarks={bookmarks}
           onSelectPkg={(pkg) => {
             setSelectedPkg(pkg);
             if (
@@ -500,6 +535,28 @@ export default function App() {
           onToggleExternal={setIncludeExternal}
           onToggleNodeType={handleToggleNodeType}
           onClearFilters={() => setSelectedNodeTypes([])}
+          onSaveBookmark={(name) => {
+            saveBookmarks([
+              ...bookmarks,
+              {
+                id: String(Date.now()),
+                name,
+                view,
+                pkg: selectedPkg,
+                layout,
+                groupByPackage,
+              },
+            ]);
+          }}
+          onApplyBookmark={(b) => {
+            setSelectedPkg(b.pkg);
+            setLayout(b.layout);
+            setGroupByPackage(b.groupByPackage);
+            setFocusId('');
+            setOverlayLabel('');
+            setView(b.view);
+          }}
+          onDeleteBookmark={(id) => saveBookmarks(bookmarks.filter((x) => x.id !== id))}
           onShowOverlay={handleShowOverlay}
         />
 
@@ -519,6 +576,7 @@ export default function App() {
             onExpandNode={handleFocusNeighbors}
             onFocusImpact={handleFocusImpact}
             onFocusCalls={handleFocusCalls}
+            onFindTests={handleFindTests}
             onOpenPackage={(pkg) => {
               setSelectedPkg(pkg);
               setSelectedId(null);
@@ -540,6 +598,7 @@ export default function App() {
           onFocusNeighbors={handleFocusNeighbors}
           onFocusImpact={handleFocusImpact}
           onFocusCalls={handleFocusCalls}
+          onFindTests={handleFindTests}
           onOpenPackage={(pkg) => {
             setSelectedPkg(pkg);
             setSelectedId(null);

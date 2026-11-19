@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { api } from './api';
 import type {
+  AffectedTestsResponse,
   ContextResponse,
   DiffResponse,
   DocDriftResponse,
@@ -8,10 +9,11 @@ import type {
   GraphNode,
   GraphView,
   GrepResponse,
+  HotspotsResponse,
   JoinResponse,
 } from './types';
 
-export type ToolTab = 'grep' | 'diff' | 'ask' | 'drift' | 'join';
+export type ToolTab = 'grep' | 'diff' | 'ask' | 'tests' | 'hotspots' | 'drift' | 'join';
 
 interface ToolsPanelProps {
   tab: ToolTab;
@@ -43,9 +45,22 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
 
   // Ask / Context state
   const [askQ, setAskQ] = useState('');
+  const [askBudget, setAskBudget] = useState<number>(0);
   const [askRes, setAskRes] = useState<ContextResponse | null>(null);
   const [askLoading, setAskLoading] = useState(false);
   const [askErr, setAskErr] = useState<string | null>(null);
+
+  // Tests state
+  const [testTarget, setTestTarget] = useState('');
+  const [testRes, setTestRes] = useState<AffectedTestsResponse | null>(null);
+  const [testLoading, setTestLoading] = useState(false);
+  const [testErr, setTestErr] = useState<string | null>(null);
+  const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
+
+  // Hotspots state
+  const [hotRes, setHotRes] = useState<HotspotsResponse | null>(null);
+  const [hotLoading, setHotLoading] = useState(false);
+  const [hotErr, setHotErr] = useState<string | null>(null);
 
   // Doc drift state
   const [driftRes, setDriftRes] = useState<DocDriftResponse | null>(null);
@@ -104,7 +119,7 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
     setAskLoading(true);
     setAskErr(null);
     try {
-      const res = await api.context(askQ.trim(), repo);
+      const res = await api.context(askQ.trim(), repo, 8, askBudget || undefined);
       setAskRes(res);
       if (res.nodes.length > 0) {
         onShowOverlay('context', res.nodes, res.edges, 'Context');
@@ -113,6 +128,39 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
       setAskErr(err instanceof Error ? err.message : 'context query failed');
     } finally {
       setAskLoading(false);
+    }
+  };
+
+  const runTests = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTestLoading(true);
+    setTestErr(null);
+    try {
+      const res = await api.tests(testTarget.trim() || undefined, repo, 3);
+      setTestRes(res);
+      if (res.nodes.length > 0) {
+        onShowOverlay('diff', res.nodes, res.edges, `Tests: ${res.target}`);
+      }
+    } catch (err: unknown) {
+      setTestErr(err instanceof Error ? err.message : 'affected_tests failed');
+    } finally {
+      setTestLoading(false);
+    }
+  };
+
+  const runHotspots = async () => {
+    setHotLoading(true);
+    setHotErr(null);
+    try {
+      const res = await api.hotspots(repo, 25);
+      setHotRes(res);
+      if (res.nodes.length > 0) {
+        onShowOverlay('diff', res.nodes, res.edges, 'Churn Hotspots');
+      }
+    } catch (err: unknown) {
+      setHotErr(err instanceof Error ? err.message : 'hotspots failed');
+    } finally {
+      setHotLoading(false);
     }
   };
 
@@ -311,9 +359,22 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
             value={askQ}
             onChange={(e) => setAskQ(e.target.value)}
           />
-          <button type="submit" className="primary-btn" disabled={askLoading}>
-            {askLoading ? 'Building Context…' : 'Build Context Pack'}
-          </button>
+          <div className="tool-row between">
+            <select
+              value={askBudget}
+              onChange={(e) => setAskBudget(Number(e.target.value))}
+              className="budget-select"
+              title="Approximate token budget"
+            >
+              <option value={0}>Budget: Default</option>
+              <option value={1200}>Compact (~1.2k tok)</option>
+              <option value={3000}>Standard (~3k tok)</option>
+              <option value={6000}>Deep (~6k tok)</option>
+            </select>
+            <button type="submit" className="primary-btn" disabled={askLoading}>
+              {askLoading ? 'Building…' : 'Build Context'}
+            </button>
+          </div>
         </form>
 
         {askErr && <div className="tool-error">{askErr}</div>}
@@ -325,6 +386,121 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
               <strong>{askRes.nodes.length}</strong> graph nodes highlighted
             </div>
             <pre className="context-output">{askRes.text}</pre>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (tab === 'tests') {
+    return (
+      <div className="tool-pane">
+        <form onSubmit={runTests} className="tool-form">
+          <p className="muted-note" style={{ padding: 0, margin: 0 }}>
+            Find minimal affected tests for a file, symbol, or leave empty for current git diff.
+          </p>
+          <div className="tool-row">
+            <input
+              type="text"
+              placeholder="Empty = git diff, or file/symbol…"
+              value={testTarget}
+              onChange={(e) => setTestTarget(e.target.value)}
+            />
+            <button type="submit" className="primary-btn" disabled={testLoading}>
+              {testLoading ? 'Finding…' : 'Tests'}
+            </button>
+          </div>
+        </form>
+
+        {testErr && <div className="tool-error">{testErr}</div>}
+
+        {testRes && (
+          <div className="tool-results">
+            <div className="tool-summary">
+              <strong>{testRes.test_files?.length ?? 0}</strong> test file(s) ·{' '}
+              <strong>{testRes.test_functions?.length ?? 0}</strong> direct test fn(s)
+            </div>
+            {testRes.commands?.map((cmd) => (
+              <div key={cmd} className="cmd-box">
+                <code>{cmd}</code>
+                <button
+                  type="button"
+                  className="mini-chip"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(cmd).catch(() => {});
+                    setCopiedCmd(cmd);
+                    setTimeout(() => setCopiedCmd(null), 1500);
+                  }}
+                >
+                  {copiedCmd === cmd ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            ))}
+            {testRes.test_functions && testRes.test_functions.length > 0 && (
+              <div className="diff-list">
+                {testRes.test_functions.map((tf) => (
+                  <button
+                    key={tf.id}
+                    type="button"
+                    className="grep-hit"
+                    onClick={() => onJumpNode(tf.id)}
+                  >
+                    <div className="grep-loc">
+                      <span className="grep-sym">{tf.name}</span>
+                      <span>
+                        {tf.file}:{tf.line}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (tab === 'hotspots') {
+    return (
+      <div className="tool-pane">
+        <div className="tool-form">
+          <p className="muted-note" style={{ padding: 0, margin: 0 }}>
+            Files with the highest git churn × dependency connectivity (architectural risk hotspots).
+          </p>
+          <button
+            type="button"
+            className="primary-btn"
+            onClick={runHotspots}
+            disabled={hotLoading}
+          >
+            {hotLoading ? 'Analyzing…' : 'Analyze Hotspots'}
+          </button>
+        </div>
+
+        {hotErr && <div className="tool-error">{hotErr}</div>}
+
+        {hotRes && (
+          <div className="tool-results">
+            <div className="diff-list">
+              {hotRes.hotspots.map((hs, idx) => (
+                <button
+                  key={hs.node_id}
+                  type="button"
+                  className="grep-hit"
+                  onClick={() => onJumpNode(hs.node_id)}
+                >
+                  <div className="grep-loc">
+                    <span>
+                      #{idx + 1} {hs.path}
+                    </span>
+                  </div>
+                  <div className="grep-text">
+                    {hs.commits} commits · {hs.degree} edges · score {hs.score}
+                  </div>
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </div>

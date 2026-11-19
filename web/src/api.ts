@@ -1,4 +1,5 @@
 import type {
+  AffectedTestsResponse,
   AnnotateRequest,
   ContextResponse,
   DiffResponse,
@@ -6,9 +7,11 @@ import type {
   GraphResponse,
   GraphView,
   GrepResponse,
+  HotspotsResponse,
   InfoResponse,
   JoinResponse,
   NodeDetailResponse,
+  NodeDiffResponse,
   OverviewResponse,
   RepoStatus,
   SearchResponse,
@@ -125,6 +128,17 @@ export const api = {
   join: (from: string, to: string, repo?: string) =>
     getJSON<JoinResponse>(`/api/join${buildParams({ repo, from, to })}`),
 
-  context: (q: string, repo?: string, limit = 8) =>
-    getJSON<ContextResponse>(`/api/context${buildParams({ repo, q, limit })}`),
+  context: (q: string, repo?: string, limit = 8, maxTokens?: number) =>
+    getJSON<ContextResponse>(
+      `/api/context${buildParams({ repo, q, limit, max_tokens: maxTokens })}`,
+    ),
+
+  tests: (target?: string, repo?: string, depth = 3) =>
+    getJSON<AffectedTestsResponse>(`/api/tests${buildParams({ repo, target, depth })}`),
+
+  hotspots: (repo?: string, limit = 25) =>
+    getJSON<HotspotsResponse>(`/api/hotspots${buildParams({ repo, limit })}`),
+
+  nodeDiff: (file: string, ref = 'HEAD', repo?: string) =>
+    getJSON<NodeDiffResponse>(`/api/node-diff${buildParams({ repo, file, ref })}`),
 };

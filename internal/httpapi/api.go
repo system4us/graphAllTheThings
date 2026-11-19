@@ -74,6 +74,9 @@ func New(p Provider) *Handler {
 	h.mux.HandleFunc("/api/annotate", h.handleAnnotate)
 	h.mux.HandleFunc("/api/join", h.handleJoin)
 	h.mux.HandleFunc("/api/context", h.handleContext)
+	h.mux.HandleFunc("/api/tests", h.handleTests)
+	h.mux.HandleFunc("/api/hotspots", h.handleHotspots)
+	h.mux.HandleFunc("/api/node-diff", h.handleNodeDiff)
 	return h
 }
 
@@ -1088,8 +1091,12 @@ func (h *Handler) handleNode(w http.ResponseWriter, r *http.Request) {
 	})
 
 	var src *sourcePreview
+	var history []engine.CommitEntry
 	if e.IsCodebase() && n.Attrs["external"] != "true" {
 		src = readNodeSource(e.G, n)
+		if f := nodeFile(n); f != "" {
+			history = e.FileHistory(r.Context(), f, 8)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1104,6 +1111,7 @@ func (h *Handler) handleNode(w http.ResponseWriter, r *http.Request) {
 		"incoming": incoming,
 		"outgoing": outgoing,
 		"source":   src,
+		"history":  history,
 	})
 }
 

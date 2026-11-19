@@ -538,13 +538,14 @@ func (h *Handler) handleContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := parseIntParam(r, "limit", 8, 1, 25)
+	maxTokens := parseIntParam(r, "max_tokens", 0, 0, 20000)
 
 	var text string
 	var err error
 	if e.IsCodebase() {
-		text, err = e.CodeContextPack(r.Context(), q, limit)
+		text, err = e.CodeContextPackWithBudget(r.Context(), q, limit, maxTokens)
 	} else {
-		text, err = e.ContextPack(r.Context(), q, limit)
+		text, err = e.ContextPackWithBudget(r.Context(), q, limit, maxTokens)
 	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -608,5 +609,177 @@ func (h *Handler) handleContext(w http.ResponseWriter, r *http.Request) {
 		"text":   text,
 		"nodes":  nodes,
 		"edges":  edges,
+	})
+}
+
+func (h *Handler) handleTests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	e, resolved, ok := h.resolveEngine(w, r)
+	if !ok {
+		return
+	}
+	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	depth := parseIntParam(r, "depth", 3, 1, 5)
+
+	res, err := e.AffectedTests(r.Context(), target, depth)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Build a highlighted subgraph of seed nodes + affected test files/functions.
+	selected := map[string]*graph.Node{}
+	statusByID := map[string]string{}
+	for _, id := range res.SeedNodes {
+		if n := e.G.Nodes[id]; n != nil {
+			selected[id] = n
+			statusByID[id] = "modified"
+		}
+	}
+	testFileSet := map[string]bool{}
+	for _, f := range res.TestFiles {
+		testFileSet[filepath.ToSlash(f)] = true
+	}
+	for _, n := range e.G.Nodes {
+		if n.Type == graph.NodeFile && testFileSet[filepath.ToSlash(n.Name)] {
+			selected[n.ID] = n
+			if statusByID[n.ID] == "" {
+				statusByID[n.ID] = "added"
+			}
+		}
+	}
+	for _, tf := range res.TestFunctions {
+		if n := e.G.Nodes[tf.ID]; n != nil {
+			selected[n.ID] = n
+			statusByID[n.ID] = "added"
+		}
+	}
+
+	nodes := make([]GraphNode, 0, len(selected))
+	for _, n := range selected {
+		gn := toGraphNode(e.G, n)
+		gn.DiffStatus = statusByID[n.ID]
+		nodes = append(nodes, gn)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+
+	var edges []GraphEdge
+	seenEdge := map[string]bool{}
+	for _, n := range selected {
+		for _, ed := range e.G.EdgesOf(n.ID) {
+			if ed.From != n.ID || selected[ed.To] == nil {
+				continue
+			}
+			ekey := ed.From + "|" + ed.Type + "|" + ed.To
+			if seenEdge[ekey] {
+				continue
+			}
+			seenEdge[ekey] = true
+			edges = append(edges, GraphEdge{ID: ekey, From: ed.From, To: ed.To, Type: ed.Type, Attrs: ed.Attrs})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"repo":           resolved,
+		"target":         res.Target,
+		"test_files":     res.TestFiles,
+		"test_functions": res.TestFunctions,
+		"commands":       res.Commands,
+		"text":           res.Text,
+		"nodes":          nodes,
+		"edges":          edges,
+	})
+}
+
+func (h *Handler) handleHotspots(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	e, resolved, ok := h.resolveEngine(w, r)
+	if !ok {
+		return
+	}
+	limit := parseIntParam(r, "limit", 25, 1, 80)
+	entries, err := e.Hotspots(r.Context(), limit)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	selected := map[string]*graph.Node{}
+	nodes := make([]GraphNode, 0, len(entries))
+	for i, hs := range entries {
+		n := e.G.Nodes[hs.NodeID]
+		if n == nil {
+			continue
+		}
+		selected[n.ID] = n
+		gn := toGraphNode(e.G, n)
+		if i < 5 {
+			gn.DiffStatus = "removed" // red high-risk hotspot
+		} else if i < 12 {
+			gn.DiffStatus = "modified" // amber medium-risk hotspot
+		} else {
+			gn.DiffStatus = "caller" // blue moderate
+		}
+		nodes = append(nodes, gn)
+	}
+
+	var edges []GraphEdge
+	seenEdge := map[string]bool{}
+	for _, n := range selected {
+		for _, ed := range e.G.EdgesOf(n.ID) {
+			if ed.From != n.ID || selected[ed.To] == nil {
+				continue
+			}
+			if ed.Type != graph.EdgeImports && ed.Type != graph.EdgeCoChanged && ed.Type != graph.EdgeDependsOn {
+				continue
+			}
+			ekey := ed.From + "|" + ed.Type + "|" + ed.To
+			if seenEdge[ekey] {
+				continue
+			}
+			seenEdge[ekey] = true
+			edges = append(edges, GraphEdge{ID: ekey, From: ed.From, To: ed.To, Type: ed.Type, Attrs: ed.Attrs})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"repo":     resolved,
+		"hotspots": entries,
+		"nodes":    nodes,
+		"edges":    edges,
+	})
+}
+
+func (h *Handler) handleNodeDiff(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	e, resolved, ok := h.resolveEngine(w, r)
+	if !ok {
+		return
+	}
+	file := strings.TrimSpace(r.URL.Query().Get("file"))
+	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+	if file == "" {
+		writeErr(w, http.StatusBadRequest, "missing file parameter")
+		return
+	}
+	diff, err := e.FileGitDiff(r.Context(), file, ref)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"repo": resolved,
+		"file": file,
+		"ref":  ref,
+		"diff": diff,
 	})
 }
