@@ -44,7 +44,7 @@ ls gatt-out/graph.db gatt-out/graph.json 2>/dev/null   # graph exists?
 
 - **Docker central server (recommended):** runs MCP HTTP + local ONNX + embedded Qdrant on `127.0.0.1:7788` with automatic commit watching:
   ```bash
-  GATT_MOUNT_ROOT=$HOME docker compose up -d --build
+  gatt docker up
   gatt install --http http://127.0.0.1:7788
   ```
 - **Local ONNX worker (CPU, no Ollama):**

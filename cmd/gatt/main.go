@@ -116,6 +116,8 @@ func main() {
 		err = cmdServe(ctx, os.Args[2:])
 	case "notify":
 		err = cmdNotify(ctx, os.Args[2:])
+	case "docker":
+		err = cmdDocker(ctx, os.Args[2:])
 	case "install":
 		err = cmdInstall(ctx, os.Args[2:])
 	case "init":
@@ -955,6 +957,11 @@ func cmdInstall(ctx context.Context, args []string) error {
 			return updateMCPConfigEntry(configPath, *name, map[string]any{"serverUrl": targetURL}, targetURL)
 		}
 		if claudePath, err := exec.LookPath("claude"); err == nil {
+			// Remove any prior registration (e.g. stdio) under the same name/scope
+			// so migrating from stdio to HTTP succeeds without manual cleanup.
+			rmName, rmArgs := wrapForShellExec(claudePath, []string{"mcp", "remove", "--scope", resolvedScope, *name})
+			_ = exec.CommandContext(ctx, rmName, rmArgs...).Run()
+
 			claudeArgs := []string{"mcp", "add", "--transport", "http", "--scope", resolvedScope, *name, targetURL}
 			execName, execArgs := wrapForShellExec(claudePath, claudeArgs)
 			cmd := exec.CommandContext(ctx, execName, execArgs...)

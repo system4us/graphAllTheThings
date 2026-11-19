@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: gatt:local
+    image: system4us/gatt:latest
     container_name: gatt-server
     restart: unless-stopped
     # Strictly loopback-only: never expose unauthenticated gatt to the network.

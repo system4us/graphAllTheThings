@@ -17,9 +17,11 @@ The vectors themselves are stored locally (default) or in Qdrant (`--qdrant URL`
 One local container runs `gatt serve --mcp --data-dir /data --onnx /opt/gatt-embed --qdrant-bin /usr/local/bin/qdrant` with both the ONNX worker (`127.0.0.1:7801`) and Qdrant (`127.0.0.1:6333`, one collection per repo) strictly internal to the container, and only port `127.0.0.1:7788` published on the host:
 
 ```sh
-GATT_MOUNT_ROOT=$HOME docker compose up -d --build
-gatt install --http http://127.0.0.1:7788   # registers http://127.0.0.1:7788/mcp?repo=<cwd>
+gatt docker up                             # pulls/runs system4us/gatt:latest on 127.0.0.1:7788
+gatt install --http http://127.0.0.1:7788  # registers http://127.0.0.1:7788/mcp?repo=<cwd>
 ```
+
+Or build from a local checkout with `GATT_MOUNT_ROOT=$HOME docker compose up -d --build`.
 
 Repos must be mounted at the **same absolute path** inside and outside the container (read-only `:ro` is fine — graphs, vectors, and annotations live in `/data`). Endpoints on `127.0.0.1:7788`:
 

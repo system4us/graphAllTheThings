@@ -43,17 +43,19 @@ Codebase graphs refresh themselves: every query re-parses only the files that ch
 
 Semantic search needs embeddings from **Ollama** (default, `bge-m3`), a **local ONNX worker** running on your CPU, or any **OpenAI-compatible** server.
 
-### Recommended: central Docker container (MCP over HTTP + ONNX)
+### Recommended: central Docker container (MCP over HTTP + ONNX + Qdrant)
 
-Keep the `gatt` CLI installed locally (via npm or Go), and run `serve --onnx` + MCP Streamable HTTP in a single local container bound strictly to `127.0.0.1:7788`:
+Keep the `gatt` CLI installed locally (via npm or Go), and run `serve --onnx` + embedded Qdrant + MCP Streamable HTTP in a single local container bound strictly to `127.0.0.1:7788`:
 
 ```bash
-# Mount your projects root at the exact same absolute path (read-only)
-GATT_MOUNT_ROOT=$HOME docker compose up -d --build
+# Pull and start system4us/gatt:latest (mounts $HOME read-only by default)
+gatt docker up
 
 # Register the HTTP MCP server for the current repo
 gatt install --http http://127.0.0.1:7788
 ```
+
+(Or build locally from this repo with `GATT_MOUNT_ROOT=$HOME docker compose up -d --build`.)
 
 Each mounted repository is selected via `?repo=<abs-path>` (or `X-Gatt-Repo`), extracted on first access, and kept current with a single shared ONNX worker and an embedded Qdrant vector store — both running strictly on loopback inside the container (never exposed). Graphs and Qdrant storage live in the container's `/data` volume.
 
