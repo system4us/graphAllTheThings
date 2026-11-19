@@ -386,7 +386,13 @@ func (e *Engine) apiContextPack(ctx context.Context, question string, limit int)
 	}
 	var b strings.Builder
 	if fr := e.G.Freshness(time.Now()); fr != "" {
-		fmt.Fprintf(&b, "# source: %s\n\n", fr)
+		fmt.Fprintf(&b, "# source: %s\n", fr)
+		if e.VectorsStale {
+			b.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n")
+		}
+		b.WriteString("\n")
+	} else if e.VectorsStale {
+		b.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n\n")
 	}
 	var names []string
 	for _, h := range endpoints.Hits {
@@ -639,7 +645,7 @@ const coverageSampleCap = 400
 // happens to contain the word): the cost of a false alarm is one glance;
 // the cost of silence was two shipped false negatives.
 func (e *Engine) coverageNote(name string, directWired int) string {
-	hits, total, _, err := e.grepScan(name, false, coverageSampleCap)
+	hits, total, _, err := e.grepScan(name, GrepOptions{Limit: coverageSampleCap})
 	if err != nil || total == 0 {
 		return ""
 	}
@@ -1231,14 +1237,18 @@ func joinCapped(items []string, max int) string {
 	return strings.Join(items[:max], ", ") + fmt.Sprintf(" … +%d more", len(items)-max)
 }
 
-// RenderDefinition renders a type/struct/class with its methods.
+// RenderDefinition renders a type/struct/class/const with its methods.
 func (e *Engine) RenderDefinition(id string) (string, error) {
 	d, err := e.Describe(id)
 	if err != nil {
 		return "", err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "## type %s\n", d.Name)
+	kind := d.Attrs["kind"]
+	if kind == "" {
+		kind = "type"
+	}
+	fmt.Fprintf(&b, "## %s %s\n", kind, d.Name)
 	if f := d.Attrs["file"]; f != "" {
 		loc := f
 		if ls := d.Attrs["line_start"]; ls != "" {
@@ -1292,7 +1302,13 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	}
 	var b strings.Builder
 	if fr := e.G.Freshness(time.Now()); fr != "" {
-		fmt.Fprintf(&b, "# source: %s\n\n", fr)
+		fmt.Fprintf(&b, "# source: %s\n", fr)
+		if e.VectorsStale {
+			b.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n")
+		}
+		b.WriteString("\n")
+	} else if e.VectorsStale {
+		b.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n\n")
 	}
 
 	funcHits, err := e.Find(ctx, question, graph.NodeFunction, limit)
@@ -1390,8 +1406,9 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	}
 
 	if rendered == 0 {
-		return "no code entities matched the question; try find_entities with different wording", nil
+		return "no code entities matched the question; try find_entities with different wording or gatt grep for an exhaustive literal scan", nil
 	}
+	b.WriteString("# note: top-N ranked context pack (not exhaustive); use `gatt grep` for exhaustive literal/regex scans\n")
 	return b.String(), nil
 }
 

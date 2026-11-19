@@ -373,3 +373,12 @@ func TestResolveInstallHTTPURL(t *testing.T) {
 		t.Errorf("explicit URL: got %q, %v", got2, err)
 	}
 }
+
+func TestCmdGrepHelpDoesNotSearch(t *testing.T) {
+	if err := cmdGrep(context.Background(), []string{"--help"}); err != nil {
+		t.Fatalf("cmdGrep(--help) returned %v, want nil", err)
+	}
+	if err := cmdGrep(context.Background(), []string{"-h"}); err != nil {
+		t.Fatalf("cmdGrep(-h) returned %v, want nil", err)
+	}
+}

@@ -29,6 +29,9 @@ type Engine struct {
 	// ids best-first. keywordFind uses it instead of scanning every NodeText
 	// in memory; nil or an empty result falls back to the scan.
 	FTS func(query, nodeType string, limit int) []string
+	// VectorsStale is true when a local vector index exists on disk but the
+	// graph has changed since the vectors were last caught up.
+	VectorsStale bool
 }
 
 func New(g *graph.Graph, vs store.VectorStore, emb *embed.Client) *Engine {

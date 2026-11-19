@@ -1890,6 +1890,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 							attrs := map[string]string{
 								"file":       relPath,
 								"line_start": fmt.Sprint(lineStart),
+								"kind":       "const",
 							}
 							if doc := docComment(nameNode, data, consumed); doc != "" {
 								attrs["doc"] = doc

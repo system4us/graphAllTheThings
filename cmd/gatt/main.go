@@ -543,12 +543,33 @@ func openEngine(graphPath, qdURL, coll, embURL, embModel string) (*engine.Engine
 	}
 	vs := openStore(graphPath, qdURL, coll)
 	e := engine.New(g, vs, embed.New(embURL, resolveModel(embModel, vs)))
+	if qdURL == "" && localVectorsStale(graphPath) {
+		e.VectorsStale = true
+	}
 	if graph.IsSQLitePath(graphPath) {
 		e.FTS = func(q, typ string, limit int) []string {
 			return graph.FTSQuery(graphPath, q, typ, limit)
 		}
 	}
 	return e, nil
+}
+
+// localVectorsStale reports whether a local vectors.json index exists on disk
+// but is behind graph.db (either its .vectors-stamp disagrees with graph.db,
+// or no stamp exists and graph.db is newer than vectors.json).
+func localVectorsStale(graphPath string) bool {
+	vst, err := os.Stat(vectorsPath(graphPath))
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(stampPath(graphPath)); err == nil {
+		return !vectorsFresh(graphPath)
+	}
+	gst, err := os.Stat(graphPath)
+	if err != nil {
+		return false
+	}
+	return gst.ModTime().After(vst.ModTime())
 }
 
 func cmdIndex(ctx context.Context, args []string) error {
@@ -1277,31 +1298,91 @@ func cmdDocDrift(ctx context.Context, args []string) error {
 	return nil
 }
 
+// multiFlag collects repeatable (and optionally comma-separated) flag values.
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			*m = append(*m, p)
+		}
+	}
+	return nil
+}
+
 // cmdGrep prints an exhaustive literal/regex match list across every file in
 // the codebase root — unlike search/find (semantic, top-N), a zero-result
 // answer here is a reliable proof of absence.
 func cmdGrep(ctx context.Context, args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: gatt grep <pattern> [--regex] [--limit N]")
+	fs := flag.NewFlagSet("grep", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: gatt grep [flags] <pattern>")
+		fmt.Fprintln(os.Stderr, "       gatt grep <pattern> [flags]")
+		fs.PrintDefaults()
 	}
-	pattern := args[0]
-	fs := flag.NewFlagSet("grep", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
 	useRegex := fs.Bool("regex", false, "treat pattern as a case-insensitive regex")
-	limit := fs.Int("limit", 50, "max matches to display (the total count is always exact)")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
+	limit := fs.Int("limit", 50, "max matches to display (0 = unlimited; total count is always exact)")
+	var includes, excludes multiFlag
+	fs.Var(&includes, "include", "glob filter to include (repeatable or comma-separated, e.g. '*.ts,src/**')")
+	fs.Var(&excludes, "exclude", "glob filter to exclude (repeatable or comma-separated, e.g. '*_test.go,docs/**')")
+	includeLockfiles := fs.Bool("all", false, "include lockfiles (skipped by default)")
+
+	// Accept flags both before (`gatt grep --limit 0 foo`, `gatt grep --help`)
+	// and after (`gatt grep foo --limit 0`) the positional pattern.
+	var pattern string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		pattern = args[0]
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
+		}
+	} else {
+		if err := fs.Parse(args); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
+		}
+		if fs.NArg() > 0 {
+			pattern = fs.Arg(0)
+			if fs.NArg() > 1 {
+				if err := fs.Parse(fs.Args()[1:]); err != nil {
+					if err == flag.ErrHelp {
+						return nil
+					}
+					return err
+				}
+			}
+		}
 	}
+	if pattern == "" {
+		fs.Usage()
+		return fmt.Errorf("missing pattern")
+	}
+
 	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
 	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
 	if err != nil {
 		return err
 	}
-	out, err := e.Grep(pattern, *useRegex, *limit)
+	res, err := e.GrepWithOptions(pattern, engine.GrepOptions{
+		Regex:            *useRegex,
+		Limit:            *limit,
+		Include:          includes,
+		Exclude:          excludes,
+		IncludeLockfiles: *includeLockfiles,
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Print(out)
+	fmt.Print(res.Text)
+	if res.Truncated {
+		fmt.Fprintf(os.Stderr, "gatt grep: truncated to %d of %d matches (pass --limit 0 to show all)\n", res.Shown, res.Total)
+	}
 	return nil
 }
 

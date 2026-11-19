@@ -37,8 +37,23 @@ ls gatt-out/graph.db gatt-out/graph.json 2>/dev/null   # graph exists?
   on huge repos; extraction can take minutes):
   ```bash
   gatt extract codebase .                           # → gatt-out/graph.db (SQLite + FTS5, default)
-  gatt index                                        # optional: semantic search (needs local embedder)
+  gatt index                                        # optional: semantic search (see Embedding setup below)
   ```
+
+### Embedding setup (optional, enables semantic search)
+
+- **Docker central server (recommended):** runs MCP HTTP + local ONNX + embedded Qdrant on `127.0.0.1:7788` with automatic commit watching:
+  ```bash
+  GATT_MOUNT_ROOT=$HOME docker compose up -d --build
+  gatt install --http http://127.0.0.1:7788
+  ```
+- **Local ONNX worker (CPU, no Ollama):**
+  ```bash
+  (cd tools/gatt-embed && npm install)
+  gatt serve --onnx tools/gatt-embed
+  export GATT_EMBED_URL=http://127.0.0.1:7801/v1
+  ```
+- **Ollama (default URL `http://localhost:11434`):** requires an *embedding* model (`ollama pull bge-m3`), not a chat model.
 
 ## Core commands
 
@@ -58,9 +73,13 @@ gatt blast <file-or-func-or-id>     # blast radius of ANY node, incl. JSON/YAML/
                                     # ALWAYS before signature/behavior changes;
                                     # [test] tags show affected tests
 gatt search "<text>" [--type function|definition|file]   # locate by name/keyword/semantics
-gatt grep <pattern> [--regex]       # exhaustive literal/regex scan of every file — a
-                                    # zero-result answer is proof of absence; search
-                                    # above is semantic/top-N and is NOT exhaustive
+gatt grep <pattern> [--regex] [--limit N] [--include glob] [--exclude glob] [--all]
+                                    # exhaustive literal/regex scan of every file — a
+                                    # zero-result answer is proof of absence; search/code-query
+                                    # above are semantic/top-N and are NOT exhaustive.
+                                    # Default cap is 50 (warns on stderr when truncated):
+                                    # pass `--limit 0` for unlimited results during audits.
+                                    # Lockfiles are skipped by default (`--all` includes them).
 gatt tree [path] [--depth N]        # directory tree annotated with each file's doc summary
 gatt routes [--file substr]         # HTTP routes found in code (Express JS/TS/JSX):
                                     # method, path, handler (incl. controller.method

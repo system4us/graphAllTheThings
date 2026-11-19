@@ -184,9 +184,12 @@ type docDriftIn struct {
 }
 
 type grepIn struct {
-	Pattern string `json:"pattern" jsonschema:"literal text (default) or regex (with regex=true) to search for"`
-	Regex   bool   `json:"regex,omitempty" jsonschema:"treat pattern as a case-insensitive regex instead of a literal substring"`
-	Limit   int    `json:"limit,omitempty" jsonschema:"max matches to display, default 50 (the reported total count is always exact)"`
+	Pattern string   `json:"pattern" jsonschema:"literal text (default) or regex (with regex=true) to search for"`
+	Regex   bool     `json:"regex,omitempty" jsonschema:"treat pattern as a case-insensitive regex instead of a literal substring"`
+	Limit   *int     `json:"limit,omitempty" jsonschema:"max matches to display; default 50, 0 = unlimited (the reported total count is always exact)"`
+	Include []string `json:"include,omitempty" jsonschema:"optional glob filters to include (e.g. '*.ts', 'src/**')"`
+	Exclude []string `json:"exclude,omitempty" jsonschema:"optional glob filters to exclude (e.g. '*_test.go', 'docs/**')"`
+	All     bool     `json:"all,omitempty" jsonschema:"include lockfiles that are skipped by default"`
 }
 
 type treeIn struct {
@@ -306,11 +309,21 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, nil, err
 		}
-		out, err := e.Grep(in.Pattern, in.Regex, in.Limit)
+		limit := 50
+		if in.Limit != nil {
+			limit = *in.Limit
+		}
+		res, err := e.GrepWithOptions(in.Pattern, engine.GrepOptions{
+			Regex:            in.Regex,
+			Limit:            limit,
+			Include:          in.Include,
+			Exclude:          in.Exclude,
+			IncludeLockfiles: in.All,
+		})
 		if err != nil {
 			return nil, nil, err
 		}
-		return text(note + out), nil, nil
+		return text(note + res.Text), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
