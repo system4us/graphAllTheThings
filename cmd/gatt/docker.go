@@ -70,18 +70,28 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 	name := fs.String("name", defaultDockerContainer, "container name")
 	port := fs.Int("port", defaultDockerPort, "host loopback port (bound strictly to 127.0.0.1)")
 	var mounts multiFlag
-	fs.Var(&mounts, "mount", "host directory to mount read-only at the same absolute path (repeatable; default: $HOME)")
+	fs.Var(&mounts, "mount", "host directory to mount read-only at the same absolute path (repeatable; default: $HOME; explicit --mount dirs are auto-scanned for git repos)")
 	repos := fs.String("repos", "", "optional comma-separated absolute repo paths to preload on startup")
+	scan := fs.Bool("scan", true, "auto-discover and index git repos under explicit --mount directories (use --scan=false to disable)")
+	scanDepth := fs.Int("scan-depth", 2, "max directory depth under --mount directories to look for .git repos")
 	pull := fs.Bool("pull", false, "pull the image before starting")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	scanExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "scan" {
+			scanExplicit = true
+		}
+	})
+
 	dockerBin, err := requireDocker()
 	if err != nil {
 		return err
 	}
-	if len(mounts) == 0 {
+	explicitMounts := len(mounts) > 0
+	if !explicitMounts {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return fmt.Errorf("could not determine home directory (pass --mount DIR): %w", err)
@@ -109,13 +119,21 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 		"-v", "gatt-data:/data",
 		"-v", "gatt-cache:/cache/huggingface",
 	}
+	var mountedTargets []string
 	for _, m := range mounts {
 		abs, err := filepath.Abs(m)
 		if err != nil {
 			return fmt.Errorf("--mount %q: %w", m, err)
 		}
 		target := containerRepoPath(abs)
+		mountedTargets = append(mountedTargets, target)
 		runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s:ro", abs, target))
+	}
+	// Auto-scan explicit --mount dirs by default (or $HOME if --scan was passed explicitly).
+	doScan := (*scan && explicitMounts) || (scanExplicit && *scan)
+	if doScan && len(mountedTargets) > 0 {
+		runArgs = append(runArgs, "-e", "GATT_SCAN_DIRS="+strings.Join(mountedTargets, ","))
+		runArgs = append(runArgs, "-e", "GATT_SCAN_DEPTH="+strconv.Itoa(*scanDepth))
 	}
 	if strings.TrimSpace(*repos) != "" {
 		var mapped []string
@@ -154,7 +172,11 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				fmt.Printf("gatt docker: ready at %s (%s)\n", baseURL, strings.TrimSpace(string(body)))
-				fmt.Printf("next: in any mounted repo, run: gatt install --http %s\n", baseURL)
+				if doScan {
+					fmt.Printf("gatt docker: scanning for git repos under %s (depth %d)\n", strings.Join(mountedTargets, ", "), *scanDepth)
+				}
+				fmt.Printf("next (global, all repos):  gatt install --http %s --scope user\n", baseURL)
+				fmt.Printf("next (this repo only):     gatt install --http %s\n", baseURL)
 				return nil
 			}
 		}

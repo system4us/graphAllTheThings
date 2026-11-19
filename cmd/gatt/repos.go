@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"graphallthethings/internal/connector/codebase"
 	"graphallthethings/internal/embed"
+	"graphallthethings/internal/graph"
 	"graphallthethings/internal/lock"
 	"graphallthethings/internal/mcpserver"
 	"graphallthethings/internal/store"
@@ -94,12 +96,15 @@ func repoKey(absPath string) string {
 }
 
 // repoPool manages multiple repositories in a central `gatt serve --data-dir`
-// instance. Each mounted repository gets its own SQLite graph, local vector
-// index, background sync coalescer, and MCP Streamable HTTP handler.
+// instance. Each mounted repository gets its own SQLite graph, vector index,
+// background sync coalescer, and MCP Streamable HTTP handler.
 type repoPool struct {
 	ctx      context.Context
 	dataDir  string
 	baseSync syncConfig
+	// indexSem serializes background sync/embed passes across repos so scanning
+	// dozens of repositories doesn't stampede the CPU-bound ONNX worker.
+	indexSem chan struct{}
 
 	mu       sync.Mutex
 	repos    map[string]*repoEntry
@@ -111,6 +116,7 @@ func newRepoPool(ctx context.Context, dataDir string, base syncConfig) *repoPool
 		ctx:      ctx,
 		dataDir:  dataDir,
 		baseSync: base,
+		indexSem: make(chan struct{}, 1),
 		repos:    map[string]*repoEntry{},
 		inFlight: map[string]chan struct{}{},
 	}
@@ -252,6 +258,12 @@ func (p *repoPool) initRepo(ctx context.Context, cleanRoot string) (*repoEntry, 
 	entry.mcpHandler = srv.HTTPHandler(nil)
 
 	entry.coalescer = newCoalescer(func() syncStatus {
+		select {
+		case p.indexSem <- struct{}{}:
+			defer func() { <-p.indexSem }()
+		case <-p.ctx.Done():
+			return syncStatus{At: time.Now(), Error: p.ctx.Err().Error()}
+		}
 		st := syncOnce(p.ctx, sc)
 		if st.Error == "" && (st.Summary != "" || st.Embedded > 0) {
 			_ = entry.mcp.Reload()
@@ -283,11 +295,15 @@ func extractInitialCodebase(ctx context.Context, root, graphPath string) error {
 }
 
 // LoadExisting pre-loads previously registered repos found under dataDir/repos
-// (whose mounted root still exists) plus any explicit paths from extraRepos.
-func (p *repoPool) LoadExisting(ctx context.Context, extraRepos []string) {
+// (whose mounted root still exists) plus any explicit paths from extraRepos and
+// any git repositories discovered under scanDirs (up to scanDepth levels deep).
+func (p *repoPool) LoadExisting(ctx context.Context, extraRepos, scanDirs []string, scanDepth int) {
 	seen := map[string]bool{}
 	matches, _ := filepath.Glob(filepath.Join(p.dataDir, "repos", "*", "meta.json"))
 	for _, mp := range matches {
+		if ctx.Err() != nil {
+			return
+		}
 		data, err := os.ReadFile(mp)
 		if err != nil {
 			continue
@@ -305,14 +321,100 @@ func (p *repoPool) LoadExisting(ctx context.Context, extraRepos []string) {
 		}
 	}
 	for _, r := range extraRepos {
-		r = strings.TrimSpace(r)
+		if ctx.Err() != nil {
+			return
+		}
+		r = containerRepoPath(r)
 		if r == "" || seen[filepath.Clean(r)] {
 			continue
 		}
+		seen[filepath.Clean(r)] = true
 		if _, err := p.Get(ctx, r); err != nil {
 			fmt.Fprintf(os.Stderr, "gatt serve: preload %s skipped: %v\n", r, err)
 		}
 	}
+	p.ScanNew(ctx, scanDirs, scanDepth)
+}
+
+// ScanNew discovers git repositories under scanDirs (up to scanDepth levels
+// deep) and registers any that are not yet loaded in the pool.
+func (p *repoPool) ScanNew(ctx context.Context, scanDirs []string, scanDepth int) {
+	if len(scanDirs) == 0 {
+		return
+	}
+	found := discoverGitRepos(scanDirs, scanDepth)
+	var added int
+	for _, root := range found {
+		if ctx.Err() != nil {
+			return
+		}
+		p.mu.Lock()
+		_, exists := p.repos[root]
+		p.mu.Unlock()
+		if exists {
+			continue
+		}
+		if _, err := p.Get(ctx, root); err != nil {
+			fmt.Fprintf(os.Stderr, "gatt serve: scan %s skipped: %v\n", root, err)
+			continue
+		}
+		added++
+	}
+	if added > 0 {
+		fmt.Fprintf(os.Stderr, "gatt serve: discovered %d git repo(s) under %s (indexing sequentially in background)\n",
+			added, strings.Join(scanDirs, ", "))
+	}
+}
+
+// discoverGitRepos walks each directory in dirs up to maxDepth levels deep and
+// returns every directory containing a .git entry (repo or worktree), without
+// recursing inside discovered repositories.
+func discoverGitRepos(dirs []string, maxDepth int) []string {
+	if maxDepth <= 0 {
+		maxDepth = 2
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range dirs {
+		root := containerRepoPath(raw)
+		if root == "" {
+			continue
+		}
+		root = filepath.Clean(root)
+		fi, err := os.Stat(root)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return nil
+			}
+			isRoot := path == root
+			if !isRoot && graph.SkipDir(d.Name(), false) {
+				return filepath.SkipDir
+			}
+			// Check if this directory is a git repo or worktree (.git dir or file).
+			if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
+				if !seen[path] {
+					seen[path] = true
+					out = append(out, path)
+				}
+				return filepath.SkipDir
+			}
+			if !isRoot {
+				rel, err := filepath.Rel(root, path)
+				if err == nil {
+					depth := strings.Count(filepath.ToSlash(rel), "/") + 1
+					if depth >= maxDepth {
+						return filepath.SkipDir
+					}
+				}
+			}
+			return nil
+		})
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (p *repoPool) List() []repoStatus {
@@ -361,6 +463,56 @@ func (p *repoPool) Trigger(root string) {
 	if e != nil && e.coalescer != nil {
 		e.coalescer.Trigger()
 	}
+}
+
+// Resolve finds a repoEntry by absolute path (auto-extracting if mounted),
+// by unique repository basename (e.g. "ducksecrets"), or — when query is empty
+// and exactly one repo is loaded — that single repo.
+func (p *repoPool) Resolve(ctx context.Context, query string) (*repoEntry, error) {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		p.mu.Lock()
+		n := len(p.repos)
+		var only *repoEntry
+		if n == 1 {
+			for _, e := range p.repos {
+				only = e
+			}
+		}
+		p.mu.Unlock()
+		if only != nil {
+			return only, nil
+		}
+		return nil, fmt.Errorf("repo is required when %d repositories are registered (pass repo=<abs-path-or-name> or call list_repos)", n)
+	}
+
+	mapped := containerRepoPath(q)
+	if filepath.IsAbs(mapped) {
+		return p.Get(ctx, mapped)
+	}
+
+	// Match by basename (case-insensitive) among loaded repos.
+	lower := strings.ToLower(q)
+	p.mu.Lock()
+	var matches []*repoEntry
+	for _, e := range p.repos {
+		if strings.ToLower(filepath.Base(e.root)) == lower || strings.ToLower(e.key) == lower {
+			matches = append(matches, e)
+		}
+	}
+	p.mu.Unlock()
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		var paths []string
+		for _, m := range matches {
+			paths = append(paths, m.root)
+		}
+		sort.Strings(paths)
+		return nil, fmt.Errorf("ambiguous repo name %q matches %s; pass the full path", q, strings.Join(paths, ", "))
+	}
+	return nil, fmt.Errorf("repo %q not found; pass the full mounted path or call list_repos", q)
 }
 
 // requestRepo extracts the target repo path from ?repo=... or X-Gatt-Repo.

@@ -944,7 +944,10 @@ func cmdInstall(ctx context.Context, args []string) error {
 	}
 
 	if *httpURL != "" {
-		targetURL, err := resolveInstallHTTPURL(*httpURL, *repoPath)
+		// Global scopes (user / agy) register the multi-repo endpoint `/mcp`
+		// without pinning a single repo (unless --repo was passed explicitly).
+		attachRepo := resolvedScope == "project" || strings.TrimSpace(*repoPath) != ""
+		targetURL, err := resolveInstallHTTPURL(*httpURL, *repoPath, attachRepo)
 		if err != nil {
 			return err
 		}
@@ -1097,7 +1100,7 @@ func binaryName() string {
 	return "gatt"
 }
 
-func resolveInstallHTTPURL(rawURL, repo string) (string, error) {
+func resolveInstallHTTPURL(rawURL, repo string, attachRepo bool) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("--http %q: must be a full URL (e.g. http://127.0.0.1:7788)", rawURL)
@@ -1106,7 +1109,7 @@ func resolveInstallHTTPURL(rawURL, repo string) (string, error) {
 		u.Path = "/mcp"
 	}
 	q := u.Query()
-	if q.Get("repo") == "" {
+	if attachRepo && q.Get("repo") == "" {
 		r := strings.TrimSpace(repo)
 		if r == "" {
 			r, err = os.Getwd()

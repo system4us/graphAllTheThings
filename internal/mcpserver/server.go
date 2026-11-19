@@ -101,6 +101,17 @@ func (s *Server) Reload() error {
 	return nil
 }
 
+// Engine refreshes a codebase graph if files drifted and returns the live
+// engine plus any auto-refresh note. Used by the global multi-repo MCP server.
+func (s *Server) Engine(ctx context.Context, autoRefresh bool) (*engine.Engine, string, error) {
+	var note string
+	if autoRefresh {
+		note = s.autoRefreshCodebase(ctx)
+	}
+	e, err := s.requireEngine()
+	return e, note, err
+}
+
 // build loads the graph (with annotations) and opens a fresh vector store, so
 // refresh/reload pick up new vectors written since startup.
 func (s *Server) build() (*engine.Engine, error) {

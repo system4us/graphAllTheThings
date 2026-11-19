@@ -42,11 +42,12 @@ ls gatt-out/graph.db gatt-out/graph.json 2>/dev/null   # graph exists?
 
 ### Embedding setup (optional, enables semantic search)
 
-- **Docker central server (recommended):** runs MCP HTTP + local ONNX + embedded Qdrant on `127.0.0.1:7788` with automatic commit watching:
+- **Docker central server (recommended):** runs MCP HTTP + local ONNX + embedded Qdrant on `127.0.0.1:7788` with automatic git repo discovery and commit watching:
   ```bash
-  gatt docker up
-  gatt install --http http://127.0.0.1:7788
+  gatt docker up --mount /path/to/your/repos
+  gatt install --http http://127.0.0.1:7788 --scope user   # global across all repos
   ```
+  When using the global HTTP MCP endpoint (`/mcp` without `?repo=`), pass `repo` set to the current repository's absolute path (or unique folder name) to any tool, or call `list_repos`.
 - **Local ONNX worker (CPU, no Ollama):**
   ```bash
   (cd tools/gatt-embed && npm install)

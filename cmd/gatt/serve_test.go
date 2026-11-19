@@ -297,13 +297,6 @@ func TestMultiRepoMCPHTTP(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// /mcp without repo returns 400.
-	resp, err = http.Post(srv.URL+"/mcp", "application/json", strings.NewReader("{}"))
-	if err != nil || resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("POST /mcp without repo = %v, %v; want 400", resp, err)
-	}
-	resp.Body.Close()
-
 	// /mcp with unmounted path returns 404.
 	resp, err = http.Post(srv.URL+"/mcp?repo=/nonexistent/unmounted/repo", "application/json", strings.NewReader("{}"))
 	if err != nil || resp.StatusCode != http.StatusNotFound {
@@ -311,7 +304,7 @@ func TestMultiRepoMCPHTTP(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Connect with the real MCP Go SDK Streamable HTTP client.
+	// Connect with the real MCP Go SDK Streamable HTTP client (project-scoped ?repo=).
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
 	endpoint := srv.URL + "/mcp?repo=" + url.QueryEscape(repoDir)
 	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint}, nil)
@@ -359,7 +352,7 @@ func TestMultiRepoMCPHTTP(t *testing.T) {
 }
 
 func TestResolveInstallHTTPURL(t *testing.T) {
-	got, err := resolveInstallHTTPURL("http://127.0.0.1:7788", "/tmp/myrepo")
+	got, err := resolveInstallHTTPURL("http://127.0.0.1:7788", "/tmp/myrepo", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,10 +360,79 @@ func TestResolveInstallHTTPURL(t *testing.T) {
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
+	// Global scope (attachRepo=false): clean /mcp without ?repo=.
+	gotGlobal, err := resolveInstallHTTPURL("http://127.0.0.1:7788", "", false)
+	if err != nil || gotGlobal != "http://127.0.0.1:7788/mcp" {
+		t.Errorf("global URL: got %q, %v", gotGlobal, err)
+	}
 	// Explicit path and query preserved.
-	got2, err := resolveInstallHTTPURL("http://127.0.0.1:7788/mcp?repo=/other", "/tmp/myrepo")
+	got2, err := resolveInstallHTTPURL("http://127.0.0.1:7788/mcp?repo=/other", "/tmp/myrepo", true)
 	if err != nil || got2 != "http://127.0.0.1:7788/mcp?repo=/other" {
 		t.Errorf("explicit URL: got %q, %v", got2, err)
+	}
+}
+
+func TestDiscoverGitReposAndGlobalMCP(t *testing.T) {
+	parent := t.TempDir()
+	repoA := filepath.Join(parent, "alpha")
+	repoB := filepath.Join(parent, "org", "beta")
+	nested := filepath.Join(repoA, "subrepo") // inside repoA: must not be discovered separately
+	tooDeep := filepath.Join(parent, "a", "b", "c", "gamma")
+	ignored := filepath.Join(parent, "node_modules", "pkg")
+
+	for _, d := range []string{repoA, repoB, nested, tooDeep, ignored} {
+		if err := os.MkdirAll(filepath.Join(d, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoA, "main.go"), []byte("package alpha\nfunc AlphaFn() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoB, "main.go"), []byte("package beta\nfunc BetaFn() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := discoverGitRepos([]string{parent}, 2)
+	if len(got) != 2 || got[0] != repoA || got[1] != repoB {
+		t.Fatalf("discoverGitRepos = %v, want [%s %s]", got, repoA, repoB)
+	}
+
+	// Load via ScanNew and query over the global /mcp endpoint (no ?repo=).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := newRepoPool(ctx, t.TempDir(), syncConfig{noEmbed: true})
+	pool.ScanNew(ctx, []string{parent}, 2)
+
+	srv := httptest.NewServer(newMultiRepoHandler(pool, nil, parent))
+	defer srv.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "global-test", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: srv.URL + "/mcp"}, nil)
+	if err != nil {
+		t.Fatalf("global MCP connect failed: %v", err)
+	}
+	defer session.Close()
+
+	// list_repos returns both alpha and beta.
+	listRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "list_repos"})
+	if err != nil {
+		t.Fatalf("list_repos failed: %v", err)
+	}
+	listText := listRes.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(listText, repoA) || !strings.Contains(listText, repoB) {
+		t.Errorf("list_repos missing repos:\n%s", listText)
+	}
+
+	// code_context by short repo basename ("beta") resolves to repoB.
+	ctxRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "code_context",
+		Arguments: map[string]any{"repo": "beta", "question": "BetaFn"},
+	})
+	if err != nil {
+		t.Fatalf("code_context(repo=beta) failed: %v", err)
+	}
+	if txt := ctxRes.Content[0].(*mcp.TextContent).Text; !strings.Contains(txt, "BetaFn") {
+		t.Errorf("code_context(repo=beta) missing BetaFn:\n%s", txt)
 	}
 }
 

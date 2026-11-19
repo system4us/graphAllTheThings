@@ -196,7 +196,8 @@ func writeRepoError(w http.ResponseWriter, err error) {
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
-func newMultiRepoHandler(pool *repoPool, onnxInfo *onnxStatus) http.Handler {
+func newMultiRepoHandler(pool *repoPool, onnxInfo *onnxStatus, scanDirs ...string) http.Handler {
+	globalMCP := newGlobalMCPHandler(pool)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -254,10 +255,19 @@ func newMultiRepoHandler(pool *repoPool, onnxInfo *onnxStatus) http.Handler {
 		if pool.baseSync.qdURL != "" {
 			out["qdrant"] = map[string]any{"url": pool.baseSync.qdURL}
 		}
+		if len(scanDirs) > 0 {
+			out["scan_dirs"] = scanDirs
+		}
 		json.NewEncoder(w).Encode(out)
 	})
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
-		entry, err := pool.Get(r.Context(), requestRepo(r))
+		repo := requestRepo(r)
+		if repo == "" {
+			// Global user-scoped MCP endpoint: tools take a `repo` parameter.
+			globalMCP.ServeHTTP(w, r)
+			return
+		}
+		entry, err := pool.Get(r.Context(), repo)
 		if err != nil {
 			writeRepoError(w, err)
 			return
@@ -278,6 +288,14 @@ func cmdServe(ctx context.Context, args []string) error {
 	enableMCP := fs.Bool("mcp", false, "expose MCP over Streamable HTTP at /mcp (always on with --data-dir)")
 	dataDir := fs.String("data-dir", os.Getenv("GATT_DATA_DIR"), "multi-repo mode: directory where per-repo graphs and vectors are stored")
 	reposFlag := fs.String("repos", os.Getenv("GATT_REPOS"), "comma-separated absolute repo paths to preload on startup (multi-repo mode)")
+	scanDirsFlag := fs.String("scan-dirs", os.Getenv("GATT_SCAN_DIRS"), "comma-separated mounted parent directories to auto-discover git repos in (multi-repo mode)")
+	defaultScanDepth := 2
+	if v := os.Getenv("GATT_SCAN_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			defaultScanDepth = n
+		}
+	}
+	scanDepth := fs.Int("scan-depth", defaultScanDepth, "max directory depth under --scan-dirs to look for .git repos")
 	noEmbed := fs.Bool("no-embed", false, "refresh the graph only; never call the embedding server")
 	onnx := fs.String("onnx", os.Getenv("GATT_EMBED_WORKER"), "path to the gatt-embed worker (tools/gatt-embed or its server.mjs): serve starts it, embeds with a local ONNX model and stops it on exit")
 	onnxPort := fs.Int("onnx-port", 7801, "port for the onnx worker (fixed so queries can find it via GATT_EMBED_URL)")
@@ -346,12 +364,34 @@ func cmdServe(ctx context.Context, args []string) error {
 		if *reposFlag != "" {
 			extra = strings.Split(*reposFlag, ",")
 		}
-		go pool.LoadExisting(passCtx, extra)
+		var scanDirs []string
+		if *scanDirsFlag != "" {
+			for _, d := range strings.Split(*scanDirsFlag, ",") {
+				if s := containerRepoPath(d); s != "" {
+					scanDirs = append(scanDirs, s)
+				}
+			}
+		}
+		go pool.LoadExisting(passCtx, extra, scanDirs, *scanDepth)
+		if len(scanDirs) > 0 {
+			go func() {
+				t := time.NewTicker(60 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-passCtx.Done():
+						return
+					case <-t.C:
+						pool.ScanNew(passCtx, scanDirs, *scanDepth)
+					}
+				}
+			}()
+		}
 		go watchGitCommits(passCtx, *watchInterval, pool.Roots, func(root, _ string) {
 			pool.Trigger(root)
 		})
-		handler = newMultiRepoHandler(pool, onnxInfo)
-		fmt.Fprintf(os.Stderr, "gatt serve: multi-repo MCP HTTP listening on http://%s (/mcp?repo=<path>, POST /refresh, GET /status, GET /repos, GET /health)\n", *addr)
+		handler = newMultiRepoHandler(pool, onnxInfo, scanDirs...)
+		fmt.Fprintf(os.Stderr, "gatt serve: multi-repo MCP HTTP listening on http://%s (/mcp [global or ?repo=<path>], POST /refresh, GET /status, GET /repos, GET /health)\n", *addr)
 	} else {
 		var c *coalescer
 		var mcpSrv *mcpserver.Server
