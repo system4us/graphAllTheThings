@@ -114,10 +114,19 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--mount %q: %w", m, err)
 		}
-		runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s:ro", abs, abs))
+		target := containerRepoPath(abs)
+		runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s:ro", abs, target))
 	}
 	if strings.TrimSpace(*repos) != "" {
-		runArgs = append(runArgs, "-e", "GATT_REPOS="+strings.TrimSpace(*repos))
+		var mapped []string
+		for _, r := range strings.Split(*repos, ",") {
+			if s := containerRepoPath(r); s != "" {
+				mapped = append(mapped, s)
+			}
+		}
+		if len(mapped) > 0 {
+			runArgs = append(runArgs, "-e", "GATT_REPOS="+strings.Join(mapped, ","))
+		}
 	}
 	runArgs = append(runArgs, *image)
 

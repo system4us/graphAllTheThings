@@ -554,7 +554,7 @@ func cmdNotify(_ context.Context, args []string) error {
 		if abs, err := filepath.Abs(r); err == nil {
 			r = abs
 		}
-		endpoint += "?repo=" + url.QueryEscape(r)
+		endpoint += "?repo=" + url.QueryEscape(containerRepoPath(r))
 	}
 	hc := &http.Client{Timeout: 1500 * time.Millisecond}
 	resp, err := hc.Post(endpoint, "application/json", nil)

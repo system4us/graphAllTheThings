@@ -1119,7 +1119,7 @@ func resolveInstallHTTPURL(rawURL, repo string) (string, error) {
 				return "", err
 			}
 		}
-		q.Set("repo", r)
+		q.Set("repo", containerRepoPath(r))
 		u.RawQuery = q.Encode()
 	}
 	return u.String(), nil

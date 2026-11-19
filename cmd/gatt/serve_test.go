@@ -382,3 +382,19 @@ func TestCmdGrepHelpDoesNotSearch(t *testing.T) {
 		t.Fatalf("cmdGrep(-h) returned %v, want nil", err)
 	}
 }
+
+func TestContainerRepoPath(t *testing.T) {
+	cases := map[string]string{
+		"/home/rodrigo/app":           "/home/rodrigo/app",
+		`C:\Users\rodrigo\app`:        "/host/c/Users/rodrigo/app",
+		`c:\Users\rodrigo\app\`:       "/host/c/Users/rodrigo/app",
+		"D:/work/my-repo":             "/host/d/work/my-repo",
+		`C:\`:                         "/host/c",
+		"":                            "",
+	}
+	for in, want := range cases {
+		if got := containerRepoPath(in); got != want {
+			t.Errorf("containerRepoPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

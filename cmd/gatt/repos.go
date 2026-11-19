@@ -116,10 +116,29 @@ func newRepoPool(ctx context.Context, dataDir string, base syncConfig) *repoPool
 	}
 }
 
+// containerRepoPath translates a host path into the POSIX path mounted inside
+// the Linux Docker container. POSIX paths (/home/...) pass through unchanged;
+// Windows drive paths (C:\Users\foo or C:/Users/foo) map to /host/c/Users/foo
+// so `-v C:\Users\foo:/host/c/Users/foo:ro`, `gatt install --http`, and
+// `gatt notify` agree on the same container path.
+func containerRepoPath(p string) string {
+	p = strings.TrimSpace(p)
+	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) {
+		drive := strings.ToLower(string(p[0]))
+		rest := strings.ReplaceAll(p[2:], "\\", "/")
+		rest = strings.TrimLeft(rest, "/")
+		if rest == "" {
+			return "/host/" + drive
+		}
+		return "/host/" + drive + "/" + strings.TrimRight(rest, "/")
+	}
+	return p
+}
+
 // Get returns the repoEntry for rawPath, initializing and extracting its graph
 // on first access. Concurrent callers for the same path wait on one init.
 func (p *repoPool) Get(ctx context.Context, rawPath string) (*repoEntry, error) {
-	rawPath = strings.TrimSpace(rawPath)
+	rawPath = containerRepoPath(rawPath)
 	if rawPath == "" {
 		return nil, fmt.Errorf("%w: missing repo parameter (?repo=/abs/path or X-Gatt-Repo header)", errBadRepo)
 	}
