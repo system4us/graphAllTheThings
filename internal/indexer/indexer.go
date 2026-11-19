@@ -22,9 +22,10 @@ var ErrModelMismatch = errors.New("embedding model mismatch")
 
 // Result reports what an index run did.
 type Result struct {
-	Total    int // points written to the store (embedded + reused)
-	Embedded int // nodes actually sent to the embedder
-	Reused   int // nodes served from the incremental cache
+	Total    int    // points written to the store (embedded + reused)
+	Embedded int    // nodes actually sent to the embedder
+	Reused   int    // nodes served from the incremental cache
+	Model    string // model recorded with the vectors (reflects server-reported model if any)
 }
 
 // ReindexNodes embeds only the given node ids and merges them into the store.
@@ -102,7 +103,14 @@ func ReindexNodes(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb
 // the CLI uses this to print a progress indicator.
 func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *embed.Client, model string, full bool, progress func(done, total int)) (Result, error) {
 	if inc, ok := vs.(store.Incremental); ok {
-		return reindexIncremental(ctx, g, vs, inc, emb, full, progress)
+		res, err := reindexIncremental(ctx, g, vs, inc, emb, full, progress)
+		if err == nil {
+			res.Model = model
+			if m := emb.ActualModel(); m != "" {
+				res.Model = m
+			}
+		}
+		return res, err
 	}
 	// Reuse vectors for nodes whose embedding text is unchanged. Only the local
 	// store exposes a cache, and only vectors from the same model are
@@ -154,18 +162,26 @@ func Reindex(ctx context.Context, g *graph.Graph, vs store.VectorStore, emb *emb
 	if len(points) == 0 {
 		return Result{}, fmt.Errorf("nothing to index")
 	}
+	// If an OpenAI-compatible server (e.g. the local ONNX worker) reported the
+	// model it actually ran, record that instead of a client-side fallback name.
+	if actual := emb.ActualModel(); actual != "" {
+		model = actual
+		if ls, ok := vs.(*local.Store); ok {
+			ls.Model = actual
+		}
+	}
 	// Nothing to embed and every stored vector is still live: the index is
 	// already exact, so don't rewrite (and re-parse) a file of many MB for nothing.
 	// points all came from the cache, so equal counts mean identical id sets.
 	if _, ok := vs.(*local.Store); ok && len(todoIDs) == 0 && len(cache) == len(points) {
-		return Result{Total: len(points), Reused: reused}, nil
+		return Result{Total: len(points), Reused: reused, Model: model}, nil
 	}
 	// points is the complete live set, so for the local store Replace also drops
 	// vectors of nodes deleted from the graph (Upsert alone only ever adds).
 	if err := replaceAll(ctx, vs, points); err != nil {
 		return Result{}, err
 	}
-	return Result{Total: len(points), Embedded: len(todoIDs), Reused: reused}, nil
+	return Result{Total: len(points), Embedded: len(todoIDs), Reused: reused, Model: model}, nil
 }
 
 // replacer is implemented by stores that can be rewritten to exactly a point set.

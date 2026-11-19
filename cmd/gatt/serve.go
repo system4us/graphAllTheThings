@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/indexer"
+	"graphallthethings/internal/mcpserver"
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
 )
@@ -143,7 +145,15 @@ func guard(next http.Handler) http.Handler {
 }
 
 func newServeHandler(c *coalescer) http.Handler {
+	return newSingleRepoHandler(c, nil)
+}
+
+func newSingleRepoHandler(c *coalescer, mcpHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
 	mux.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -162,21 +172,125 @@ func newServeHandler(c *coalescer) http.Handler {
 		}
 		json.NewEncoder(w).Encode(out)
 	})
+	if mcpHandler != nil {
+		mux.Handle("/mcp", mcpHandler)
+	}
 	return guard(mux)
 }
 
-// cmdServe keeps a graph fresh in the background. The agent's hook calls
-// `gatt notify` (or POSTs /refresh); each pass re-parses drifted files, then
-// brings the vectors up to date with the same hash-incremental logic as
-// `gatt index`. Queries never wait on any of it.
+type onnxStatus struct {
+	URL   string `json:"url,omitempty"`
+	Model string `json:"model,omitempty"`
+}
+
+func writeRepoError(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, errBadRepo):
+		code = http.StatusBadRequest
+	case errors.Is(err, errRepoNotMounted):
+		code = http.StatusNotFound
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+func newMultiRepoHandler(pool *repoPool, onnxInfo *onnxStatus) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		out := map[string]any{"ok": true, "mode": "multi-repo"}
+		if onnxInfo != nil {
+			out["model"] = onnxInfo.Model
+		}
+		if pool.baseSync.qdURL != "" {
+			out["vector_store"] = "qdrant"
+		} else {
+			out["vector_store"] = "local"
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+	mux.HandleFunc("/repos", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"repos": pool.List()})
+	})
+	mux.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if repo := requestRepo(r); repo != "" {
+			entry, err := pool.Get(r.Context(), repo)
+			if err != nil {
+				writeRepoError(w, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]string{"repo": entry.root, "state": entry.coalescer.Trigger()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{"repos": pool.RefreshAll()})
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if repo := requestRepo(r); repo != "" {
+			entry, err := pool.Get(r.Context(), repo)
+			if err != nil {
+				writeRepoError(w, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(entry.status())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		out := map[string]any{"repos": pool.List()}
+		if onnxInfo != nil {
+			out["onnx"] = onnxInfo
+		}
+		if pool.baseSync.qdURL != "" {
+			out["qdrant"] = map[string]any{"url": pool.baseSync.qdURL}
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		entry, err := pool.Get(r.Context(), requestRepo(r))
+		if err != nil {
+			writeRepoError(w, err)
+			return
+		}
+		entry.mcpHandler.ServeHTTP(w, r)
+	})
+	return guard(mux)
+}
+
+// cmdServe keeps a graph fresh in the background and optionally serves MCP over
+// Streamable HTTP. With --data-dir it runs in multi-repo mode, serving any
+// mounted repository selected via ?repo=/abs/path (or X-Gatt-Repo).
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
-	addr := fs.String("addr", serveAddr(), "listen address (loopback only)")
+	addr := fs.String("addr", serveAddr(), "listen address (loopback only unless --bind-any)")
+	bindAny := fs.Bool("bind-any", os.Getenv("GATT_BIND_ANY") == "1", "allow binding a non-loopback address (e.g. 0.0.0.0 inside Docker; Host header is still restricted to loopback)")
+	enableMCP := fs.Bool("mcp", false, "expose MCP over Streamable HTTP at /mcp (always on with --data-dir)")
+	dataDir := fs.String("data-dir", os.Getenv("GATT_DATA_DIR"), "multi-repo mode: directory where per-repo graphs and vectors are stored")
+	reposFlag := fs.String("repos", os.Getenv("GATT_REPOS"), "comma-separated absolute repo paths to preload on startup (multi-repo mode)")
 	noEmbed := fs.Bool("no-embed", false, "refresh the graph only; never call the embedding server")
 	onnx := fs.String("onnx", os.Getenv("GATT_EMBED_WORKER"), "path to the gatt-embed worker (tools/gatt-embed or its server.mjs): serve starts it, embeds with a local ONNX model and stops it on exit")
 	onnxPort := fs.Int("onnx-port", 7801, "port for the onnx worker (fixed so queries can find it via GATT_EMBED_URL)")
 	onnxModel := fs.String("onnx-model", "", "model for the onnx worker (default: the worker's multilingual MiniLM; downloaded on first use)")
+	qdrantBin := fs.String("qdrant-bin", os.Getenv("GATT_QDRANT_BIN"), "path to an embedded qdrant binary: serve starts it on loopback (127.0.0.1) with storage under --data-dir/qdrant and stops it on exit")
+	qdrantPort := fs.Int("qdrant-port", 6333, "HTTP port for the embedded qdrant process (loopback only)")
+	defaultWatch := 5 * time.Second
+	if v := os.Getenv("GATT_WATCH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			defaultWatch = d
+		}
+	}
+	watchInterval := fs.Duration("watch-interval", defaultWatch, "poll interval to detect git commits and trigger incremental reindex (0 disables)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -184,30 +298,116 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("--addr: %w", err)
 	}
-	if !loopbackHost(host) {
-		return fmt.Errorf("--addr %q: serve only listens on loopback (it is unauthenticated)", *addr)
+	if !*bindAny && !loopbackHost(host) {
+		return fmt.Errorf("--addr %q: serve only listens on loopback (pass --bind-any inside a container published on 127.0.0.1)", *addr)
 	}
 
 	passCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	sc := syncConfig{graphPath: *graphPath, qdURL: *qdURL, coll: *coll, embURL: *embURL, embModel: *embModel, noEmbed: *noEmbed}
+	if *qdrantBin != "" && sc.qdURL == "" && !*noEmbed {
+		storageRoot := filepath.Join(filepath.Dir(*graphPath), "qdrant")
+		if *dataDir != "" {
+			storageRoot = filepath.Join(*dataDir, "qdrant")
+		}
+		qp, err := startQdrant(passCtx, *qdrantBin, storageRoot, *qdrantPort)
+		if err != nil {
+			return err
+		}
+		defer qp.Stop()
+		sc.qdURL = qp.URL
+		fmt.Fprintf(os.Stderr, "gatt serve: embedded qdrant ready at %s (storage %s)\n", qp.URL, storageRoot)
+	}
+	var onnxInfo *onnxStatus
 	if *onnx != "" {
 		w, err := startOnnxWorker(passCtx, *onnx, *onnxPort, *onnxModel)
 		if err != nil {
 			return err
 		}
 		defer w.Stop()
+		onnxInfo = &onnxStatus{URL: w.URL, Model: w.Model}
 		fmt.Fprintf(os.Stderr, "gatt serve: onnx worker ready at %s (model %s)\n", w.URL, w.Model)
-		fmt.Fprintf(os.Stderr, "gatt serve: for queries to use the same model, export GATT_EMBED_URL=%s\n", w.URL)
+		if *dataDir == "" && !*enableMCP {
+			fmt.Fprintf(os.Stderr, "gatt serve: for queries to use the same model, export GATT_EMBED_URL=%s\n", w.URL)
+		}
 		sc.embURL, sc.initIndex = w.URL, true
 		if sc.embModel == "" {
 			sc.embModel = w.Model
 		}
 	}
-	var c *coalescer
-	c = newCoalescer(func() syncStatus { return syncOnce(passCtx, sc) })
-	sc.progress = c.SetProgress
-	srv := &http.Server{Addr: *addr, Handler: newServeHandler(c), ReadHeaderTimeout: 5 * time.Second}
+
+	var handler http.Handler
+	if *dataDir != "" {
+		if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+			return fmt.Errorf("--data-dir: %w", err)
+		}
+		pool := newRepoPool(passCtx, *dataDir, sc)
+		var extra []string
+		if *reposFlag != "" {
+			extra = strings.Split(*reposFlag, ",")
+		}
+		go pool.LoadExisting(passCtx, extra)
+		go watchGitCommits(passCtx, *watchInterval, pool.Roots, func(root, _ string) {
+			pool.Trigger(root)
+		})
+		handler = newMultiRepoHandler(pool, onnxInfo)
+		fmt.Fprintf(os.Stderr, "gatt serve: multi-repo MCP HTTP listening on http://%s (/mcp?repo=<path>, POST /refresh, GET /status, GET /repos, GET /health)\n", *addr)
+	} else {
+		var c *coalescer
+		var mcpSrv *mcpserver.Server
+		var mcpHandler http.Handler
+		if *enableMCP {
+			mcpCfg := mcpserver.Config{
+				GraphPath: *graphPath,
+				OnAutoRefresh: func() {
+					if c != nil {
+						c.Trigger()
+					}
+				},
+			}
+			if !sc.noEmbed {
+				vs := openStore(*graphPath, sc.qdURL, sc.coll)
+				model := sc.embModel
+				if model == "" {
+					model = resolveModel("", vs)
+				}
+				mcpCfg.OpenStore = func() store.VectorStore { return openStore(*graphPath, sc.qdURL, sc.coll) }
+				mcpCfg.Embedder = embed.New(sc.embURL, model)
+				mcpCfg.EmbModel = model
+			}
+			var err error
+			mcpSrv, err = mcpserver.New(mcpCfg)
+			if err != nil {
+				return fmt.Errorf("mcp init: %w", err)
+			}
+			mcpHandler = mcpSrv.HTTPHandler(nil)
+		}
+		c = newCoalescer(func() syncStatus {
+			st := syncOnce(passCtx, sc)
+			if mcpSrv != nil && st.Error == "" && (st.Summary != "" || st.Embedded > 0) {
+				_ = mcpSrv.Reload()
+			}
+			return st
+		})
+		sc.progress = c.SetProgress
+		handler = newSingleRepoHandler(c, mcpHandler)
+		if *enableMCP {
+			fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (/mcp, POST /refresh, GET /status, GET /health)\n", *addr)
+		} else {
+			fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (POST /refresh, GET /status, GET /health)\n", *addr)
+		}
+		c.Trigger() // bring everything current once at startup
+		go watchGitCommits(passCtx, *watchInterval, func() []string {
+			if src, _, err := graph.LoadCodebaseState(*graphPath); err == nil && strings.HasPrefix(src, "codebase:") {
+				return []string{strings.TrimPrefix(src, "codebase:")}
+			}
+			return nil
+		}, func(_, _ string) {
+			c.Trigger()
+		})
+	}
+
+	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -219,8 +419,6 @@ func cmdServe(ctx context.Context, args []string) error {
 		srv.Shutdown(shutdown)
 	}()
 
-	fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (POST /refresh, GET /status)\n", *addr)
-	c.Trigger() // bring everything current once at startup
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -274,7 +472,7 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 		return st
 	}
 	vs := openStore(graphPath, qdURL, coll)
-	model := resolveModel(embModel, vs)
+	model := resolveIndexModel(ctx, embModel, embURL, vs, false)
 	if stored := localStoredModel(vs); stored != "" && stored != model {
 		st.Note = fmt.Sprintf("vectors were built with %q, not %q; skipped (run `gatt index --full` to switch)", stored, model)
 		return st
@@ -340,16 +538,26 @@ func localStoredModel(vs store.VectorStore) string {
 
 // cmdNotify tells a running `gatt serve` to refresh. It is meant for agent
 // hooks, so it is fast and never fails the hook: if nothing is listening it
-// exits 0 quietly (use -v to see why).
+// exits 0 quietly (use -v to see why). In multi-repo mode, --repo (default:
+// current working directory) selects which mounted repository to refresh.
 func cmdNotify(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("notify", flag.ExitOnError)
 	addr := fs.String("addr", serveAddr(), "address of gatt serve")
+	defaultRepo, _ := os.Getwd()
+	repo := fs.String("repo", defaultRepo, "repository path to refresh in multi-repo mode (empty = all)")
 	verbose := fs.Bool("v", false, "report failures on stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	endpoint := "http://" + *addr + "/refresh"
+	if r := strings.TrimSpace(*repo); r != "" {
+		if abs, err := filepath.Abs(r); err == nil {
+			r = abs
+		}
+		endpoint += "?repo=" + url.QueryEscape(r)
+	}
 	hc := &http.Client{Timeout: 1500 * time.Millisecond}
-	resp, err := hc.Post("http://"+*addr+"/refresh", "application/json", nil)
+	resp, err := hc.Post(endpoint, "application/json", nil)
 	if err != nil {
 		if *verbose {
 			fmt.Fprintln(os.Stderr, "gatt notify: no server:", err)
@@ -442,6 +650,79 @@ func (w *onnxWorker) Stop() {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		_ = w.cmd.Process.Kill()
+		<-done
+	}
+}
+
+// qdrantProc is a running embedded Qdrant child process bound strictly to
+// loopback inside the container/host.
+type qdrantProc struct {
+	URL string
+	cmd *exec.Cmd
+}
+
+func startQdrant(ctx context.Context, binPath, storageRoot string, port int) (*qdrantProc, error) {
+	if _, err := os.Stat(binPath); err != nil {
+		return nil, fmt.Errorf("--qdrant-bin: %w", err)
+	}
+	storageDir := filepath.Join(storageRoot, "storage")
+	snapshotsDir := filepath.Join(storageRoot, "snapshots")
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		return nil, fmt.Errorf("--qdrant-bin: create storage dir: %w", err)
+	}
+	if err := os.MkdirAll(snapshotsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("--qdrant-bin: create snapshots dir: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, binPath)
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"QDRANT__SERVICE__HOST=127.0.0.1",
+		"QDRANT__SERVICE__HTTP_PORT="+strconv.Itoa(port),
+		"QDRANT__SERVICE__GRPC_PORT="+strconv.Itoa(port+1),
+		"QDRANT__SERVICE__ENABLE_STATIC_CONTENT=false",
+		"QDRANT__TELEMETRY_DISABLED=true",
+		"QDRANT__STORAGE__STORAGE_PATH="+storageDir,
+		"QDRANT__STORAGE__SNAPSHOTS_PATH="+snapshotsDir,
+		"QDRANT__LOG_LEVEL=WARN",
+	)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("--qdrant-bin: start: %w", err)
+	}
+
+	qp := &qdrantProc{URL: fmt.Sprintf("http://127.0.0.1:%d", port), cmd: cmd}
+	hc := &http.Client{Timeout: 500 * time.Millisecond}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			qp.Stop()
+			return nil, ctx.Err()
+		}
+		resp, err := hc.Get(qp.URL + "/readyz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return qp, nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	qp.Stop()
+	return nil, errors.New("--qdrant-bin: qdrant did not become ready within 20s")
+}
+
+// Stop sends SIGTERM to Qdrant so it flushes storage cleanly, then kills if needed.
+func (q *qdrantProc) Stop() {
+	if q == nil || q.cmd == nil || q.cmd.Process == nil {
+		return
+	}
+	_ = q.cmd.Process.Signal(syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() { _ = q.cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = q.cmd.Process.Kill()
 		<-done
 	}
 }

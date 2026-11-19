@@ -1,0 +1,28 @@
+services:
+  gatt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gatt:local
+    container_name: gatt-server
+    restart: unless-stopped
+    # Strictly loopback-only: never expose unauthenticated gatt to the network.
+    ports:
+      - "127.0.0.1:7788:7788"
+    environment:
+      # Optional: comma-separated list of mounted absolute repo paths to preload on startup.
+      # GATT_REPOS: /home/user/repo-a,/home/user/repo-b
+      GATT_EMBED_CACHE: /cache/huggingface
+    volumes:
+      # Persistent store for per-repo SQLite graphs, vectors, and annotations.
+      - gatt-data:/data
+      # Persistent cache for the downloaded ONNX model (~130 MB).
+      - gatt-cache:/cache/huggingface
+      # Mount your local repositories read-only at the EXACT SAME absolute path
+      # inside and outside the container so mtime-based incremental refresh works
+      # on uncommitted edits. Replace/add entries for your workspace roots:
+      - ${GATT_MOUNT_ROOT:-.}:${GATT_MOUNT_ROOT:-/workspace}:ro
+
+volumes:
+  gatt-data:
+  gatt-cache:

@@ -64,3 +64,47 @@ func TestOpenAIErrorAndCountMismatch(t *testing.T) {
 		t.Error("expected error on vector count mismatch")
 	}
 }
+
+func TestOpenAIActualModelAndProbe(t *testing.T) {
+	const onnxModel = "Xenova/paraphrase-multilingual-MiniLM-L12-v2"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			json.NewEncoder(w).Encode(map[string]any{"ok": true, "model": onnxModel})
+		case "/v1/embeddings":
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"model":  onnxModel,
+				"data":   []map[string]any{{"index": 0, "embedding": []float32{0.1, 0.2}}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// ProbeModel discovers the worker's model via /health.
+	c1 := New(srv.URL+"/v1", "")
+	if got := c1.ProbeModel(context.Background()); got != onnxModel {
+		t.Errorf("ProbeModel = %q, want %q", got, onnxModel)
+	}
+	if got := c1.ActualModel(); got != onnxModel {
+		t.Errorf("ActualModel after probe = %q, want %q", got, onnxModel)
+	}
+
+	// Embed also captures the model field from the /v1/embeddings response even
+	// if the client sent a fallback model name like bge-m3.
+	c2 := New(srv.URL+"/v1", DefaultModel)
+	if _, err := c2.Embed(context.Background(), []string{"hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := c2.ActualModel(); got != onnxModel {
+		t.Errorf("ActualModel after embed = %q, want %q", got, onnxModel)
+	}
+
+	// Ollama URLs do not probe /health.
+	c3 := New(srv.URL, DefaultModel)
+	if got := c3.ProbeModel(context.Background()); got != "" {
+		t.Errorf("ProbeModel on ollama URL = %q, want empty", got)
+	}
+}

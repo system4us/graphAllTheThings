@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -268,5 +271,105 @@ func TestVectorsFresh(t *testing.T) {
 	markVectorsFresh(graphPath, sigBefore)
 	if vectorsFresh(graphPath) {
 		t.Error("graph changed during the catch-up: stamp must not match")
+	}
+}
+
+func TestMultiRepoMCPHTTP(t *testing.T) {
+	dataDir := t.TempDir()
+	repoDir := t.TempDir()
+	// Put a tiny Go file in repoDir so codebase extraction produces real nodes.
+	src := "package demo\n\nfunc Hello() string { return \"hi\" }\n"
+	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pool := newRepoPool(ctx, dataDir, syncConfig{noEmbed: true})
+	srv := httptest.NewServer(newMultiRepoHandler(pool, &onnxStatus{URL: "http://127.0.0.1:7801/v1", Model: "test-model"}))
+	defer srv.Close()
+
+	// /health returns 200 ok.
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health = %v, %v", resp, err)
+	}
+	resp.Body.Close()
+
+	// /mcp without repo returns 400.
+	resp, err = http.Post(srv.URL+"/mcp", "application/json", strings.NewReader("{}"))
+	if err != nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /mcp without repo = %v, %v; want 400", resp, err)
+	}
+	resp.Body.Close()
+
+	// /mcp with unmounted path returns 404.
+	resp, err = http.Post(srv.URL+"/mcp?repo=/nonexistent/unmounted/repo", "application/json", strings.NewReader("{}"))
+	if err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /mcp unmounted = %v, %v; want 404", resp, err)
+	}
+	resp.Body.Close()
+
+	// Connect with the real MCP Go SDK Streamable HTTP client.
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	endpoint := srv.URL + "/mcp?repo=" + url.QueryEscape(repoDir)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint}, nil)
+	if err != nil {
+		t.Fatalf("MCP HTTP connect failed: %v", err)
+	}
+	defer session.Close()
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil || len(tools.Tools) == 0 {
+		t.Fatalf("ListTools = %v, %v", tools, err)
+	}
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "code_context",
+		Arguments: map[string]any{"question": "Hello"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(code_context) failed: %v", err)
+	}
+	if len(res.Content) == 0 {
+		t.Fatalf("CallTool(code_context) returned empty content")
+	}
+
+	// /repos and /status should now list repoDir.
+	resp, err = http.Get(srv.URL + "/repos")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repos = %v, %v", resp, err)
+	}
+	var reposOut struct {
+		Repos []repoStatus `json:"repos"`
+	}
+	json.NewDecoder(resp.Body).Decode(&reposOut)
+	resp.Body.Close()
+	if len(reposOut.Repos) != 1 || reposOut.Repos[0].Root != repoDir {
+		t.Errorf("GET /repos = %+v, want 1 entry for %s", reposOut.Repos, repoDir)
+	}
+
+	// POST /refresh?repo=<repoDir> returns 202.
+	resp, err = http.Post(srv.URL+"/refresh?repo="+url.QueryEscape(repoDir), "application/json", nil)
+	if err != nil || resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /refresh?repo = %v, %v; want 202", resp, err)
+	}
+	resp.Body.Close()
+}
+
+func TestResolveInstallHTTPURL(t *testing.T) {
+	got, err := resolveInstallHTTPURL("http://127.0.0.1:7788", "/tmp/myrepo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "http://127.0.0.1:7788/mcp?repo=%2Ftmp%2Fmyrepo"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Explicit path and query preserved.
+	got2, err := resolveInstallHTTPURL("http://127.0.0.1:7788/mcp?repo=/other", "/tmp/myrepo")
+	if err != nil || got2 != "http://127.0.0.1:7788/mcp?repo=/other" {
+		t.Errorf("explicit URL: got %q, %v", got2, err)
 	}
 }

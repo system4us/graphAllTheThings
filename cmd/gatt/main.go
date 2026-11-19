@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -388,7 +389,7 @@ func withChat(e *engine.Engine, embURL, chatModel string) {
 
 // resolveModel picks the embedding model: explicit flag > model recorded in
 // the local index > default. Prevents silent dimension mismatches between
-// index time and query time.
+// index time and query time without doing network I/O on read-only commands.
 func resolveModel(flagModel string, vs store.VectorStore) string {
 	if flagModel != "" {
 		return flagModel
@@ -401,6 +402,23 @@ func resolveModel(flagModel string, vs store.VectorStore) string {
 		if m := local.PeekModel(ls.Path); m != "" {
 			return m
 		}
+	}
+	return embed.DefaultModel
+}
+
+// resolveIndexModel picks the embedding model for indexing passes (`gatt index`,
+// `gatt serve`): explicit flag > server-reported model via /health (for
+// OpenAI-compatible workers like gatt-embed) > stored index model (unless full)
+// > default.
+func resolveIndexModel(ctx context.Context, flagModel, embURL string, vs store.VectorStore, full bool) string {
+	if flagModel != "" {
+		return flagModel
+	}
+	if m := embed.New(embURL, "").ProbeModel(ctx); m != "" {
+		return m
+	}
+	if !full {
+		return resolveModel("", vs)
 	}
 	return embed.DefaultModel
 }
@@ -545,7 +563,7 @@ func cmdIndex(ctx context.Context, args []string) error {
 		return err
 	}
 	vs := openStore(*graphPath, *qdURL, *coll)
-	model := resolveModel(*embModel, vs)
+	model := resolveIndexModel(ctx, *embModel, *embURL, vs, *full)
 	emb := embed.New(*embURL, model)
 
 	progress := func(done, total int) {
@@ -555,11 +573,15 @@ func cmdIndex(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	usedModel := res.Model
+	if usedModel == "" {
+		usedModel = model
+	}
 	if res.Embedded > 0 {
 		fmt.Fprintln(os.Stderr)
-		fmt.Printf("embedded %d nodes with %s (%d reused from cache)\n", res.Embedded, model, res.Reused)
+		fmt.Printf("embedded %d nodes with %s (%d reused from cache)\n", res.Embedded, usedModel, res.Reused)
 	} else {
-		fmt.Printf("all %d nodes already current with %s\n", res.Reused, model)
+		fmt.Printf("all %d nodes already current with %s\n", res.Reused, usedModel)
 	}
 	backend := "in-process index"
 	if *qdURL != "" {
@@ -859,6 +881,8 @@ func cmdInstall(ctx context.Context, args []string) error {
 	srcKind := fs.String("source-kind", "", "source connector to wire in for the check_drift/refresh_graph tools ("+connector.Kinds+")")
 	src := fs.String("source", "", "source the connector reads (file/DSN/URL); note a DB DSN is stored in the MCP config")
 	code := fs.String("code", "", "repo root to link endpoints/schemas to their Go source on refresh")
+	httpURL := fs.String("http", "", "register a Streamable HTTP MCP server (e.g. http://127.0.0.1:7788) instead of stdio; appends /mcp?repo=<cwd> when no path is given")
+	repoPath := fs.String("repo", "", "repo path to attach as ?repo= with --http (default: current working directory)")
 	skill := fs.Bool("skill", true, "also install the Claude Code skill into ~/.claude/skills/gatt/")
 	addPath := fs.Bool("path", true, "copy the gatt binary to ~/.local/bin and add it to PATH if `gatt` isn't already resolvable")
 	if err := fs.Parse(args); err != nil {
@@ -894,6 +918,36 @@ func cmdInstall(ctx context.Context, args []string) error {
 			// two are independent conveniences.
 			fmt.Printf("warning: could not install skill: %v\n", err)
 		}
+	}
+
+	if *httpURL != "" {
+		targetURL, err := resolveInstallHTTPURL(*httpURL, *repoPath)
+		if err != nil {
+			return err
+		}
+		if resolvedScope == "agy" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("could not find home dir: %w", err)
+			}
+			configPath := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+			return updateMCPConfigEntry(configPath, *name, map[string]any{"serverUrl": targetURL}, targetURL)
+		}
+		if claudePath, err := exec.LookPath("claude"); err == nil {
+			claudeArgs := []string{"mcp", "add", "--transport", "http", "--scope", resolvedScope, *name, targetURL}
+			execName, execArgs := wrapForShellExec(claudePath, claudeArgs)
+			cmd := exec.CommandContext(ctx, execName, execArgs...)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("claude mcp add failed: %w", err)
+			}
+			fmt.Printf("registered HTTP MCP server %q (scope %s) → %s\n", *name, resolvedScope, targetURL)
+			return nil
+		}
+		if resolvedScope != "project" {
+			return fmt.Errorf("claude CLI not found; only --scope project or agy supported")
+		}
+		return updateMCPConfigEntry(".mcp.json", *name, map[string]any{"type": "http", "url": targetURL}, targetURL)
 	}
 
 	absGraph, err := filepath.Abs(*graphPath)
@@ -1015,7 +1069,39 @@ func binaryName() string {
 	return "gatt"
 }
 
+func resolveInstallHTTPURL(rawURL, repo string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("--http %q: must be a full URL (e.g. http://127.0.0.1:7788)", rawURL)
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/mcp"
+	}
+	q := u.Query()
+	if q.Get("repo") == "" {
+		r := strings.TrimSpace(repo)
+		if r == "" {
+			r, err = os.Getwd()
+			if err != nil {
+				return "", err
+			}
+		} else {
+			r, err = filepath.Abs(r)
+			if err != nil {
+				return "", err
+			}
+		}
+		q.Set("repo", r)
+		u.RawQuery = q.Encode()
+	}
+	return u.String(), nil
+}
+
 func updateMCPConfig(configPath, name, exe string, mcpArgs []string) error {
+	return updateMCPConfigEntry(configPath, name, map[string]any{"command": exe, "args": mcpArgs}, exe+" "+strings.Join(mcpArgs, " "))
+}
+
+func updateMCPConfigEntry(configPath, name string, entry map[string]any, summary string) error {
 	cfg := map[string]any{}
 	if data, err := os.ReadFile(configPath); err == nil {
 		// Antigravity/agy leaves this file zero-length as a placeholder before
@@ -1037,7 +1123,7 @@ func updateMCPConfig(configPath, name, exe string, mcpArgs []string) error {
 	if servers == nil {
 		servers = map[string]any{}
 	}
-	servers[name] = map[string]any{"command": exe, "args": mcpArgs}
+	servers[name] = entry
 	cfg["mcpServers"] = servers
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -1046,7 +1132,7 @@ func updateMCPConfig(configPath, name, exe string, mcpArgs []string) error {
 	if err := os.WriteFile(configPath, data, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s: server %q → %s %s\n", filepath.Base(configPath), name, exe, strings.Join(mcpArgs, " "))
+	fmt.Printf("wrote %s: server %q → %s\n", filepath.Base(configPath), name, summary)
 	return nil
 }
 

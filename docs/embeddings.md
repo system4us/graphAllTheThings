@@ -12,7 +12,23 @@ Queries refresh the *graph* (cheap) but never wait on an embedding server. Vecto
 
 The vectors themselves are stored locally (default) or in Qdrant (`--qdrant URL`). The model name is stored with them; a different model is refused rather than silently replacing the index (`gatt index --full` to switch).
 
-## Set it up (local ONNX)
+## Set it up (Docker: multi-repo MCP HTTP + ONNX + embedded Qdrant)
+
+One local container runs `gatt serve --mcp --data-dir /data --onnx /opt/gatt-embed --qdrant-bin /usr/local/bin/qdrant` with both the ONNX worker (`127.0.0.1:7801`) and Qdrant (`127.0.0.1:6333`, one collection per repo) strictly internal to the container, and only port `127.0.0.1:7788` published on the host:
+
+```sh
+GATT_MOUNT_ROOT=$HOME docker compose up -d --build
+gatt install --http http://127.0.0.1:7788   # registers http://127.0.0.1:7788/mcp?repo=<cwd>
+```
+
+Repos must be mounted at the **same absolute path** inside and outside the container (read-only `:ro` is fine — graphs, vectors, and annotations live in `/data`). Endpoints on `127.0.0.1:7788`:
+
+- `POST/GET/DELETE /mcp?repo=<abs-path>` (or `X-Gatt-Repo` header): Streamable HTTP MCP server; auto-extracts on first access and catches vectors up in the background.
+- **Automatic commit watching:** `gatt serve` polls `.git/HEAD` every 5 s (`--watch-interval` / `GATT_WATCH_INTERVAL`, `0` to disable) and triggers an incremental graph + vector reindex whenever a commit, pull, merge, rebase, or branch switch occurs.
+- `POST /refresh?repo=<abs-path>`: trigger background refresh + embedding (`gatt notify` sends the current working directory automatically; omit `repo` to refresh all registered repos).
+- `GET /status` / `GET /repos` / `GET /health`: inspect indexing progress and server health.
+
+## Set it up (local ONNX without Docker)
 
 ```sh
 (cd tools/gatt-embed && npm install)      # once; Node >= 18; a postinstall prune leaves ~120 MB

@@ -19,6 +19,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,9 @@ type Client struct {
 	URL   string
 	Model string
 	http  *http.Client
+
+	mu          sync.Mutex
+	actualModel string // model reported by an OpenAI-compatible server (/health or /v1/embeddings)
 }
 
 func New(url, model string) *Client {
@@ -44,6 +48,55 @@ func New(url, model string) *Client {
 		model = DefaultModel
 	}
 	return &Client{URL: url, Model: model, http: &http.Client{Timeout: 120 * time.Second}}
+}
+
+// ActualModel returns the model name reported by the embedding server (via
+// ProbeModel or a /v1/embeddings response), or "" if the server did not report one.
+func (c *Client) ActualModel() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.actualModel
+}
+
+func (c *Client) setActualModel(m string) {
+	if m == "" {
+		return
+	}
+	c.mu.Lock()
+	c.actualModel = m
+	c.mu.Unlock()
+}
+
+// ProbeModel asks an OpenAI-compatible worker (such as gatt-embed) which model
+// it is actually serving, via GET <base>/health. Returns "" for Ollama URLs or
+// servers that don't expose a model field on /health.
+func (c *Client) ProbeModel(ctx context.Context) string {
+	if !c.openAI() {
+		return ""
+	}
+	base := strings.TrimSuffix(strings.TrimRight(c.URL, "/"), "/v1")
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, base+"/health", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var out struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Model == "" {
+		return ""
+	}
+	c.setActualModel(out.Model)
+	return out.Model
 }
 
 // openAI reports whether the configured URL selects the OpenAI-compatible API.
@@ -126,13 +179,17 @@ func (c *Client) embedOpenAI(ctx context.Context, texts []string) ([][]float32, 
 		return nil, fmt.Errorf("embed: %s: %s", resp.Status, msg)
 	}
 	var out struct {
-		Data []struct {
+		Model string `json:"model"`
+		Data  []struct {
 			Index     int       `json:"index"`
 			Embedding []float32 `json:"embedding"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
+	}
+	if out.Model != "" {
+		c.setActualModel(out.Model)
 	}
 	if len(out.Data) != len(texts) {
 		return nil, fmt.Errorf("embed: got %d vectors for %d texts", len(out.Data), len(texts))

@@ -1,0 +1,14 @@
+.git
+.github
+.gatt
+dist
+gatt
+gatt.exe
+gatt-out
+npm
+scripts
+tools/gatt-embed/node_modules
+*.sql
+*.db
+*.db-wal
+*.db-shm

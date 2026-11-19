@@ -215,6 +215,11 @@ func (c *Client) Search(ctx context.Context, vector []float32, limit int, nodeTy
 		} `json:"result"`
 	}
 	if err := c.do(ctx, http.MethodPost, "/collections/"+c.Collection+"/points/search", body, &out); err != nil {
+		// Collection may not exist yet (e.g. while initial background indexing is
+		// still in progress): treat as 0 hits so callers fall back to lexical search.
+		if strings.Contains(err.Error(), "404") {
+			return nil, nil
+		}
 		return nil, err
 	}
 	var hits []store.Hit

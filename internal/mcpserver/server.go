@@ -1,4 +1,5 @@
-// Package mcpserver exposes the semantic graph to agents over MCP (stdio).
+// Package mcpserver exposes the semantic graph to agents over MCP (stdio or
+// Streamable HTTP).
 // Read tools answer schema questions from the pre-built graph so the agent
 // never has to introspect the live source at question time. Maintenance tools
 // let the agent curate business knowledge and, when the server was started
@@ -10,6 +11,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,6 +27,7 @@ import (
 	"graphallthethings/internal/enrich"
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/indexer"
+	"graphallthethings/internal/lock"
 	"graphallthethings/internal/store"
 )
 
@@ -34,12 +37,16 @@ import (
 // (only annotate_entity and reload_graph are then available).
 type Config struct {
 	GraphPath  string
-	SourceKind string // "sqlite" | "postgres" | "openapi"; "" disables drift/refresh
+	SourceKind string // "sqlite" | "postgres" | "openapi" | "codebase"; "" disables drift/refresh
 	Source     string // file path, DSN, or URL
 	CodeRoot   string // repo root for source-code linking (swaggo); "" disables it
 	OpenStore  func() store.VectorStore
 	Embedder   *embed.Client
 	EmbModel   string
+	// OnAutoRefresh, when non-nil, is called after autoRefreshCodebase writes a
+	// fresh graph instead of re-embedding inline (used by `gatt serve` so its
+	// background coalescer catches the vectors up without slowing tool calls).
+	OnAutoRefresh func()
 }
 
 type Server struct {
@@ -66,6 +73,32 @@ func New(cfg Config) (*Server, error) {
 
 func (s *Server) Run(ctx context.Context) error {
 	return s.server.Run(ctx, &mcp.StdioTransport{})
+}
+
+// MCPServer returns the underlying SDK server, e.g. for custom HTTP routing.
+func (s *Server) MCPServer() *mcp.Server {
+	return s.server
+}
+
+// HTTPHandler returns an http.Handler serving this MCP server over Streamable HTTP.
+func (s *Server) HTTPHandler(opts *mcp.StreamableHTTPOptions) http.Handler {
+	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return s.server
+	}, opts)
+}
+
+// Reload reloads the graph and vector store from disk into the live engine.
+func (s *Server) Reload() error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	ne, err := s.build()
+	if err != nil {
+		return err
+	}
+	if ne != nil {
+		s.setEngine(ne)
+	}
+	return nil
 }
 
 // build loads the graph (with annotations) and opens a fresh vector store, so
@@ -503,27 +536,43 @@ func (s *Server) autoRefreshCodebase(ctx context.Context) string {
 	if !conn.HasDrift(mts) {
 		return ""
 	}
-	raw, err := graph.LoadRaw(s.cfg.GraphPath)
+	release, err := lock.Acquire(s.cfg.GraphPath+".lock", 2*time.Minute)
 	if err != nil {
-		return ""
+		return fmt.Sprintf("graph auto-refresh skipped: %v\n", err)
 	}
-	ng, summary, err := conn.Update(ctx, raw)
+	ng, summary, added, err := func() (*graph.Graph, string, []string, error) {
+		defer release()
+		if _, mts, err := graph.LoadCodebaseState(s.cfg.GraphPath); err != nil || !conn.HasDrift(mts) {
+			return nil, "", nil, nil
+		}
+		raw, err := graph.LoadRaw(s.cfg.GraphPath)
+		if err != nil {
+			return nil, "", nil, nil
+		}
+		ng, summary, err := conn.Update(ctx, raw)
+		if err != nil || summary == "" {
+			return nil, "", nil, err
+		}
+		added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
+		if err := ng.Save(s.cfg.GraphPath); err != nil {
+			return nil, "", nil, err
+		}
+		return ng, summary, added, nil
+	}()
 	if err != nil {
 		return fmt.Sprintf("graph auto-refresh skipped: %v\n", err)
 	}
 	if summary == "" {
 		return ""
 	}
-	added := ng.JournalAddedNodeIDs() // read before Save: a SQLite save resets the journal
-	if err := ng.Save(s.cfg.GraphPath); err != nil {
-		return ""
-	}
-	if ne, err := s.build(); err == nil {
+	if ne, err := s.build(); err == nil && ne != nil {
 		s.setEngine(ne)
 	}
-	// Re-embed just the changed nodes, best-effort: an unreachable embedder
-	// never blocks the refresh (hybrid Find covers the gap until it's back).
-	if len(added) > 0 && s.cfg.OpenStore != nil && s.cfg.Embedder != nil {
+	if s.cfg.OnAutoRefresh != nil {
+		s.cfg.OnAutoRefresh()
+	} else if len(added) > 0 && s.cfg.OpenStore != nil && s.cfg.Embedder != nil {
+		// Re-embed just the changed nodes, best-effort: an unreachable embedder
+		// never blocks the refresh (hybrid Find covers the gap until it's back).
 		if n, err := indexer.ReindexNodes(ctx, ng, s.cfg.OpenStore(), s.cfg.Embedder, s.cfg.EmbModel, added); err == nil && n > 0 {
 			summary += fmt.Sprintf("; re-embedded %d node(s)", n)
 		}

@@ -238,3 +238,38 @@ func TestReindexQdrantIsIncrementalByHash(t *testing.T) {
 		t.Errorf("ReindexNodes left %d points, want 4 (it wiped the rest)", len(got))
 	}
 }
+
+func TestReindexRecordsServerReportedModel(t *testing.T) {
+	const actual = "Xenova/paraphrase-multilingual-MiniLM-L12-v2"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		data := make([]map[string]any, len(req.Input))
+		for i := range req.Input {
+			data[i] = map[string]any{"index": i, "embedding": []float32{0.5, 0.5}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"model":  actual,
+			"data":   data,
+		})
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "vectors.json")
+	g := testGraph("a", "b")
+	emb := embed.New(srv.URL+"/v1", embed.DefaultModel)
+
+	res, err := Reindex(context.Background(), g, local.New(path), emb, embed.DefaultModel, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Model != actual {
+		t.Errorf("res.Model = %q, want %q", res.Model, actual)
+	}
+	if stored := local.New(path).StoredModel(); stored != actual {
+		t.Errorf("StoredModel = %q, want %q", stored, actual)
+	}
+}
