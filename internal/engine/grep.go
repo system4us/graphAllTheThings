@@ -127,6 +127,7 @@ func matchesAnyGlob(rel string, patterns []string) bool {
 // GrepResult is the structured result of GrepWithOptions.
 type GrepResult struct {
 	Text         string
+	Hits         []GrepHit
 	Total        int
 	Shown        int
 	FilesScanned int
@@ -177,6 +178,7 @@ func (e *Engine) GrepWithOptions(pattern string, opts GrepOptions) (GrepResult, 
 	}
 	return GrepResult{
 		Text:         b.String(),
+		Hits:         hits,
 		Total:        total,
 		Shown:        len(hits),
 		FilesScanned: filesScanned,

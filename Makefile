@@ -7,12 +7,19 @@ GOARCH  ?= $(shell go env GOARCH)
 EXT      = $(if $(filter windows,$(GOOS)),.exe,)
 DIST     = dist
 
-.PHONY: build dist checksums clean
+.PHONY: ui build dist checksums clean
 
-build:
+ui:
+	cd web && npm install && npm run build
+	rm -rf internal/webui/dist
+	mkdir -p internal/webui/dist
+	cp -R web/dist/. internal/webui/dist/
+	printf 'Built by make ui\n' > internal/webui/dist/README
+
+build: ui
 	go build -ldflags '$(LDFLAGS)' -o gatt$(EXT) ./cmd/gatt
 
-dist:
+dist: ui
 	CGO_ENABLED=1 go build -trimpath -ldflags '$(LDFLAGS)' \
 		-o $(DIST)/gatt-$(GOOS)-$(GOARCH)$(EXT) ./cmd/gatt
 
@@ -20,4 +27,5 @@ checksums:
 	cd $(DIST) && sha256sum gatt-* > checksums.txt
 
 clean:
-	rm -rf $(DIST) gatt gatt.exe
+	rm -rf $(DIST) gatt gatt.exe web/dist internal/webui/dist/*
+	printf 'Placeholder so go:embed all:dist succeeds before make ui.\n' > internal/webui/dist/README

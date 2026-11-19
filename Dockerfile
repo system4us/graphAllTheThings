@@ -1,5 +1,14 @@
 # syntax=docker/dockerfile:1
 
+# Stage 0: build the web UI (React + Vite + Cytoscape) to embed into the Go binary.
+FROM node:22-bookworm-slim AS web-builder
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 # Stage 1: build the CGO-enabled gatt binary (go-tree-sitter requires CGO).
 FROM golang:1.25-bookworm AS go-builder
 
@@ -11,6 +20,7 @@ RUN go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
+COPY --from=web-builder /web/dist ./internal/webui/dist
 
 RUN CGO_ENABLED=1 go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \

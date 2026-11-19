@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -101,7 +102,8 @@ type Graph struct {
 	Nodes       map[string]*Node `json:"nodes"`
 	Edges       []Edge           `json:"edges"`
 
-	adj map[string][]int // node id -> edge indexes (both directions), built lazily
+	adjMu sync.RWMutex
+	adj   map[string][]int // node id -> edge indexes (both directions), built lazily
 
 	journal *journal // non-nil while tracking mutations for delta saves
 }
@@ -267,26 +269,36 @@ func (g *Graph) RemoveNodesWhere(pred func(*Node) bool) int {
 	return len(removed)
 }
 
-func (g *Graph) buildAdj() {
-	if g.adj != nil {
-		return
+func (g *Graph) buildAdj() map[string][]int {
+	g.adjMu.RLock()
+	adj := g.adj
+	g.adjMu.RUnlock()
+	if adj != nil {
+		return adj
 	}
-	g.adj = map[string][]int{}
+	g.adjMu.Lock()
+	defer g.adjMu.Unlock()
+	if g.adj != nil {
+		return g.adj
+	}
+	adj = make(map[string][]int, len(g.Nodes))
 	for i, e := range g.Edges {
-		g.adj[e.From] = append(g.adj[e.From], i)
+		adj[e.From] = append(adj[e.From], i)
 		// A self-loop (self-referential FK, or a schema whose property $refs
 		// itself) must be recorded once, not twice, or EdgesOf returns it twice.
 		if e.To != e.From {
-			g.adj[e.To] = append(g.adj[e.To], i)
+			adj[e.To] = append(adj[e.To], i)
 		}
 	}
+	g.adj = adj
+	return adj
 }
 
 // EdgesOf returns all edges touching the node, in both directions.
 func (g *Graph) EdgesOf(id string) []Edge {
-	g.buildAdj()
+	adj := g.buildAdj()
 	var out []Edge
-	for _, i := range g.adj[id] {
+	for _, i := range adj[id] {
 		out = append(out, g.Edges[i])
 	}
 	return out

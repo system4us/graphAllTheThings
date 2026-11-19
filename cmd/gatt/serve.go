@@ -24,10 +24,12 @@ import (
 
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/graph"
+	"graphallthethings/internal/httpapi"
 	"graphallthethings/internal/indexer"
 	"graphallthethings/internal/mcpserver"
 	"graphallthethings/internal/store"
 	"graphallthethings/internal/store/local"
+	"graphallthethings/internal/webui"
 )
 
 const defaultServeAddr = "127.0.0.1:7788"
@@ -127,28 +129,79 @@ func loopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// guard rejects anything that is not a plain local, non-browser request:
-// a Host that is not loopback (DNS rebinding) or any Origin header (a web page
-// POSTing to localhost). The hook client (curl, `gatt notify`) sends neither.
+// sameOriginAllowed reports whether an Origin header matches the request's Host
+// and that host is permitted (allowing the embedded web UI to POST to its own
+// server while blocking cross-origin pages such as https://evil.example.com).
+func sameOriginAllowed(origin, reqHost, extraHost string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	if !strings.EqualFold(u.Host, reqHost) {
+		return false
+	}
+	return allowedHost(u.Hostname(), extraHost)
+}
+
+func allowedHost(host, extraHosts string) bool {
+	if loopbackHost(host) {
+		return true
+	}
+	clean := strings.Trim(host, "[]")
+	for _, raw := range strings.Split(extraHosts, ",") {
+		eh := strings.Trim(strings.TrimSpace(raw), "[]")
+		if eh != "" && eh != "0.0.0.0" && eh != "::" && strings.EqualFold(clean, eh) {
+			return true
+		}
+	}
+	return false
+}
+
+// guard rejects anything that is not a plain local request: a Host that is not
+// loopback (DNS rebinding) or a cross-origin browser request.
 func guard(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, _, err := net.SplitHostPort(r.Host)
-		if err != nil {
-			host = r.Host
-		}
-		if !loopbackHost(host) || r.Header.Get("Origin") != "" {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return guardWithHost(next, "")
+}
+
+type guardedHandler struct {
+	inner     http.Handler
+	extraHost string
+}
+
+func (g *guardedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
+	}
+	if !allowedHost(host, g.extraHost) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && !sameOriginAllowed(origin, r.Host, g.extraHost) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	g.inner.ServeHTTP(w, r)
+}
+
+func unwrapGuard(h http.Handler) http.Handler {
+	if g, ok := h.(*guardedHandler); ok {
+		return g.inner
+	}
+	return h
+}
+
+// guardWithHost is like guard, additionally permitting requests whose Host
+// matches extraHost (e.g. an explicitly bound Tailscale IP with --bind-any).
+func guardWithHost(next http.Handler, extraHost string) http.Handler {
+	return &guardedHandler{inner: next, extraHost: extraHost}
 }
 
 func newServeHandler(c *coalescer) http.Handler {
-	return newSingleRepoHandler(c, nil)
+	return newSingleRepoHandler(c, nil, nil)
 }
 
-func newSingleRepoHandler(c *coalescer, mcpHandler http.Handler) http.Handler {
+func newSingleRepoHandler(c *coalescer, mcpHandler http.Handler, apiProvider httpapi.Provider) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -175,6 +228,10 @@ func newSingleRepoHandler(c *coalescer, mcpHandler http.Handler) http.Handler {
 	if mcpHandler != nil {
 		mux.Handle("/mcp", mcpHandler)
 	}
+	if apiProvider != nil {
+		mux.Handle("/api/", httpapi.New(apiProvider))
+	}
+	mux.Handle("/", webui.Handler())
 	return guard(mux)
 }
 
@@ -274,6 +331,8 @@ func newMultiRepoHandler(pool *repoPool, onnxInfo *onnxStatus, scanDirs ...strin
 		}
 		entry.mcpHandler.ServeHTTP(w, r)
 	})
+	mux.Handle("/api/", httpapi.New(&multiRepoProvider{pool: pool}))
+	mux.Handle("/", webui.Handler())
 	return guard(mux)
 }
 
@@ -430,11 +489,16 @@ func cmdServe(ctx context.Context, args []string) error {
 			return st
 		})
 		sc.progress = c.SetProgress
-		handler = newSingleRepoHandler(c, mcpHandler)
+		apiProv := &singleRepoProvider{
+			graphPath: *graphPath,
+			coalescer: c,
+			mcpSrv:    mcpSrv,
+		}
+		handler = newSingleRepoHandler(c, mcpHandler, apiProv)
 		if *enableMCP {
-			fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (/mcp, POST /refresh, GET /status, GET /health)\n", *addr)
+			fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (Web UI /, /api/*, /mcp, POST /refresh, GET /status, GET /health)\n", *addr)
 		} else {
-			fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (POST /refresh, GET /status, GET /health)\n", *addr)
+			fmt.Fprintf(os.Stderr, "gatt serve: listening on http://%s (Web UI /, /api/*, POST /refresh, GET /status, GET /health)\n", *addr)
 		}
 		c.Trigger() // bring everything current once at startup
 		go watchGitCommits(passCtx, *watchInterval, func() []string {
@@ -447,6 +511,16 @@ func cmdServe(ctx context.Context, args []string) error {
 		})
 	}
 
+	var extraHosts []string
+	if *bindAny && !loopbackHost(host) && host != "0.0.0.0" && host != "::" && host != "" {
+		extraHosts = append(extraHosts, host)
+	}
+	if envHosts := strings.TrimSpace(os.Getenv("GATT_ALLOWED_HOSTS")); envHosts != "" {
+		extraHosts = append(extraHosts, envHosts)
+	}
+	if len(extraHosts) > 0 {
+		handler = guardWithHost(unwrapGuard(handler), strings.Join(extraHosts, ","))
+	}
 	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
 	sig := make(chan os.Signal, 1)

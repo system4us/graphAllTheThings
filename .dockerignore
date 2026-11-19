@@ -8,6 +8,10 @@ gatt-out
 npm
 scripts
 tools/gatt-embed/node_modules
+web/node_modules
+web/dist
+internal/webui/dist/*
+!internal/webui/dist/README
 *.sql
 *.db
 *.db-wal

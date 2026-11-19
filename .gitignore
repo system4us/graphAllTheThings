@@ -10,10 +10,16 @@ swagger.json
 gatt.exe
 
 # release artifacts
-dist/
+/dist/
 
 # local scratch / private dumps
 test_ts.go
 gen_graph.py
 whatsappCRM_schema.sql
 npm-out/
+
+# web UI build outputs (embedded at build time via `make ui`)
+web/node_modules/
+web/dist/
+internal/webui/dist/*
+!internal/webui/dist/README

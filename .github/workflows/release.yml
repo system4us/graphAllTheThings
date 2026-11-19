@@ -32,6 +32,20 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build Web UI
+        shell: bash
+        run: |
+          cd web && npm ci && npm run build
+          cd ..
+          rm -rf internal/webui/dist
+          mkdir -p internal/webui/dist
+          cp -R web/dist/. internal/webui/dist/
+          printf 'Built by CI\n' > internal/webui/dist/README
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
