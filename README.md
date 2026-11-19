@@ -14,58 +14,64 @@ Codebase parsing covers nine languages with uneven depth; see [supported languag
 
 ## Install
 
-Via npm (Node 18+):
+Via npm (Node 18+, prebuilt binaries for Linux, macOS, and Windows):
 
 ```bash
 npm install -g gatt-graph
 ```
 
-Or build from source (requires Go 1.25+):
+Or build from source (requires Go 1.25+ and a C compiler for tree-sitter):
 
 ```bash
 go build -o ~/.local/bin/gatt ./cmd/gatt
 ```
 
-## Quickstart
+## Recommended: central Docker server (MCP HTTP + ONNX + Qdrant)
+
+Run one local container (`system4us/gatt:latest`) that serves **all your repositories** over Streamable HTTP MCP, with a shared local **ONNX** embedder (`paraphrase-multilingual-MiniLM-L12-v2`) and an embedded **Qdrant** vector store — both running strictly on loopback inside the container (only `127.0.0.1:7788` is published).
+
+```bash
+# 1. Start the container mounting your code root(s) read-only.
+#    Every git repo under explicit --mount folders is discovered and indexed
+#    sequentially in the background, and reindexed incrementally on every commit.
+gatt docker up --mount /path/to/your/repos
+
+# 2a. Register ONCE globally across all repos (Claude Code / Antigravity):
+gatt install --http http://127.0.0.1:7788 --scope user
+
+# 2b. Or register per-project inside a specific repo's .mcp.json:
+gatt install --http http://127.0.0.1:7788
+```
+
+- **Multiple roots:** pass `--mount` multiple times (`gatt docker up --mount /mnt/code --mount /mnt/more-code`).
+- **Windows (Docker Desktop):** drive paths like `C:\Users\you\code` are mapped automatically to `/host/c/Users/you/code` across `gatt docker up`, `gatt install --http`, and `gatt notify`.
+- **Manage the container:** `gatt docker status`, `gatt docker logs -f`, `gatt docker pull`, `gatt docker down` (named volumes `gatt-data` and `gatt-cache` are preserved).
+- **Local build:** `GATT_MOUNT_ROOT=$HOME docker compose up -d --build`.
+
+## Standalone CLI / stdio MCP (without Docker)
 
 ```bash
 gatt extract codebase .                   # or: extract sqlite|postgres|openapi ...
 gatt index                                # embed nodes (optional; keyword search works without)
-gatt install                              # register the MCP server in Claude Code
+gatt install                              # register stdio MCP server in Claude Code / Antigravity
 ```
 
-Then ask from the terminal (the MCP tools expose the same operations):
+Query directly from the terminal (the MCP tools expose the same operations):
 
 ```bash
-gatt code-query "how does incremental refresh work"   # functions, callers, docs in one pack
-gatt impact saveSQLite --depth 3                      # what breaks if this signature changes
-gatt grep "TODO(#42)"                                 # exhaustive scan: zero hits = proof of absence
-gatt query "how many messages did each client send"   # tables, columns, joins for a data question
+gatt code-query "how does incremental refresh work"       # functions, callers, docs in one pack
+gatt impact saveSQLite --depth 3                          # what breaks if this signature changes
+gatt blast shared/schema.json --depth 2                   # callers, importers, co-change companions
+gatt grep "TODO(#42)" --limit 0 --exclude '*_test.go'     # exhaustive scan: zero hits = proof of absence
+gatt routes                                               # HTTP routes → handlers → ORM models → clients
+gatt query "how many messages did each client send"       # tables, columns, joins for a data question
 ```
 
 Codebase graphs refresh themselves: every query re-parses only the files that changed.
 
-## Embeddings, background refresh, and Docker MCP HTTP
+## Local embeddings without Docker
 
-Semantic search needs embeddings from **Ollama** (default, `bge-m3`), a **local ONNX worker** running on your CPU, or any **OpenAI-compatible** server.
-
-### Recommended: central Docker container (MCP over HTTP + ONNX + Qdrant)
-
-Keep the `gatt` CLI installed locally (via npm or Go), and run `serve --onnx` + embedded Qdrant + MCP Streamable HTTP in a single local container bound strictly to `127.0.0.1:7788`:
-
-```bash
-# Pull and start system4us/gatt:latest (mounts $HOME read-only by default)
-gatt docker up
-
-# Register the HTTP MCP server for the current repo
-gatt install --http http://127.0.0.1:7788
-```
-
-(Or build locally from this repo with `GATT_MOUNT_ROOT=$HOME docker compose up -d --build`.)
-
-Each mounted repository is selected via `?repo=<abs-path>` (or `X-Gatt-Repo`), extracted on first access, and kept current with a single shared ONNX worker and an embedded Qdrant vector store — both running strictly on loopback inside the container (never exposed). Graphs and Qdrant storage live in the container's `/data` volume.
-
-### Local (without Docker)
+Semantic search works with **Ollama** (default, `ollama pull bge-m3`), the **local ONNX worker**, or any **OpenAI-compatible** server (`--embed-url http://host:port/v1`):
 
 ```bash
 (cd tools/gatt-embed && npm install)      # once; Node >= 18
@@ -73,7 +79,7 @@ gatt serve --onnx tools/gatt-embed        # refreshes graph + vectors in the bac
 export GATT_EMBED_URL=http://127.0.0.1:7801/v1
 ```
 
-and have your agent's hook call `gatt notify` (silent; exits 0 even if nothing is listening):
+Optional agent hook to trigger immediate background refresh on edits (silent; exits 0 even if nothing is listening):
 
 ```json
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"gatt notify"}]}]}}
@@ -87,12 +93,13 @@ Only nodes whose text changed are re-embedded: on a 21,830-node graph the first 
 |---|---|
 | [Command reference](docs/cli.md) | every query command with examples |
 | [MCP tools](docs/mcp-tools.md) | what the agent can call |
-| [Embeddings and background refresh](docs/embeddings.md) | backends, `serve`, hook setup, performance, env vars |
+| [Embeddings and background refresh](docs/embeddings.md) | Docker, ONNX, Qdrant, Ollama, `serve`, hooks, env vars |
 | [The call graph](docs/call-graph.md) | what a `CALLS` edge means, what is left out, measured accuracy |
 | [Codebase graphs](docs/codebase-graphs.md) | impact/blast/routes/models/doc-drift, the `.gatt/` overlay |
 | [Annotations and freshness](docs/annotations-and-freshness.md) | curated business knowledge, drift checks |
 | [Graph model](docs/graph-model.md) | node and edge types per source |
 | [Architecture and layout](docs/architecture.md) | how it fits together, adding a connector |
+| [Docker Hub guide](docs/dockerhub.md) | container env vars, volumes, endpoints |
 | [Roadmap](docs/roadmap.md) | |
 
 ## License

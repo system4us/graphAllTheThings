@@ -110,3 +110,21 @@ jobs:
             VERSION=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Sync Docker Hub README
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -f docs/dockerhub.md ]; then
+            LOGIN_JSON=$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" '{username:$u,password:$p}')
+            HUB_JWT=$(curl -fsSL -X POST "https://hub.docker.com/v2/users/login/" -H "Content-Type: application/json" -d "$LOGIN_JSON" | jq -r '.token // empty' || true)
+            if [ -n "$HUB_JWT" ]; then
+              jq -Rs '{full_description: .}' docs/dockerhub.md | \
+                curl -fsSL -X PATCH "https://hub.docker.com/v2/repositories/system4us/gatt/" \
+                  -H "Authorization: Bearer ${HUB_JWT}" \
+                  -H "Content-Type: application/json" \
+                  -d @- >/dev/null || echo "warning: could not update Docker Hub README"
+            else
+              echo "warning: Docker Hub API login failed; skipped README sync"
+            fi
+          fi
