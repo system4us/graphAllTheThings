@@ -66,8 +66,9 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s.e = e
-	s.server = mcp.NewServer(&mcp.Implementation{Name: "graphallthethings", Version: "0.1.0"}, nil)
+	s.server = mcp.NewServer(&mcp.Implementation{Name: "graphallthethings", Version: "0.3.2"}, nil)
 	s.register()
+	s.registerPromptsAndResources()
 	return s, nil
 }
 

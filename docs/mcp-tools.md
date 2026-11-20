@@ -49,3 +49,21 @@ JOIN orders ON users.id = orders.user_id
 JOIN order_items ON orders.id = order_items.order_id
 JOIN products ON order_items.product_id = products.id
 ```
+
+## MCP Prompts
+
+Guided agentic workflows exposed natively via MCP `prompts/list` & `prompts/get` (in both stdio/per-repo and global `/mcp` servers):
+
+| Prompt | Arguments | Workflow |
+|--------|-----------|----------|
+| `plan-change` | `task` (required), `repo` (global) | `code_context` → `read_symbols` → `impact`/`blast` + `file_history` → concrete `file:line` plan |
+| `debug-flow` | `symptom` (required), `from`, `to`, `repo` (global) | `code_context` → `trace_path` → `read_symbols` → `file_history` |
+| `review-diff` | `ref` (default `HEAD`), `repo` (global) | `preflight_check` → inspect risk alerts / callers / tests / docs |
+| `onboard-repo` | `focus`, `repo` (global) | `graph_overview` → `tree` → `hotspots` → `routes` + `models` → `gatt://annotations` |
+
+## MCP Resources
+
+Live read-only views exposed via MCP `resources/list` & `resources/read`:
+
+- **Single-repo MCP**: `gatt://overview`, `gatt://hotspots`, `gatt://annotations`, `gatt://routes`, `gatt://models`
+- **Global `/mcp` server**: `gatt://repos` plus URI templates `gatt://repo/{repo}/overview`, `gatt://repo/{repo}/hotspots`, `gatt://repo/{repo}/annotations`, `gatt://repo/{repo}/routes`, `gatt://repo/{repo}/models`

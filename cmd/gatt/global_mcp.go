@@ -143,7 +143,8 @@ type globalDescribeIn struct {
 // (`gatt install --http http://127.0.0.1:7788 --scope user`). Every tool takes
 // a `repo` parameter (absolute path or unique basename) and routes to repoPool.
 func newGlobalMCPHandler(pool *repoPool) http.Handler {
-	srv := mcp.NewServer(&mcp.Implementation{Name: "graphallthethings", Version: "0.2.0"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "graphallthethings", Version: "0.3.2"}, nil)
+	mcpserver.RegisterPrompts(srv, true)
 
 	resolveEngine := func(ctx context.Context, repo string, autoRefresh bool) (*engine.Engine, string, error) {
 		entry, err := pool.Resolve(ctx, repo)
@@ -487,6 +488,88 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 			fmt.Fprintf(&b, "- %s: %d\n", k, v)
 		}
 		return mcpText(note + b.String()), nil, nil
+	})
+
+	srv.AddResource(&mcp.Resource{
+		URI:         "gatt://repos",
+		Name:        "repos",
+		Title:       "Registered Repositories",
+		Description: "All repositories indexed by the central gatt server (paths, git HEADs, indexing status).",
+		MIMEType:    "text/plain",
+	}, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		repos := pool.List()
+		var b strings.Builder
+		if len(repos) == 0 {
+			b.WriteString("no repositories loaded yet\n")
+		} else {
+			fmt.Fprintf(&b, "%d repository(ies) registered:\n", len(repos))
+			for _, r := range repos {
+				state := "ready"
+				if r.Running {
+					state = "indexing"
+				}
+				head := ""
+				if r.Head != "" {
+					head = " @" + r.Head
+				}
+				fmt.Fprintf(&b, "- %s%s [%s]\n", r.Root, head, state)
+			}
+		}
+		return &mcp.ReadResourceResult{
+			Contents: []*mcp.ResourceContents{
+				{URI: req.Params.URI, MIMEType: "text/plain", Text: b.String()},
+			},
+		}, nil
+	})
+
+	addGlobalRepoTemplate := func(name, title, view, desc string, render func(ctx context.Context, e *engine.Engine) (string, error)) {
+		srv.AddResourceTemplate(&mcp.ResourceTemplate{
+			URITemplate: "gatt://repo/{repo}/" + view,
+			Name:        name,
+			Title:       title,
+			Description: desc,
+			MIMEType:    "text/plain",
+		}, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			prefix := "gatt://repo/"
+			suffix := "/" + view
+			uri := req.Params.URI
+			if !strings.HasPrefix(uri, prefix) || !strings.HasSuffix(uri, suffix) {
+				return nil, mcp.ResourceNotFoundError(uri)
+			}
+			repoName := strings.TrimSuffix(strings.TrimPrefix(uri, prefix), suffix)
+			e, note, err := resolveEngine(ctx, repoName, view != "overview")
+			if err != nil {
+				return nil, err
+			}
+			body, err := render(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			return &mcp.ReadResourceResult{
+				Contents: []*mcp.ResourceContents{
+					{URI: uri, MIMEType: "text/plain", Text: note + body},
+				},
+			}, nil
+		})
+	}
+	addGlobalRepoTemplate("repo-overview", "Repository Overview", "overview", "Graph overview for a specific repository.", func(ctx context.Context, e *engine.Engine) (string, error) {
+		return e.RenderOverview(), nil
+	})
+	addGlobalRepoTemplate("repo-hotspots", "Repository Hotspots", "hotspots", "Top 20 hotspots for a specific repository.", func(ctx context.Context, e *engine.Engine) (string, error) {
+		entries, err := e.Hotspots(ctx, 20)
+		if err != nil {
+			return "", err
+		}
+		return engine.RenderHotspots(entries), nil
+	})
+	addGlobalRepoTemplate("repo-annotations", "Repository Annotations", "annotations", "Persisted agent annotations (invariants, gotchas, notes) for a specific repository.", func(ctx context.Context, e *engine.Engine) (string, error) {
+		return mcpserver.RenderAnnotations(e), nil
+	})
+	addGlobalRepoTemplate("repo-routes", "Repository Routes", "routes", "Detected HTTP routes for a specific repository.", func(ctx context.Context, e *engine.Engine) (string, error) {
+		return e.Routes("")
+	})
+	addGlobalRepoTemplate("repo-models", "Repository Models", "models", "Detected ORM and sqlc models for a specific repository.", func(ctx context.Context, e *engine.Engine) (string, error) {
+		return e.Models("")
 	})
 
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
