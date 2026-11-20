@@ -138,6 +138,10 @@ func (e *Engine) Hotspots(ctx context.Context, limit int) ([]HotspotEntry, error
 			continue
 		}
 		p := filepath.ToSlash(f.Name)
+		switch strings.ToLower(filepath.Ext(p)) {
+		case ".md", ".mdx", ".rst", ".txt":
+			continue
+		}
 		c := churn[p]
 		if c == 0 {
 			continue

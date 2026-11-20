@@ -46,7 +46,13 @@ func IsTestFilePath(p string) bool {
 		strings.HasSuffix(base, "_test.rs") {
 		return true
 	}
-	return strings.Contains(p, "/__tests__/") || strings.HasPrefix(p, "tests/") || strings.Contains(p, "/tests/")
+	if strings.Contains(p, "/__tests__/") || strings.HasPrefix(p, "tests/") || strings.Contains(p, "/tests/") {
+		switch filepath.Ext(base) {
+		case ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".java", ".kt", ".cs", ".sh":
+			return true
+		}
+	}
+	return false
 }
 
 // AffectedTests finds the minimal set of test files, test functions, and ready-to-run
@@ -200,15 +206,16 @@ func (e *Engine) AffectedTests(ctx context.Context, target string, depth int) (A
 					nextID = ed.To
 				}
 			case graph.EdgeCoChanged:
-				// Only consider direct co-change test files at depth 0; transitive
-				// co-change walks explode across unrelated frontend/backend modules.
+				// Only record direct co-change test files at depth 0 without marking
+				// their parent directory (e.g. tests/) as impacted, so a single co-change
+				// with tests/check.sh doesn't drag in every unrelated file under tests/.
 				if cur.dist == 0 {
 					cand := ed.To
 					if cand == cur.id {
 						cand = ed.From
 					}
 					if cn := e.G.Nodes[cand]; cn != nil && cn.Type == graph.NodeFile && IsTestFilePath(cn.Name) {
-						nextID = cand
+						recordIfTest(cn)
 					}
 				}
 			}
