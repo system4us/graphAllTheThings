@@ -9,6 +9,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"graphallthethings/internal/engine"
+	"graphallthethings/internal/mcpserver"
 )
 
 func mcpText(t string) *mcp.CallToolResult {
@@ -35,15 +36,60 @@ type globalTestsIn struct {
 }
 
 type globalImpactIn struct {
-	Repo     string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
-	Function string `json:"function" jsonschema:"function name or full node id"`
-	Depth    int    `json:"depth,omitempty" jsonschema:"caller levels to walk, default 3"`
+	Repo      string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Function  string `json:"function" jsonschema:"function name or full node id"`
+	Depth     int    `json:"depth,omitempty" jsonschema:"caller levels to walk, default 3"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
 }
 
 type globalBlastIn struct {
-	Repo   string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
-	Target string `json:"target" jsonschema:"file path, function name, or full node id"`
-	Depth  int    `json:"depth,omitempty" jsonschema:"dependency levels to walk, default 3"`
+	Repo      string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Target    string `json:"target" jsonschema:"file path, function name, or full node id"`
+	Depth     int    `json:"depth,omitempty" jsonschema:"dependency levels to walk, default 3"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
+}
+
+type globalTracePathIn struct {
+	Repo     string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	From     string `json:"from" jsonschema:"source node: route (e.g. 'POST /checkout'), function name, file path, model name, or full node id"`
+	To       string `json:"to" jsonschema:"target node: function name, model/table name, file path, route, or full node id"`
+	MaxDepth int    `json:"max_depth,omitempty" jsonschema:"max hops to walk, default 8 (max 15)"`
+}
+
+type globalReadSymbolsIn struct {
+	Repo      string   `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	IDs       []string `json:"ids" jsonschema:"list of function/type/file names or full node ids to read in one batch"`
+	MaxTokens int      `json:"max_tokens,omitempty" jsonschema:"approximate token budget, default 4000"`
+}
+
+type globalPreflightIn struct {
+	Repo      string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Ref       string `json:"ref,omitempty" jsonschema:"git ref to check against, default HEAD"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
+}
+
+type globalHotspotsIn struct {
+	Repo  string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max hotspot files to return, default 20"`
+}
+
+type globalFileHistoryIn struct {
+	Repo  string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	File  string `json:"file" jsonschema:"repository-relative file path"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max recent commits to return, default 8"`
+}
+
+type globalAnnotateIn struct {
+	Repo           string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Node           string `json:"node" jsonschema:"function/type/file/table name or node id to annotate"`
+	EntityNote     string `json:"entity_note,omitempty" jsonschema:"free-text architectural or business note"`
+	DefaultFilter  string `json:"default_filter,omitempty" jsonschema:"canonical WHERE clause for DB entities"`
+	Invariant      string `json:"invariant,omitempty" jsonschema:"code invariant surfaced in impact/blast/read_symbols/preflight_check"`
+	Gotcha         string `json:"gotcha,omitempty" jsonschema:"non-obvious pitfall to remember before editing"`
+	RouteMethod    string `json:"route_method,omitempty" jsonschema:"HTTP method for manual route tagging"`
+	RoutePath      string `json:"route_path,omitempty" jsonschema:"route path for manual route tagging"`
+	RouteFramework string `json:"route_framework,omitempty" jsonschema:"web framework name for manual route tagging"`
+	Clear          bool   `json:"clear,omitempty" jsonschema:"remove all annotations from the node"`
 }
 
 type globalGrepIn struct {
@@ -63,14 +109,16 @@ type globalTreeIn struct {
 }
 
 type globalFileFilterIn struct {
-	Repo string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
-	File string `json:"file,omitempty" jsonschema:"only entries in files whose path contains this substring"`
+	Repo      string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	File      string `json:"file,omitempty" jsonschema:"only entries in files whose path contains this substring"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
 }
 
 type globalCodeDiffIn struct {
-	Repo  string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
-	Ref   string `json:"ref,omitempty" jsonschema:"git ref to diff against, default HEAD"`
-	Limit int    `json:"limit,omitempty" jsonschema:"max changes to display, default 30"`
+	Repo      string `json:"repo,omitempty" jsonschema:"absolute path of the target repository (or unique repo name)"`
+	Ref       string `json:"ref,omitempty" jsonschema:"git ref to diff against, default HEAD"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"max changes to display, default 30"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
 }
 
 type globalDocDriftIn struct {
@@ -175,7 +223,104 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 		if err != nil {
 			return nil, nil, err
 		}
+		return mcpText(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "trace_path",
+		Description: "Shortest execution/data-flow path between any two codebase nodes (route, function, event emitter/listener, sqlc query, ORM model, or file). Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalTracePathIn) (*mcp.CallToolResult, any, error) {
+		e, note, err := resolveEngine(ctx, in.Repo, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.TracePath(in.From, in.To, in.MaxDepth)
+		if err != nil {
+			return nil, nil, err
+		}
 		return mcpText(note + out), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "read_symbols",
+		Description: "Batch-read the full source body (with line numbers) and annotations (entity_note, invariant, gotcha) of 1..N symbols in one call. Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalReadSymbolsIn) (*mcp.CallToolResult, any, error) {
+		e, note, err := resolveEngine(ctx, in.Repo, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.ReadSymbols(in.IDs, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mcpText(note + out), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "preflight_check",
+		Description: "Composite post-edit verification gate vs git diff (default HEAD): risk alerts (generated files, hotspots, gotchas/invariants), structural diff, affected tests + commands, and affected docs. Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalPreflightIn) (*mcp.CallToolResult, any, error) {
+		e, note, err := resolveEngine(ctx, in.Repo, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.PreflightCheck(ctx, in.Ref, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mcpText(note + out), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "hotspots",
+		Description: "Rank repository files by recent git churn × graph connectivity, surfacing high-risk architectural hubs. Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalHotspotsIn) (*mcp.CallToolResult, any, error) {
+		e, note, err := resolveEngine(ctx, in.Repo, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		limit := in.Limit
+		if limit <= 0 {
+			limit = 20
+		}
+		entries, err := e.Hotspots(ctx, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mcpText(note + engine.RenderHotspots(entries)), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "file_history",
+		Description: "Recent git commit history for a file, including extracted issue references (#42, PROJ-123). Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalFileHistoryIn) (*mcp.CallToolResult, any, error) {
+		e, note, err := resolveEngine(ctx, in.Repo, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		entries := e.FileHistory(ctx, in.File, in.Limit)
+		return mcpText(note + engine.RenderFileHistory(in.File, entries)), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "annotate_entity",
+		Description: "Persist architectural/business notes (entity_note, invariant, gotcha, default_filter, route_*) onto a node so future sessions carry it. Pass `repo`.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalAnnotateIn) (*mcp.CallToolResult, any, error) {
+		entry, err := pool.Resolve(ctx, in.Repo)
+		if err != nil {
+			return nil, nil, err
+		}
+		return entry.mcp.Annotate(mcpserver.AnnotateIn{
+			Node:           in.Node,
+			EntityNote:     in.EntityNote,
+			DefaultFilter:  in.DefaultFilter,
+			Invariant:      in.Invariant,
+			Gotcha:         in.Gotcha,
+			RouteMethod:    in.RouteMethod,
+			RoutePath:      in.RoutePath,
+			RouteFramework: in.RouteFramework,
+			Clear:          in.Clear,
+		})
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -190,7 +335,7 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 		if err != nil {
 			return nil, nil, err
 		}
-		return mcpText(note + out), nil, nil
+		return mcpText(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -245,7 +390,7 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 		if err != nil {
 			return nil, nil, err
 		}
-		return mcpText(note + out), nil, nil
+		return mcpText(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -275,7 +420,7 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 		if err != nil {
 			return nil, nil, err
 		}
-		return mcpText(note + out), nil, nil
+		return mcpText(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

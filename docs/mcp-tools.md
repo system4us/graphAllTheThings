@@ -9,9 +9,15 @@
 | `describe_entity` | One node in full: a table (types, enums, row counts, DDL), an API schema/endpoint (properties, `$ref`s, bodies), or a function/type (signature, doc, call edges) + all relationships. |
 | `join_path` | Cheapest FK path between two tables with exact join columns — a ready `JOIN ... ON ...` hint (or the `$ref` chain between two API schemas). Routes around hub tables (`tenant_id`-style FKs every table carries), which a naive shortest path would cut through, producing semantically wrong joins. |
 | `sql_context` | One-shot context pack for a data question: most relevant tables/schemas fully described. Feed straight into SQL generation. |
-| `code_context` | One-shot context pack for a code question: relevant functions, types, docs with `file:line` and call graph. The `code-query` CLI, as a tool. |
-| `impact` | Transitive callers of a function to depth N — what breaks if it changes. Run before refactors; `[test]` tags included. Also lists shared mutable state (JS/TS/JSX). |
-| `blast` | Blast radius of any node — file (incl. data files), function, or type: callers + importers + regenerated outputs + diverged copies. Run before editing shared config/schema files. |
+| `code_context` | One-shot context pack for a code question: relevant functions, types, docs with `file:line` and call graph. Supports optional `max_tokens`. |
+| `read_symbols` | Batch-read full source bodies (with line numbers) and annotations (`entity_note`, `invariant`, `gotcha`) for 1..N symbols in one call. |
+| `trace_path` | Shortest execution/data-flow path between two codebase nodes across routes, calls, event dispatch (`emits "event"`), `sqlc` queries, ORM models, and shared state. |
+| `affected_tests` | Minimal set of test files, test functions, and ready-to-run test commands impacted by a file, symbol, or git diff. |
+| `preflight_check` | Composite post-edit verification gate vs git diff: risk alerts (generated files, hotspots, gotchas/invariants), structural diff, affected tests, and affected docs. |
+| `hotspots` | Rank codebase files by recent git churn × graph connectivity to surface risky architectural hubs. |
+| `file_history` | Recent git commit history for a file, with extracted issue references (`#42`, `PROJ-123`). |
+| `impact` | Transitive callers of a function to depth N — what breaks if it changes. Run before refactors; `[test]` tags, shared mutable state, and `gotcha`/`invariant` notes included. Supports `max_tokens`. |
+| `blast` | Blast radius of any node — file (incl. data/SQL files), function, or type: callers + importers + regenerated outputs (`GENERATES`, incl. `sqlc`) + diverged copies + co-change companions. Supports `max_tokens`. |
 | `grep` | Exhaustive literal/regex search across every file — a zero-result answer is proof of absence, unlike the semantic/top-N `find_entities`. |
 | `tree` | Directory tree synthesized from file nodes, each annotated with its doc summary. |
 | `routes` | Every HTTP route detected in code: method, path, handler (incl. `controller.method` refs), middleware chain, models touched, frontend call sites. The full-stack intersection in one call. |

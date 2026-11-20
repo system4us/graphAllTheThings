@@ -100,6 +100,14 @@ func main() {
 		err = cmdModels(ctx, os.Args[2:])
 	case "diff":
 		err = cmdDiff(ctx, os.Args[2:])
+	case "trace", "trace-path":
+		err = cmdTrace(ctx, os.Args[2:])
+	case "affected-tests", "tests":
+		err = cmdAffectedTests(ctx, os.Args[2:])
+	case "hotspots":
+		err = cmdHotspots(ctx, os.Args[2:])
+	case "preflight":
+		err = cmdPreflight(ctx, os.Args[2:])
 	case "code-query", "codequery":
 		err = cmdCodeQuery(ctx, os.Args[2:])
 	case "path":
@@ -171,6 +179,10 @@ query it (graphify-style):
   gatt models [--file substr]      ORM models detected in code (Sequelize/TypeORM/gorm/Django/SQLAlchemy +
                                       .gatt/models.json overlay): table, field→column renames, associations
   gatt diff [ref]                  structural diff vs a git ref (default HEAD): added/removed/changed/renamed/moved functions & types, plus current callers [--limit N]
+  gatt trace <from> <to>           shortest execution/data-flow path between two nodes (routes, functions, events, sqlc queries, models) [--depth N]
+  gatt affected-tests [target]     minimal set of test files & commands impacted by a file, symbol, or git diff [--depth N]
+  gatt hotspots [--limit N]        rank codebase files by recent git churn × graph connectivity
+  gatt preflight [ref]             composite post-edit check: risk alerts, structural diff, affected tests, and doc drift [--max-tokens N]
   gatt path <tableA> <tableB>      cheapest FK join path with exact columns
   gatt explain <table|column>      one node in full: attrs + relationships
   gatt overview                    all tables, counts, references
@@ -1176,15 +1188,22 @@ func installSkill() error {
 	if err != nil {
 		return fmt.Errorf("could not find home dir: %w", err)
 	}
-	dir := filepath.Join(home, ".claude", "skills", "gatt")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	targets := []string{
+		filepath.Join(home, ".claude", "skills", "gatt"),
 	}
-	path := filepath.Join(dir, "SKILL.md")
-	if err := os.WriteFile(path, []byte(skillMD), 0o644); err != nil {
-		return err
+	if _, err := os.Stat(filepath.Join(home, ".gemini")); err == nil {
+		targets = append(targets, filepath.Join(home, ".gemini", "antigravity", "skills", "gatt"))
 	}
-	fmt.Printf("installed skill → %s\n", path)
+	for _, dir := range targets {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		path := filepath.Join(dir, "SKILL.md")
+		if err := os.WriteFile(path, []byte(skillMD), 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("installed skill → %s\n", path)
+	}
 	return nil
 }
 
@@ -1506,6 +1525,7 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
 	chatModel := chatFlag(fs)
 	limit := fs.Int("limit", 6, "max entities in context")
+	maxTokens := fs.Int("max-tokens", 0, "optional approximate token budget (0 = unlimited)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1515,7 +1535,103 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 		return err
 	}
 	withChat(e, *embURL, *chatModel)
-	out, err := e.CodeContextPack(ctx, question, *limit)
+	out, err := e.CodeContextPackWithBudget(ctx, question, *limit, *maxTokens)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+func cmdTrace(ctx context.Context, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: gatt trace <from> <to> [--depth N] [--graph PATH]")
+	}
+	from, to := args[0], args[1]
+	fs := flag.NewFlagSet("trace", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	depth := fs.Int("depth", 8, "max hops to walk")
+	if err := fs.Parse(args[2:]); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.TracePath(from, to, *depth)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+func cmdAffectedTests(ctx context.Context, args []string) error {
+	target := ""
+	flagArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		target = args[0]
+		flagArgs = args[1:]
+	}
+	fs := flag.NewFlagSet("affected-tests", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	depth := fs.Int("depth", 3, "dependency hops to walk")
+	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	res, err := e.AffectedTests(ctx, target, *depth)
+	if err != nil {
+		return err
+	}
+	fmt.Print(res.Text)
+	return nil
+}
+
+func cmdHotspots(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("hotspots", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	limit := fs.Int("limit", 20, "max hotspot files to show")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	entries, err := e.Hotspots(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	fmt.Print(engine.RenderHotspots(entries))
+	return nil
+}
+
+func cmdPreflight(ctx context.Context, args []string) error {
+	ref := "HEAD"
+	flagArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		ref = args[0]
+		flagArgs = args[1:]
+	}
+	fs := flag.NewFlagSet("preflight", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	maxTokens := fs.Int("max-tokens", 0, "optional approximate token budget (0 = unlimited)")
+	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	autoRefreshCodebase(ctx, *graphPath, *qdURL, *coll, *embURL, *embModel)
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	out, err := e.PreflightCheck(ctx, ref, *maxTokens)
 	if err != nil {
 		return err
 	}

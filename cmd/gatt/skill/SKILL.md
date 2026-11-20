@@ -102,6 +102,15 @@ gatt models [--file substr]         # ORM models found in code: name, DB table,
 gatt diff [ref] [--limit N]         # structural diff vs a git ref (default HEAD):
                                     # added/removed/changed/renamed/moved functions & types,
                                     # plus current callers of anything that changed
+gatt trace <from> <to> [--depth N]  # shortest execution/data-flow path between two nodes
+                                    # (HTTP routes, functions, event emitters/listeners,
+                                    # sqlc queries, ORM models, files)
+gatt affected-tests [target]        # minimal test files + ready-to-run commands impacted
+                                    # by a file, symbol, or current git diff (omit target)
+gatt hotspots [--limit N]           # rank files by recent git churn × graph connectivity
+gatt preflight [ref]                # composite post-edit gate: risk alerts (generated files,
+                                    # hotspots, gotchas/invariants), diff, affected tests, docs
+gatt doc-drift                      # docs with broken or stale code references
 gatt explain <node-id>              # one node in full: attrs + every edge
 gatt overview                       # node counts, project shape
 ```
@@ -110,12 +119,12 @@ All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
 
 ## Workflow
 
-1. `gatt code-query "<the question or feature description>"` — get the map.
-2. Read **only** the line ranges the pack points at (`Read` with offset/limit),
-   not whole files. Short functions already include their body — skip the Read.
-3. Editing? `gatt impact <function>` first; check `[test]` entries.
-4. After your edits, nothing to do — the next query auto-refreshes the graph
-   and re-embeds changed nodes.
+1. `gatt code-query "<the question or feature description>"` (with `--max-tokens` if needed) — get the map.
+2. Use `read_symbols` (MCP) to batch-read full bodies of 1–5 target symbols in one call, or `Read` with offset/limit on the exact line ranges the pack points at.
+3. Tracing a flow across routes, events, or sqlc queries? Run `trace_path` (`gatt trace <from> <to>`).
+4. Editing? Run `impact` / `blast` (and `file_history` on unfamiliar/hotspot files) first.
+5. After edits, run `preflight_check` (`gatt preflight`) or `affected_tests` to verify changes and catch generated-file / doc-drift / invariant alerts.
+6. Learned a subtle invariant or pitfall? Persist it with `annotate_entity` (`invariant`, `gotcha`, `entity_note`) so future sessions inherit it.
 
 ## Interpreting output
 
@@ -152,6 +161,8 @@ All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
 ## MCP alternative
 
 If the `gatt` MCP server is installed in the client (`mcp__gatt__*` tools visible),
-`code_context`, `impact`, `blast`, `find_entities`, `describe_entity`, `grep`, `tree`,
-`routes`, `models`, `code_diff` mirror the commands above with the engine resident in
-memory (faster on huge repos). Prefer whichever is already available; functionality is identical.
+`code_context`, `read_symbols`, `trace_path`, `impact`, `blast`, `affected_tests`,
+`preflight_check`, `hotspots`, `file_history`, `find_entities`, `describe_entity`,
+`grep`, `tree`, `routes`, `models`, `code_diff`, `doc_drift`, and `annotate_entity`
+mirror the commands above with the engine resident in memory (faster on huge repos).
+Prefer whichever is already available; functionality is identical.

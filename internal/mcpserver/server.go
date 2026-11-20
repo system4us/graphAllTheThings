@@ -187,13 +187,40 @@ type affectedTestsIn struct {
 }
 
 type impactIn struct {
-	Function string `json:"function" jsonschema:"function name (if unique) or full node id, e.g. func:internal/engine/engine.go:Find:129"`
-	Depth    int    `json:"depth,omitempty" jsonschema:"caller levels to walk, default 3"`
+	Function  string `json:"function" jsonschema:"function name (if unique) or full node id, e.g. func:internal/engine/engine.go:Find:129"`
+	Depth     int    `json:"depth,omitempty" jsonschema:"caller levels to walk, default 3"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
 }
 
 type blastIn struct {
-	Target string `json:"target" jsonschema:"file path (e.g. shared/schemas/product.schema.json), function name, or full node id"`
-	Depth  int    `json:"depth,omitempty" jsonschema:"dependency levels to walk, default 3"`
+	Target    string `json:"target" jsonschema:"file path (e.g. shared/schemas/product.schema.json), function name, or full node id"`
+	Depth     int    `json:"depth,omitempty" jsonschema:"dependency levels to walk, default 3"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
+}
+
+type tracePathIn struct {
+	From     string `json:"from" jsonschema:"source node: route (e.g. 'POST /checkout'), function name, file path, model name, or full node id"`
+	To       string `json:"to" jsonschema:"target node: function name, model/table name, file path, route, or full node id"`
+	MaxDepth int    `json:"max_depth,omitempty" jsonschema:"max hops to walk, default 8 (max 15)"`
+}
+
+type readSymbolsIn struct {
+	IDs       []string `json:"ids" jsonschema:"list of function/type/file names or full node ids to read in one batch"`
+	MaxTokens int      `json:"max_tokens,omitempty" jsonschema:"approximate token budget, default 4000"`
+}
+
+type preflightIn struct {
+	Ref       string `json:"ref,omitempty" jsonschema:"git ref to check against, default HEAD"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
+}
+
+type hotspotsIn struct {
+	Limit int `json:"limit,omitempty" jsonschema:"max hotspot files to return, default 20"`
+}
+
+type fileHistoryIn struct {
+	File  string `json:"file" jsonschema:"repository-relative file path"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max recent commits to return, default 8"`
 }
 
 type docDriftIn struct {
@@ -215,7 +242,8 @@ type treeIn struct {
 }
 
 type routesIn struct {
-	File string `json:"file,omitempty" jsonschema:"only routes in files whose path contains this substring"`
+	File      string `json:"file,omitempty" jsonschema:"only routes in files whose path contains this substring"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
 }
 
 type modelsIn struct {
@@ -223,14 +251,17 @@ type modelsIn struct {
 }
 
 type codeDiffIn struct {
-	Ref   string `json:"ref,omitempty" jsonschema:"git ref to diff against, default HEAD"`
-	Limit int    `json:"limit,omitempty" jsonschema:"max changes to display, default 30"`
+	Ref       string `json:"ref,omitempty" jsonschema:"git ref to diff against, default HEAD"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"max changes to display, default 30"`
+	MaxTokens int    `json:"max_tokens,omitempty" jsonschema:"optional approximate token budget; 0 = unlimited"`
 }
 
-type annotateIn struct {
-	Node           string `json:"node" jsonschema:"table/column/schema name or node id to annotate"`
-	EntityNote     string `json:"entity_note,omitempty" jsonschema:"free-text business definition of the entity (what it canonically means, edge cases)"`
-	DefaultFilter  string `json:"default_filter,omitempty" jsonschema:"a canonical WHERE clause always applied for this entity, e.g. 'enabled = true'"`
+type AnnotateIn struct {
+	Node           string `json:"node" jsonschema:"table/column/schema/function/file name or node id to annotate"`
+	EntityNote     string `json:"entity_note,omitempty" jsonschema:"free-text business or architectural note (canonical meaning, design rationale)"`
+	DefaultFilter  string `json:"default_filter,omitempty" jsonschema:"a canonical WHERE clause always applied for this DB entity, e.g. 'enabled = true'"`
+	Invariant      string `json:"invariant,omitempty" jsonschema:"code invariant that must always hold (surfaced in impact, blast, read_symbols, preflight_check)"`
+	Gotcha         string `json:"gotcha,omitempty" jsonschema:"non-obvious pitfall or edge case to remember before editing this node"`
 	RouteMethod    string `json:"route_method,omitempty" jsonschema:"HTTP method (GET, POST, ...) — tag a function node as an HTTP route handler the static detector didn't recognize (any language/framework/style)"`
 	RoutePath      string `json:"route_path,omitempty" jsonschema:"route path, e.g. '/users/{id}' — pairs with route_method"`
 	RouteFramework string `json:"route_framework,omitempty" jsonschema:"web framework the route belongs to, e.g. flask, fastapi, spring, gin — pairs with route_method"`
@@ -298,7 +329,88 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, nil, err
 		}
+		return text(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "trace_path",
+		Description: "Shortest execution/data-flow path between any two codebase nodes (HTTP route, function, event emitter/listener, sqlc query, ORM model, or file). Walks CALLS_ENDPOINT, HANDLED_BY, CALLS (including string-keyed event dispatch with event names), USES_MODEL, sqlc DEPENDS_ON/GENERATES, IMPORTS, and shared state. Use to trace end-to-end flows in one call.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in tracePathIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.TracePath(in.From, in.To, in.MaxDepth)
+		if err != nil {
+			return nil, nil, err
+		}
 		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "read_symbols",
+		Description: "Batch-read the full source body (with line numbers) and any persisted annotations (entity_note, invariant, gotcha) of 1..N functions, types, or files in a single tool call, bounded by max_tokens (default 4000). Replaces multiple follow-up Read calls after code_context.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in readSymbolsIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.ReadSymbols(in.IDs, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "preflight_check",
+		Description: "Single composite post-edit verification gate against git diff (default HEAD): risk alerts (edited generated files, touched hotspots, gotchas/invariants), structural code_diff, affected_tests with ready-to-run commands, and docs mentioning changed code. Run before finishing a task.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in preflightIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.PreflightCheck(ctx, in.Ref, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "hotspots",
+		Description: "Rank codebase files by recent git churn × graph connectivity (degree), surfacing high-risk architectural hubs that change frequently. Useful during planning and code review.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in hotspotsIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		limit := in.Limit
+		if limit <= 0 {
+			limit = 20
+		}
+		entries, err := e.Hotspots(ctx, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(note + engine.RenderHotspots(entries)), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "file_history",
+		Description: "Recent git commit history for a specific file, including extracted issue references (#42, PROJ-123). Use before editing unfamiliar or fragile code to understand why it changed recently.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in fileHistoryIn) (*mcp.CallToolResult, any, error) {
+		note := s.autoRefreshCodebase(ctx)
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		entries := e.FileHistory(ctx, in.File, in.Limit)
+		return text(note + engine.RenderFileHistory(in.File, entries)), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -314,7 +426,7 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, nil, err
 		}
-		return text(note + out), nil, nil
+		return text(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -388,7 +500,7 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, nil, err
 		}
-		return text(note + out), nil, nil
+		return text(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -420,7 +532,7 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, nil, err
 		}
-		return text(note + out), nil, nil
+		return text(note + engine.TrimToTokenBudget(out, in.MaxTokens)), nil, nil
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -477,9 +589,9 @@ func (s *Server) register() {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "annotate_entity",
-		Description: "Persist business knowledge you've learned onto a table/column/schema so every later sql_context and describe_entity carries it. entity_note is a free-text definition; default_filter is a canonical WHERE clause (e.g. 'enabled = true') that gets rendered like a soft-delete filter. On a codebase graph, also use route_method/route_path/route_framework to tag any function node as an HTTP route handler the static detector missed — it only recognizes Express-style JS/TS calls, so this is the way to record routes for any other language, framework, or coding style; tagged routes then show up in the routes tool. Survives re-extraction and line-number drift. Use this instead of re-explaining the same caveat each session; use clear=true to remove.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in annotateIn) (*mcp.CallToolResult, any, error) {
-		return s.annotate(in)
+		Description: "Persist business or architectural knowledge onto a node (table/column/schema/function/file) so every later query carries it. Supports entity_note, default_filter (DB WHERE clause), invariant (code invariant surfaced in impact/blast/read_symbols/preflight_check), gotcha (non-obvious pitfall before editing), and route_method/route_path/route_framework for manual HTTP route tagging. Survives re-extraction and line-number drift. Use clear=true to remove.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in AnnotateIn) (*mcp.CallToolResult, any, error) {
+		return s.Annotate(in)
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -516,12 +628,12 @@ func (s *Server) register() {
 	})
 }
 
-func (s *Server) annotate(in annotateIn) (*mcp.CallToolResult, any, error) {
-		e, err := s.requireEngine()
-		if err != nil {
-			return nil, nil, err
-		}
-	// Resolve a bare name ("contacts") to the canonical node id the merge keys on.
+func (s *Server) Annotate(in AnnotateIn) (*mcp.CallToolResult, any, error) {
+	e, err := s.requireEngine()
+	if err != nil {
+		return nil, nil, err
+	}
+	// Resolve a bare name ("contacts" or a function name) to the canonical node id.
 	d, err := e.Describe(in.Node)
 	if err != nil {
 		return nil, nil, err
@@ -533,6 +645,12 @@ func (s *Server) annotate(in annotateIn) (*mcp.CallToolResult, any, error) {
 	if in.DefaultFilter != "" {
 		set["default_filter"] = in.DefaultFilter
 	}
+	if in.Invariant != "" {
+		set["invariant"] = in.Invariant
+	}
+	if in.Gotcha != "" {
+		set["gotcha"] = in.Gotcha
+	}
 	if in.RouteMethod != "" {
 		set["route_method"] = in.RouteMethod
 	}
@@ -543,7 +661,7 @@ func (s *Server) annotate(in annotateIn) (*mcp.CallToolResult, any, error) {
 		set["route_framework"] = in.RouteFramework
 	}
 	if !in.Clear && len(set) == 0 {
-		return nil, nil, fmt.Errorf("nothing to do: set entity_note/default_filter or pass clear=true")
+		return nil, nil, fmt.Errorf("nothing to do: set entity_note/default_filter/invariant/gotcha/route_* or pass clear=true")
 	}
 	annPath := filepath.Join(filepath.Dir(s.cfg.GraphPath), graph.AnnotationsFile)
 	result, err := graph.SetAnnotation(annPath, d.ID, set, in.Clear)

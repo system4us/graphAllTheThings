@@ -82,6 +82,8 @@ func declQueryFor(ext string) string {
 		return `
 		(parameter_declaration name: (identifier) @decl.name type: (_) @decl.type)
 		(var_spec name: (identifier) @decl.name type: (_) @decl.type)
+		(field_declaration name: (field_identifier) @decl.name type: (_) @decl.type)
+		(field_declaration name: (field_identifier) @decl.any)
 		(parameter_declaration name: (identifier) @decl.any)
 		(var_spec name: (identifier) @decl.any)
 		(short_var_declaration left: (expression_list (identifier) @decl.any))

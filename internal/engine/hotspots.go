@@ -162,3 +162,33 @@ func (e *Engine) Hotspots(ctx context.Context, limit int) ([]HotspotEntry, error
 	}
 	return entries, nil
 }
+
+// RenderHotspots formats hotspot entries into a compact agent-readable table.
+func RenderHotspots(entries []HotspotEntry) string {
+	if len(entries) == 0 {
+		return "no hotspots found (no recent git churn matching graph files)\n"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "top %d hotspot(s) (recent git churn × graph connectivity):\n", len(entries))
+	for i, h := range entries {
+		fmt.Fprintf(&b, "  %2d. %s  commits=%d degree=%d score=%d\n", i+1, h.Path, h.Commits, h.Degree, h.Score)
+	}
+	return b.String()
+}
+
+// RenderFileHistory formats recent commits for a file into a compact text list.
+func RenderFileHistory(relPath string, entries []CommitEntry) string {
+	if len(entries) == 0 {
+		return fmt.Sprintf("no git history found for %s\n", relPath)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "recent git history for %s (%d commit(s)):\n", relPath, len(entries))
+	for _, c := range entries {
+		issues := ""
+		if len(c.Issues) > 0 {
+			issues = " [" + strings.Join(c.Issues, ", ") + "]"
+		}
+		fmt.Fprintf(&b, "  %s %s (%s): %s%s\n", c.SHA, c.Date, c.Author, c.Subject, issues)
+	}
+	return b.String()
+}

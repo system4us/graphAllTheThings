@@ -772,6 +772,15 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "impact of changing %s (%s)\n", n.Name, funcLoc(n))
+	if note := n.Attrs["entity_note"]; note != "" {
+		fmt.Fprintf(&b, "note: %s\n", note)
+	}
+	if inv := n.Attrs["invariant"]; inv != "" {
+		fmt.Fprintf(&b, "⚠ invariant: %s\n", inv)
+	}
+	if g := n.Attrs["gotcha"]; g != "" {
+		fmt.Fprintf(&b, "⚠ gotcha: %s\n", g)
+	}
 	visited := map[string]bool{id: true}
 	level := []string{id}
 	total := 0
@@ -1019,6 +1028,15 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "blast radius of modifying %s (%s)\n", n.Name, n.Type)
+	if note := n.Attrs["entity_note"]; note != "" {
+		fmt.Fprintf(&b, "note: %s\n", note)
+	}
+	if inv := n.Attrs["invariant"]; inv != "" {
+		fmt.Fprintf(&b, "⚠ invariant: %s\n", inv)
+	}
+	if g := n.Attrs["gotcha"]; g != "" {
+		fmt.Fprintf(&b, "⚠ gotcha: %s\n", g)
+	}
 
 	// Warn when the target is a generated artifact: edits get overwritten.
 	if n.Attrs["generated"] == "true" {

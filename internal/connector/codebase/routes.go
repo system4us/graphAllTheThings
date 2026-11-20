@@ -459,6 +459,7 @@ func (c *Connector) wireRouteModels(g *graph.Graph) {
 		}
 		// Transitive callee files from the handler, depth 3, capped.
 		files := map[string]bool{}
+		modelHit := map[string]bool{}
 		visited := map[string]bool{handler: true}
 		level := []string{handler}
 		for d := 0; d < 3 && len(level) > 0 && len(visited) < 200; d++ {
@@ -471,12 +472,13 @@ func (c *Connector) wireRouteModels(g *graph.Graph) {
 					if e.Type == graph.EdgeCalls && e.From == cur && !visited[e.To] {
 						visited[e.To] = true
 						next = append(next, e.To)
+					} else if e.Type == graph.EdgeUsesModel && e.From == cur {
+						modelHit[e.To] = true
 					}
 				}
 			}
 			level = next
 		}
-		modelHit := map[string]bool{}
 		for f := range files {
 			for _, mid := range modelsByFile[f] {
 				modelHit[mid] = true

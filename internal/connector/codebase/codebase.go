@@ -113,6 +113,7 @@ type Connector struct {
 	// tree is parsed.
 	pendingDispatchAssocs   []dispatchAssoc
 	pendingDispatchTriggers []dispatchTrigger
+	dispatchConstValues     map[string]string
 	// namedImports maps file path -> imported local binding name -> resolved
 	// target file id ("file:...") — every `import { x } from '...'` binding
 	// in that file (JS/TS/JSX), not just the state-tracking subset (see
@@ -293,6 +294,7 @@ func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
 	c.wireClientCalls(g, funcs)
 	c.wireStyles(g)
 	c.wireDispatch(g, funcsByName)
+	c.wireSqlc(g)
 	c.wireRouteModels(g)
 	c.mineGitCoChanges(ctx, g)
 
@@ -529,6 +531,8 @@ func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph
 	c.wireModels(prev)
 	c.wireClientCalls(prev, newFuncs)
 	c.wireStyles(prev)
+	c.wireDispatch(prev, funcsByName)
+	c.wireSqlc(prev)
 	c.wireRouteModels(prev)
 
 	// Calls from *unchanged* files may now have a target that didn't exist at
@@ -1771,6 +1775,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		if doc := leadingFileDoc(tree.RootNode(), data, consumed); doc != "" {
 			fileAttrs["file_doc"] = doc
 		}
+		c.collectDispatchFile(tree.RootNode(), ext, data)
 
 		qc := sitter.NewQueryCursor()
 		qc.Exec(lc.query, tree.RootNode())
@@ -2076,10 +2081,10 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				if !c.detectNativeRoute(g, callNode, callName, relPath, fileID, ext, data) {
 					c.detectGenericClientCall(callNode, callName, relPath, ext, data)
 				}
-				// String-keyed dispatch (queueJob("createPdf"), io.on("connected", h)):
-				// JS/TS/JSX only — the object-literal lookup-table side of the
-				// registry (collectDispatchTable) is JS/TS/JSX-only too.
-				if ext == ".js" || ext == ".jsx" || ext == ".ts" || ext == ".tsx" {
+				// String-keyed dispatch (queueJob("createPdf"), io.on("connected", h),
+				// bus.Subscribe("order.paid", handlePaid), etc.) across JS/TS, Go, Python, Java, C#.
+				switch ext {
+				case ".js", ".jsx", ".ts", ".tsx", ".go", ".py", ".java", ".cs":
 					c.detectDispatchCall(callNode, callName, callerFuncID, data)
 				}
 			}
@@ -3640,7 +3645,8 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 		seen[calledName] = true
 
 		if rest, ok := strings.CutPrefix(calledName, "@"); ok {
-			if recv, method, ok := strings.Cut(rest, "."); ok {
+			if dot := strings.LastIndexByte(rest, '.'); dot > 0 && dot+1 < len(rest) {
+				recv, method := rest[:dot], rest[dot+1:]
 				if !c.resolveGoPackageCall(g, callerID, callerFile, recv, method, funcsByName) {
 					c.resolveReceiverCall(g, callerID, callerFile, recv, method)
 				}
@@ -3706,6 +3712,10 @@ func (c *Connector) resolveGoPackageCall(g *graph.Graph, callerID, callerFile, r
 	if len(imps) == 0 {
 		return false
 	}
+	pkgRecv := recv
+	if dot := strings.IndexByte(pkgRecv, '.'); dot > 0 {
+		pkgRecv = pkgRecv[:dot]
+	}
 	var matchedDirs []string
 	for _, imp := range imps {
 		dir := strings.TrimPrefix(imp.pkgID, "pkg:")
@@ -3713,7 +3723,7 @@ func (c *Connector) resolveGoPackageCall(g *graph.Graph, callerID, callerFile, r
 		if pn := g.Nodes[imp.pkgID]; pn != nil {
 			pkgName = pn.Name
 		}
-		if imp.alias == recv || (imp.alias == "" && (pkgName == recv || filepath.Base(dir) == recv)) {
+		if imp.alias == pkgRecv || (imp.alias == "" && (pkgName == pkgRecv || filepath.Base(dir) == pkgRecv)) {
 			matchedDirs = append(matchedDirs, dir)
 		}
 	}
