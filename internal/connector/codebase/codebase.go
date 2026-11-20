@@ -279,6 +279,13 @@ type funcInfo struct {
 }
 
 func (c *Connector) Extract(ctx context.Context) (*graph.Graph, error) {
+	info, err := os.Stat(c.dir)
+	if err != nil {
+		return nil, fmt.Errorf("codebase path %q: %w", c.dir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("codebase path %q is not a directory", c.dir)
+	}
 	g := graph.New(fmt.Sprintf("codebase:%s", c.dir))
 	g.ExtractedAt = time.Now().UTC()
 

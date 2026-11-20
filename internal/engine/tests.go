@@ -195,11 +195,21 @@ func (e *Engine) AffectedTests(ctx context.Context, target string, depth int) (A
 				if ed.To == cur.id {
 					nextID = ed.From
 				}
-			case graph.EdgeCoChanged:
+			case graph.EdgeGenerates:
 				if ed.From == cur.id {
 					nextID = ed.To
-				} else {
-					nextID = ed.From
+				}
+			case graph.EdgeCoChanged:
+				// Only consider direct co-change test files at depth 0; transitive
+				// co-change walks explode across unrelated frontend/backend modules.
+				if cur.dist == 0 {
+					cand := ed.To
+					if cand == cur.id {
+						cand = ed.From
+					}
+					if cn := e.G.Nodes[cand]; cn != nil && cn.Type == graph.NodeFile && IsTestFilePath(cn.Name) {
+						nextID = cand
+					}
 				}
 			}
 			if nextID == "" || visited[nextID] {

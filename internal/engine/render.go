@@ -1096,12 +1096,29 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 		level = next
 	}
 
+	// Split USES_MODEL hits into HTTP routes vs sqlc/code queries so labels stay accurate.
+	if um := byEdge[graph.EdgeUsesModel]; len(um) > 0 {
+		var routeHits, queryHits []hit
+		for _, h := range um {
+			if h.node != nil && h.node.Type == graph.NodeRoute {
+				routeHits = append(routeHits, h)
+			} else {
+				queryHits = append(queryHits, h)
+			}
+		}
+		byEdge[graph.EdgeUsesModel] = routeHits
+		if len(queryHits) > 0 {
+			byEdge["USES_MODEL_QUERY"] = queryHits
+		}
+	}
+
 	sections := []struct{ edge, label string }{
 		{graph.EdgeImports, "importers"},
 		{graph.EdgeCalls, "callers"},
 		{graph.EdgeGenerates, "regenerated outputs"},
 		{graph.EdgeReferences, "references"},
 		{graph.EdgeUsesModel, "routes touching this model — API surface affected"},
+		{"USES_MODEL_QUERY", "queries/functions touching this model"},
 		{graph.EdgeCallsEndpoint, "frontend call sites hitting this route"},
 		{graph.EdgeUsesStyle, "UI files using this stylesheet's selectors"},
 		{graph.EdgeMentions, "documented in — update these docs too"},

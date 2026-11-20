@@ -195,7 +195,14 @@ func (e *Engine) bfsTrace(srcID, dstID string, maxDepth int, directedOnly bool) 
 			} else {
 				continue
 			}
-			if visited[nextID] || e.G.Nodes[nextID] == nil {
+			if visited[nextID] {
+				continue
+			}
+			nn := e.G.Nodes[nextID]
+			if nn == nil {
+				continue
+			}
+			if nextID != dstID && (nn.Attrs["external"] == "true" || nn.Type == graph.NodeComponent) {
 				continue
 			}
 			visited[nextID] = true
