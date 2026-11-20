@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"graphallthethings/internal/connector/docs"
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/httpapi"
@@ -542,6 +543,7 @@ func cmdServe(ctx context.Context, args []string) error {
 // syncConfig is everything one background pass needs.
 type syncConfig struct {
 	graphPath, qdURL, coll, embURL, embModel string
+	sourceKind, sourceRoot                   string
 	noEmbed                                  bool
 	// initIndex builds the vector index from scratch when none exists. Only
 	// safe with a local embedder (--onnx): with a remote or slow one, the first
@@ -558,7 +560,13 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 	st.At = start
 	defer func() { st.Duration = time.Since(start).Round(time.Millisecond).String() }()
 
-	res, err := refreshCodebase(ctx, graphPath, qdURL, coll, embURL, embModel, false)
+	var res refreshResult
+	var err error
+	if c.sourceKind == "docs" && c.sourceRoot != "" {
+		res, err = refreshDocs(ctx, c.sourceRoot, graphPath)
+	} else {
+		res, err = refreshCodebase(ctx, graphPath, qdURL, coll, embURL, embModel, false)
+	}
 	if err != nil {
 		st.Error = err.Error()
 		return st
@@ -601,6 +609,48 @@ func syncOnce(ctx context.Context, c syncConfig) (st syncStatus) {
 		markVectorsFresh(graphPath, sig) // also when nothing needed embedding
 	}
 	return st
+}
+
+// refreshDocs re-extracts a docs collection only when any document file under
+// root is newer than graphPath (or graphPath does not exist yet).
+func refreshDocs(ctx context.Context, root, graphPath string) (refreshResult, error) {
+	gst, err := os.Stat(graphPath)
+	if err == nil {
+		newer := false
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil || newer {
+				return nil
+			}
+			if d.IsDir() {
+				if path != root && graph.SkipDir(d.Name(), false) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			switch strings.ToLower(filepath.Ext(d.Name())) {
+			case ".pdf", ".docx", ".md", ".markdown", ".txt":
+				if fi, statErr := d.Info(); statErr == nil && fi.ModTime().After(gst.ModTime()) {
+					newer = true
+					return filepath.SkipAll
+				}
+			}
+			return nil
+		})
+		if !newer {
+			return refreshResult{}, nil
+		}
+	}
+	g, err := docs.New(root).Extract(ctx)
+	if err != nil {
+		return refreshResult{}, err
+	}
+	g.ExtractedAt = time.Now()
+	if err := g.Save(graphPath); err != nil {
+		return refreshResult{}, err
+	}
+	return refreshResult{
+		Summary: fmt.Sprintf("docs refreshed (%d documents, %d chunks)", len(g.NodesByType(graph.NodeDocument)), len(g.NodesByType(graph.NodeChunk))),
+	}, nil
 }
 
 func vectorsPath(graphPath string) string {
@@ -806,7 +856,7 @@ func startQdrant(ctx context.Context, binPath, storageRoot string, port int) (*q
 
 	qp := &qdrantProc{URL: fmt.Sprintf("http://127.0.0.1:%d", port), cmd: cmd}
 	hc := &http.Client{Timeout: 500 * time.Millisecond}
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			qp.Stop()
@@ -822,7 +872,7 @@ func startQdrant(ctx context.Context, binPath, storageRoot string, port int) (*q
 		time.Sleep(100 * time.Millisecond)
 	}
 	qp.Stop()
-	return nil, errors.New("--qdrant-bin: qdrant did not become ready within 20s")
+	return nil, errors.New("--qdrant-bin: qdrant did not become ready within 90s")
 }
 
 // Stop sends SIGTERM to Qdrant so it flushes storage cleanly, then kills if needed.

@@ -174,12 +174,44 @@ func newGlobalMCPHandler(pool *repoPool) http.Handler {
 				}
 			}
 			head := ""
-			if r.Head != "" {
+			if r.Kind == "docs" {
+				head = " [docs]"
+			} else if r.Head != "" {
 				head = " @" + r.Head
 			}
 			fmt.Fprintf(&b, "- %s%s [%s]\n", r.Root, head, state)
 		}
 		return mcpText(b.String()), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "doc_context",
+		Description: "PREFERRED FIRST CALL for any question over a mounted document collection (PDF, DOCX, Markdown, TXT). Pass `repo` set to the docs folder's absolute path (or unique folder name, e.g. 'corpus'). Returns relevant passages with file, page, and section citations plus adjacent reading-order context, using hybrid ONNX + Qdrant + FTS5 retrieval.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalContextIn) (*mcp.CallToolResult, any, error) {
+		e, _, err := resolveEngine(ctx, in.Repo, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.DocContextPackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mcpText(out), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "doc_guide",
+		Description: "Build a structured source pack for authoring a user guide or step-by-step runbook from a mounted document collection (pass `repo`, e.g. 'corpus'). Returns the top 1-2 canonical documents in full reading order (all sections/steps 1->N), referenced screenshot filenames, modification dates, and related/variant docs listed separately. Supports limit (default 2 docs) and max_tokens (default 6000).",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in globalContextIn) (*mcp.CallToolResult, any, error) {
+		e, _, err := resolveEngine(ctx, in.Repo, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.DocGuidePackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mcpText(out), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

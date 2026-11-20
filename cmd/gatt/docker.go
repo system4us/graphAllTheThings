@@ -115,6 +115,7 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 		"run", "-d",
 		"--name", *name,
 		"--restart", "unless-stopped",
+		"--ulimit", "nofile=65536:65536",
 		"-p", fmt.Sprintf("127.0.0.1:%d:7788", *port),
 		"-v", "gatt-data:/data",
 		"-v", "gatt-cache:/cache/huggingface",
@@ -164,7 +165,7 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 	fmt.Fprintf(os.Stderr, "gatt docker: started %s (%s), waiting for %s/health...\n", *name, containerID, baseURL)
 
 	hc := &http.Client{Timeout: 2 * time.Second}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := hc.Get(baseURL + "/health")
 		if err == nil {
@@ -182,7 +183,7 @@ func cmdDockerUp(ctx context.Context, args []string) error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("container %s started but %s/health did not become ready within 30s (check `gatt docker logs`)", *name, baseURL)
+	return fmt.Errorf("container %s started but %s/health did not become ready within 90s (check `gatt docker logs`)", *name, baseURL)
 }
 
 func cmdDockerDown(ctx context.Context, args []string) error {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"graphallthethings/internal/connector/codebase"
+	"graphallthethings/internal/connector/docs"
 	"graphallthethings/internal/connector/openapi"
 	"graphallthethings/internal/connector/postgres"
 	"graphallthethings/internal/connector/sqlite"
@@ -15,17 +16,17 @@ import (
 )
 
 type Connector interface {
-	// Name identifies the connector kind, e.g. "sqlite", "postgres", "openapi".
+	// Name identifies the connector kind, e.g. "sqlite", "postgres", "openapi", "docs".
 	Name() string
 	// Extract collects metadata from the source and builds the graph.
 	Extract(ctx context.Context) (*graph.Graph, error)
 }
 
 // Kinds lists the available connector kinds, for usage and error messages.
-const Kinds = "sqlite, postgres, openapi, codebase"
+const Kinds = "sqlite, postgres, openapi, codebase, docs"
 
 // Open builds the connector for a source kind ("sqlite", "postgres",
-// "openapi", "codebase") pointed at source (a file path, DSN, or URL). Shared by the CLI's
+// "openapi", "codebase", "docs") pointed at source (a file path, DSN, or URL). Shared by the CLI's
 // `extract` and the MCP server's refresh/drift tools so both resolve a source
 // the same way.
 func Open(kind, source string) (Connector, error) {
@@ -38,6 +39,8 @@ func Open(kind, source string) (Connector, error) {
 		return openapi.New(source), nil
 	case "codebase":
 		return codebase.New(source), nil
+	case "docs":
+		return docs.New(source), nil
 	default:
 		return nil, fmt.Errorf("unknown connector %q (available: %s)", kind, Kinds)
 	}

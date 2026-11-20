@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"graphallthethings/internal/connector/codebase"
+	"graphallthethings/internal/connector/docs"
 	"graphallthethings/internal/embed"
 	"graphallthethings/internal/graph"
 	"graphallthethings/internal/lock"
@@ -31,12 +32,14 @@ var (
 type repoMeta struct {
 	Root      string    `json:"root"`
 	Key       string    `json:"key"`
+	Kind      string    `json:"kind,omitempty"` // "codebase" (default) or "docs"
 	CreatedAt time.Time `json:"created_at"`
 }
 
 type repoEntry struct {
 	key        string
 	root       string
+	kind       string // "codebase" or "docs"
 	graphPath  string
 	coalescer  *coalescer
 	mcp        *mcpserver.Server
@@ -46,6 +49,7 @@ type repoEntry struct {
 type repoStatus struct {
 	Root     string      `json:"root"`
 	Key      string      `json:"key"`
+	Kind     string      `json:"kind,omitempty"`
 	Head     string      `json:"head,omitempty"`
 	Running  bool        `json:"running"`
 	Queued   bool        `json:"queued"`
@@ -63,10 +67,13 @@ func (e *repoEntry) status() repoStatus {
 	st := repoStatus{
 		Root:    e.root,
 		Key:     e.key,
-		Head:    shortSHA(gitHeadSHA(e.root)),
+		Kind:    e.kind,
 		Running: running,
 		Queued:  queued,
 		Last:    last,
+	}
+	if e.kind != "docs" {
+		st.Head = shortSHA(gitHeadSHA(e.root))
 	}
 	if running && e.coalescer.pTotal.Load() > 0 {
 		st.Progress = &progress{Done: e.coalescer.pDone.Load(), Total: e.coalescer.pTotal.Load()}
@@ -197,11 +204,18 @@ func (p *repoPool) initRepo(ctx context.Context, cleanRoot string) (*repoEntry, 
 		return nil, fmt.Errorf("create repo data dir: %w", err)
 	}
 
+	kind := detectSourceKind(cleanRoot)
 	metaPath := filepath.Join(repoDir, "meta.json")
-	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+	if data, err := os.ReadFile(metaPath); err == nil {
+		var m repoMeta
+		if json.Unmarshal(data, &m) == nil && m.Kind != "" {
+			kind = m.Kind
+		}
+	} else if os.IsNotExist(err) {
 		metaBytes, _ := json.MarshalIndent(repoMeta{
 			Root:      cleanRoot,
 			Key:       key,
+			Kind:      kind,
 			CreatedAt: time.Now().UTC(),
 		}, "", "  ")
 		_ = os.WriteFile(metaPath, metaBytes, 0o644)
@@ -209,8 +223,8 @@ func (p *repoPool) initRepo(ctx context.Context, cleanRoot string) (*repoEntry, 
 
 	graphPath := filepath.Join(repoDir, "graph.db")
 	if _, err := os.Stat(graphPath); os.IsNotExist(err) {
-		if err := extractInitialCodebase(ctx, cleanRoot, graphPath); err != nil {
-			return nil, fmt.Errorf("initial extract %s: %w", cleanRoot, err)
+		if err := extractInitialSource(ctx, kind, cleanRoot, graphPath); err != nil {
+			return nil, fmt.Errorf("initial extract %s (%s): %w", cleanRoot, kind, err)
 		}
 	}
 
@@ -222,16 +236,19 @@ func (p *repoPool) initRepo(ctx context.Context, cleanRoot string) (*repoEntry, 
 	sc := p.baseSync
 	sc.graphPath = graphPath
 	sc.coll = coll
+	sc.sourceKind = kind
+	sc.sourceRoot = cleanRoot
 
 	entry := &repoEntry{
 		key:       key,
 		root:      cleanRoot,
+		kind:      kind,
 		graphPath: graphPath,
 	}
 
 	mcpCfg := mcpserver.Config{
 		GraphPath:  graphPath,
-		SourceKind: "codebase",
+		SourceKind: kind,
 		Source:     cleanRoot,
 		OnAutoRefresh: func() {
 			if entry.coalescer != nil {
@@ -277,7 +294,56 @@ func (p *repoPool) initRepo(ctx context.Context, cleanRoot string) (*repoEntry, 
 	return entry, nil
 }
 
-func extractInitialCodebase(ctx context.Context, root, graphPath string) error {
+// detectSourceKind classifies a mounted directory as "docs" or "codebase".
+// Directories with .git or common code project manifests are treated as
+// "codebase"; directories with a .gatt-docs marker or containing document files
+// (PDF, DOCX, MD, TXT) and no code manifest are treated as "docs".
+func detectSourceKind(dir string) string {
+	if _, err := os.Stat(filepath.Join(dir, ".gatt-docs")); err == nil {
+		return "docs"
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		return "codebase"
+	}
+	for _, marker := range []string{"go.mod", "package.json", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "Makefile"} {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return "codebase"
+		}
+	}
+	if hasDocFiles(dir, 3) {
+		return "docs"
+	}
+	return "codebase"
+}
+
+func hasDocFiles(dir string, maxDepth int) bool {
+	found := false
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if d.IsDir() {
+			if path != dir && graph.SkipDir(d.Name(), false) {
+				return filepath.SkipDir
+			}
+			if rel, relErr := filepath.Rel(dir, path); relErr == nil && rel != "." {
+				if strings.Count(filepath.ToSlash(rel), "/")+1 > maxDepth {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(d.Name())) {
+		case ".pdf", ".docx", ".md", ".markdown", ".txt":
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+func extractInitialSource(ctx context.Context, kind, root, graphPath string) error {
 	release, err := lock.Acquire(graphPath+".lock", 2*time.Minute)
 	if err != nil {
 		return err
@@ -286,7 +352,12 @@ func extractInitialCodebase(ctx context.Context, root, graphPath string) error {
 	if _, err := os.Stat(graphPath); err == nil {
 		return nil
 	}
-	g, err := codebase.New(root).Extract(ctx)
+	var g *graph.Graph
+	if kind == "docs" {
+		g, err = docs.New(root).Extract(ctx)
+	} else {
+		g, err = codebase.New(root).Extract(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -343,6 +414,22 @@ func (p *repoPool) ScanNew(ctx context.Context, scanDirs []string, scanDepth int
 		return
 	}
 	found := discoverGitRepos(scanDirs, scanDepth)
+	// Also register any scanDir itself that is a pure document collection
+	// (e.g. `gatt docker up --mount /home/user/repos --mount /home/user/corpus`).
+	seenFound := make(map[string]bool, len(found))
+	for _, f := range found {
+		seenFound[f] = true
+	}
+	for _, raw := range scanDirs {
+		root := filepath.Clean(containerRepoPath(raw))
+		if root == "" || seenFound[root] {
+			continue
+		}
+		if detectSourceKind(root) == "docs" && len(discoverGitRepos([]string{root}, scanDepth)) == 0 {
+			found = append(found, root)
+			seenFound[root] = true
+		}
+	}
 	var added int
 	for _, root := range found {
 		if ctx.Err() != nil {

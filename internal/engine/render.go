@@ -38,6 +38,8 @@ func (e *Engine) Render(id string) (string, error) {
 		return e.RenderSchema(d.ID)
 	case graph.NodeEndpoint:
 		return e.RenderEndpoint(d.ID)
+	case graph.NodeDocument, graph.NodeSection, graph.NodeChunk:
+		return e.RenderDocument(d.ID)
 	default:
 		return e.RenderTable(d.ID)
 	}

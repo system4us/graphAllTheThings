@@ -110,6 +110,10 @@ func main() {
 		err = cmdPreflight(ctx, os.Args[2:])
 	case "code-query", "codequery":
 		err = cmdCodeQuery(ctx, os.Args[2:])
+	case "doc-query", "docquery":
+		err = cmdDocQuery(ctx, os.Args[2:])
+	case "doc-guide", "docguide":
+		err = cmdDocGuide(ctx, os.Args[2:])
 	case "path":
 		err = cmdPath(ctx, os.Args[2:])
 	case "explain":
@@ -153,6 +157,7 @@ func usage() {
 build the graph:
   gatt init                        scaffold an agent-native .gatt/ config for codebase contextualization
   gatt extract codebase <dir>      parse a repo (tree-sitter) into a code graph; merges the .gatt/ overlay if present
+  gatt extract docs <dir|file>     parse PDF, DOCX, Markdown, and TXT documents into a semantic document graph
   gatt extract sqlite <db-file> [--out gatt-out/graph.db] [--check]
   gatt extract postgres "postgres://user:pass@host:port/db?sslmode=disable" [--out PATH] [--check]
   gatt extract openapi <spec.json|spec.yaml|http://host:8000/openapi.json> [--out PATH] [--check] [--code REPO_ROOT]
@@ -167,6 +172,8 @@ build the graph:
 query it (graphify-style):
   gatt query "<question>"          context pack: relevant tables, columns, joins
   gatt code-query "<question>"     context pack for code: functions, types, docs, call graph
+  gatt doc-query "<question>"      context pack for documents (PDF, DOCX, MD, TXT) with section & page citations
+  gatt doc-guide "<topic>"         full canonical document pack (ordered steps, screenshots, related variants) for authoring user guides
   gatt search "<text>"             semantic search over all nodes [--type table|column|...]
   gatt impact <function>           transitive callers: what breaks on a signature change [--depth N]
   gatt blast <file-or-function>    blast radius of any node: callers + importers + generated copies [--depth N]
@@ -214,7 +221,7 @@ vectors live in-process (vectors.json next to the graph); --qdrant URL opts into
 func cmdExtract(ctx context.Context, args []string) error {
 	args = hoistPositionals(args, 2)
 	if len(args) < 2 {
-		return fmt.Errorf("usage: gatt extract sqlite|postgres|openapi|codebase <source> [--out PATH] [--check]")
+		return fmt.Errorf("usage: gatt extract sqlite|postgres|openapi|codebase|docs <source> [--out PATH] [--check]")
 	}
 	kind, source := args[0], args[1]
 	fs := flag.NewFlagSet("extract", flag.ExitOnError)
@@ -1586,6 +1593,60 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 	}
 	withChat(e, *embURL, *chatModel)
 	out, err := e.CodeContextPackWithBudget(ctx, question, *limit, *maxTokens)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+func cmdDocQuery(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
+	if len(args) < 1 {
+		return fmt.Errorf(`usage: gatt doc-query "<question>" [flags]`)
+	}
+	question := args[0]
+	fs := flag.NewFlagSet("doc-query", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	chatModel := chatFlag(fs)
+	limit := fs.Int("limit", 6, "max document passages in context")
+	maxTokens := fs.Int("max-tokens", 0, "optional approximate token budget (0 = unlimited)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	withChat(e, *embURL, *chatModel)
+	out, err := e.DocContextPackWithBudget(ctx, question, *limit, *maxTokens)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+func cmdDocGuide(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
+	if len(args) < 1 {
+		return fmt.Errorf(`usage: gatt doc-guide "<topic>" [flags]`)
+	}
+	topic := args[0]
+	fs := flag.NewFlagSet("doc-guide", flag.ExitOnError)
+	graphPath, qdURL, coll, embURL, embModel := indexFlags(fs)
+	chatModel := chatFlag(fs)
+	limit := fs.Int("limit", 2, "max canonical documents to expand in full")
+	maxTokens := fs.Int("max-tokens", 6000, "approximate token budget (default 6000)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	e, err := openEngine(*graphPath, *qdURL, *coll, *embURL, *embModel)
+	if err != nil {
+		return err
+	}
+	withChat(e, *embURL, *chatModel)
+	out, err := e.DocGuidePackWithBudget(ctx, topic, *limit, *maxTokens)
 	if err != nil {
 		return err
 	}

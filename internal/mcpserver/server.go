@@ -157,7 +157,7 @@ func text(t string) *mcp.CallToolResult {
 type emptyIn struct{}
 
 type sourceIn struct {
-	SourceKind string `json:"source_kind,omitempty" jsonschema:"optional: connector kind (sqlite, postgres, openapi). Required if the server wasn't started with one."`
+	SourceKind string `json:"source_kind,omitempty" jsonschema:"optional: connector kind (sqlite, postgres, openapi, codebase, docs). Required if the server wasn't started with one."`
 	Source     string `json:"source,omitempty" jsonschema:"optional: file path, DSN, or URL. Required if the server wasn't started with one."`
 }
 
@@ -279,6 +279,36 @@ func (s *Server) register() {
 			return nil, nil, err
 		}
 		out, err := e.ContextPackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "doc_context",
+		Description: "PREFERRED FIRST CALL for any question over a document collection (PDF, DOCX, Markdown, TXT). Returns the most relevant passages with file, page, and section citations plus adjacent reading-order context, using hybrid semantic + keyword retrieval. Supports optional max_tokens budget.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, any, error) {
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.DocContextPackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name:        "doc_guide",
+		Description: "Build a structured source pack for authoring a user guide or step-by-step runbook from a document collection (PDF, DOCX, Markdown, TXT). Instead of short fragments, returns the top 1-2 canonical documents in full reading order (all sections/steps 1->N), referenced screenshot filenames, modification dates, and related/variant docs listed separately. Supports limit (default 2 docs) and max_tokens (default 6000).",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in contextIn) (*mcp.CallToolResult, any, error) {
+		e, err := s.requireEngine()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := e.DocGuidePackWithBudget(ctx, in.Question, in.Limit, in.MaxTokens)
 		if err != nil {
 			return nil, nil, err
 		}

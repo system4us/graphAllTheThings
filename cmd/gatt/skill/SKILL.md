@@ -1,6 +1,6 @@
 ---
 name: gatt
-description: "Query a codebase through its gatt metadata graph instead of grep/read exploration. Use whenever (1) the user asks anything about a codebase, (2) you are about to run multiple Grep/Glob/Read rounds to orient yourself, or (3) you are in planning mode and need to map the code a plan will touch. Trigger check: `gatt-out/graph.db` or `gatt-out/graph.json` exists in the repo root, or `gatt` is on PATH."
+description: "Query a codebase or document collection (PDF, DOCX, Markdown, TXT) through its gatt semantic graph instead of grep/read exploration. Use whenever (1) the user asks anything about a codebase or a mounted docs corpus, (2) you are about to run multiple Grep/Glob/Read rounds to orient yourself, or (3) you are in planning mode and need to map the code or specs a plan will touch. Trigger check: `gatt-out/graph.db` or `gatt-out/graph.json` exists, `gatt` is on PATH, or the `gatt` MCP server is connected."
 ---
 
 # gatt — graph-first codebase navigation
@@ -115,10 +115,21 @@ gatt affected-tests [target]        # minimal test files + ready-to-run commands
 gatt hotspots [--limit N]           # rank files by recent git churn × graph connectivity
 gatt preflight [ref]                # composite post-edit gate: risk alerts (generated files,
                                     # hotspots, gotchas/invariants), diff, affected tests, docs
-gatt doc-drift                      # docs with broken or stale code references
+gatt doc-drift                      # docs with broken or stale code references (candidate list by git commit date)
+gatt doc-query "<question>"         # FIRST CALL for document Q&A / helpdesk (PDF, DOCX, MD, TXT) —
+                                    # returns ranked passages with citations and Confidence: high|medium|low
+gatt doc-guide "<topic>"            # FIRST CALL for authoring a user guide — returns top 1-2 full canonical
+                                    # documents in reading order, referenced screenshots, dates & related variants
 gatt explain <node-id>              # one node in full: attrs + every edge
 gatt overview                       # node counts, project shape
 ```
+
+## Documents (`doc_context`, `doc_guide` & `doc_drift`)
+
+- **Q&A / Helpdesk (`doc_context` / `gatt doc-query`):** use on `[docs]` repos (e.g. `repo: "corpus"`). Returns ranked passages in reading order per file, with `Confidence: high | medium | low`. When `Confidence: low`, it returns 0 passages and lists missing terms — do not fabricate missing facts.
+- **Drafting user guides (`doc_guide` / `gatt doc-guide`):** instead of fragmented chunks, returns the top 1–2 canonical documents **in full reading order**, lists referenced screenshot filenames (`Screenshots referenced:`), modification dates, and separates related/variant documents (e.g. Slack `direct` vs. `token`) so procedures don't get mixed.
+- **Markdown docs inside a codebase repo:** `code_context` already surfaces relevant repo docs alongside code; calling `doc_context` on a codebase repo falls back to searching the repo's indexed markdown/prose files (`README.md`, `docs/*.md`, etc.).
+- **`doc_drift`:** compares git commit dates of referenced code vs. the doc file (not semantic content). Use it as a **candidate checklist** of docs to review; note that uncommitted doc edits still appear stale until committed.
 
 All accept `--graph PATH` (auto-detects `gatt-out/graph.db` → `graph.json`).
 

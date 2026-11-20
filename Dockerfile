@@ -41,7 +41,7 @@ FROM qdrant/qdrant:v1.13.6 AS qdrant-bin
 FROM node:22-bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libunwind8 \
+    && apt-get install -y --no-install-recommends ca-certificates git libunwind8 poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && git config --global --add safe.directory '*' \
     && mkdir -p /data /cache/huggingface

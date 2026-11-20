@@ -43,6 +43,10 @@ const (
 	NodeState   = "state"   // a tracked property slot on a shared cross-file singleton
 	NodeModel   = "model"   // an ORM model found in code (e.g. Sequelize Model.init / sequelize.define)
 	NodePackage = "package" // a resolved local package/namespace directory (Go, Python, Java, Kotlin, C#)
+
+	NodeDocument = "document" // a standalone document file (PDF, DOCX, Markdown, TXT)
+	NodeSection  = "section"  // a heading/page section inside a document
+	NodeChunk    = "chunk"    // a retrieval-sized text chunk inside a section
 )
 
 // Edge types.
@@ -77,6 +81,10 @@ const (
 	EdgeRefersTo     = "REFERS_TO"     // property -> schema (a $ref, analogous to FOREIGN_KEY)
 	EdgeAccepts      = "ACCEPTS"       // endpoint -> schema (request body)
 	EdgeRespondsWith = "RESPONDS_WITH" // endpoint -> schema (response)
+
+	EdgeHasSection = "HAS_SECTION" // document -> section
+	EdgeHasChunk   = "HAS_CHUNK"   // section -> chunk
+	EdgeNext       = "NEXT"        // section -> section or chunk -> chunk (reading order)
 )
 
 type Node struct {
@@ -186,6 +194,9 @@ func (g *Graph) Dialect() string {
 // rather than a database. The engine uses it to switch its container node type
 // (schema vs table), rendering, and join semantics ($ref chain vs FK JOIN).
 func (g *Graph) IsAPI() bool { return strings.HasPrefix(g.Source, "openapi:") }
+
+// IsDocs reports whether this graph describes a document collection (PDF/DOCX/MD/TXT).
+func (g *Graph) IsDocs() bool { return strings.HasPrefix(g.Source, "docs:") }
 
 // Freshness returns a one-line provenance string for agent output, e.g.
 // "postgres:app, extracted 3h ago (2026-07-13)". Empty when no extraction
@@ -479,6 +490,17 @@ func (g *Graph) NodeText(id string) string {
 		}
 		if f := n.Attrs["fields"]; f != "" {
 			fmt.Fprintf(&b, " Fields: %s.", f)
+		}
+	}
+	if n.Type == NodeDocument || n.Type == NodeSection || n.Type == NodeChunk {
+		if title := n.Attrs["title"]; title != "" && title != n.Name {
+			fmt.Fprintf(&b, " Title: %s.", title)
+		}
+		if sec := n.Attrs["section"]; sec != "" && sec != n.Name {
+			fmt.Fprintf(&b, " Section: %s.", sec)
+		}
+		if t := n.Attrs["text"]; t != "" {
+			fmt.Fprintf(&b, " %s", t)
 		}
 	}
 	var cols, refs, refBy, accepts, returns, usedBy, methods, calledBy []string
