@@ -1,10 +1,10 @@
 # `system4us/gatt` — Central Knowledge Graph & MCP HTTP Server
 
-All-in-one local container for [**graphAllTheThings (`gatt`)**](https://github.com/system4us/graphAllTheThings): turns your mounted repositories into a live, semantically indexed knowledge graph exposed to AI coding agents over **Streamable HTTP MCP**.
+All-in-one local container for [**graphAllTheThings (`gatt`)**](https://github.com/system4us/graphAllTheThings): turns your mounted repositories and document collections (PDF, DOCX, Markdown, TXT) into a live, semantically indexed knowledge graph exposed to AI agents over **Streamable HTTP MCP**.
 
 ## What's inside
 
-- **`gatt serve`** (Go + tree-sitter for Go, TS/JS, Python, Rust, Java, C#, Kotlin, Swift)
+- **`gatt serve`** (Go + tree-sitter for Go, TS/JS, Python, Rust, Java, C#, Kotlin, Swift + native PDF/DOCX/Markdown/TXT document extractor with `poppler-utils`)
 - **Internal ONNX embedding worker** (`Xenova/paraphrase-multilingual-MiniLM-L12-v2`, CPU-only, loopback `127.0.0.1:7801` — never exposed)
 - **Embedded Qdrant** (`v1.13.6`, one collection per repo, loopback `127.0.0.1:6333` — never exposed)
 - **Automatic git commit watcher**: polls `.git/HEAD` (including worktrees and packed refs) and reindexes changed files and vectors incrementally on every commit, pull, merge, or branch switch.
@@ -26,6 +26,7 @@ Mount your repositories **read-only (`:ro`) at the exact same absolute path** in
 docker run -d \
   --name gatt-server \
   --restart unless-stopped \
+  --ulimit nofile=65536:65536 \
   -p 127.0.0.1:7788:7788 \
   -e GATT_SCAN_DIRS=/home/you/projects \
   -v gatt-data:/data \
@@ -71,7 +72,7 @@ docker run -d `
 |----------|---------|---------|
 | `GATT_SCAN_DIRS` | *(empty)* | Comma-separated mounted parent directories to auto-discover git repos in (rescans every 60 s) |
 | `GATT_SCAN_DEPTH` | `2` | Max directory depth under `GATT_SCAN_DIRS` to look for `.git` repos |
-| `GATT_REPOS` | *(empty)* | Comma-separated specific repo paths to preload on startup |
+| `GATT_REPOS` | *(empty)* | Comma-separated specific repo or document folder paths to preload on startup (auto-detects `codebase` vs `docs`) |
 | `GATT_WATCH_INTERVAL` | `5s` | Poll interval for git commit detection (`0` disables) |
 | `GATT_EMBED_CACHE` | `/cache/huggingface` | ONNX model download cache directory |
 

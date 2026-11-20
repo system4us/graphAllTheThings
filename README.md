@@ -7,6 +7,7 @@ Turn any source's metadata into a knowledge graph that your AI agent queries thr
 | **Database** (SQLite, PostgreSQL) | tables, columns, enums, FKs, indexes | "which tables hold login events, and how do I join them?" |
 | **API spec** (OpenAPI 3.x, Swagger 2.0) | endpoints, schemas, `$ref`s, auth | "what's the full request to create an order?" |
 | **Codebase** (Go, TS/JS, Python, Rust, Java, C#, Kotlin, Swift) | functions, call graph, routes, ORM models, docs | "what breaks if I change this signature?" |
+| **Documents** (PDF, DOCX, Markdown, TXT) | documents, sections, reading-order chunks, screenshot refs | "how do I configure Okta SSO?" / draft a user guide |
 
 Extract once, index semantically, and the agent gets tools that answer *which tables? how do I join them? who calls this?* in a single call. On a real 113-table CRM that is ~2.3k tokens in 1 tool call instead of ~7.8k across 6 introspection queries; on a codebase one `code-query` (~3 KB) replaces a 20–50k-token Grep/Read exploration.
 
@@ -43,7 +44,7 @@ gatt install --http http://127.0.0.1:7788 --scope user
 gatt install --http http://127.0.0.1:7788
 ```
 
-- **Multiple roots:** pass `--mount` multiple times (`gatt docker up --mount /mnt/code --mount /mnt/more-code`).
+- **Multiple roots & document collections:** pass `--mount` multiple times (`gatt docker up --mount /mnt/code --mount /mnt/docs`) or preload a PDF/DOCX/Markdown folder with `--repos /path/to/corpus`. Directories without `.git` or code manifests are automatically classified as `docs` collections (supporting `.gattignore` exclusions).
 - **Windows (Docker Desktop):** drive paths like `C:\Users\you\code` are mapped automatically to `/host/c/Users/you/code` across `gatt docker up`, `gatt install --http`, and `gatt notify`.
 - **Manage the container:** `gatt docker status`, `gatt docker logs -f`, `gatt docker pull`, `gatt docker down` (named volumes `gatt-data` and `gatt-cache` are preserved).
 - **Local build:** `GATT_MOUNT_ROOT=$HOME docker compose up -d --build`.
@@ -51,7 +52,7 @@ gatt install --http http://127.0.0.1:7788
 ## Standalone CLI / stdio MCP (without Docker)
 
 ```bash
-gatt extract codebase .                   # or: extract sqlite|postgres|openapi ...
+gatt extract codebase .                   # or: extract docs|sqlite|postgres|openapi ...
 gatt index                                # embed nodes (optional; keyword search works without)
 gatt install                              # register stdio MCP server in Claude Code / Antigravity
 ```
@@ -60,6 +61,8 @@ Query directly from the terminal (the MCP tools expose the same operations):
 
 ```bash
 gatt code-query "how does incremental refresh work"       # functions, callers, docs in one pack
+gatt doc-query "how to configure Okta SSO"                # hybrid Q&A over PDF/DOCX/MD/TXT with confidence signal
+gatt doc-guide "configure Slack subscriber token"         # full canonical doc pack + screenshots + variants for authoring guides
 gatt impact saveSQLite --depth 3                          # what breaks if this signature changes
 gatt blast shared/schema.json --depth 2                   # callers, importers, co-change companions
 gatt grep "TODO(#42)" --limit 0 --exclude '*_test.go'     # exhaustive scan: zero hits = proof of absence

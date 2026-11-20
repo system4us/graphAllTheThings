@@ -10,6 +10,8 @@
 | `join_path` | Cheapest FK path between two tables with exact join columns — a ready `JOIN ... ON ...` hint (or the `$ref` chain between two API schemas). Routes around hub tables (`tenant_id`-style FKs every table carries), which a naive shortest path would cut through, producing semantically wrong joins. |
 | `sql_context` | One-shot context pack for a data question: most relevant tables/schemas fully described. Feed straight into SQL generation. |
 | `code_context` | One-shot context pack for a code question: relevant functions, types, docs with `file:line` and call graph. Supports optional `max_tokens`. |
+| `doc_context` | Hybrid Q&A over a document collection (PDF, DOCX, Markdown, TXT) with section/page citations, reading-order grouping, backward/forward expansion, and `Confidence: high\|medium\|low` (returns 0 passages on low confidence). Falls back to markdown docs on codebase repos. |
+| `doc_guide` | Structured source pack for authoring user guides: returns top 1–2 canonical documents in full reading order (or a centered window for large manuals), referenced screenshot filenames, modification dates, and related/variant documents listed separately. |
 | `read_symbols` | Batch-read full source bodies (with line numbers) and annotations (`entity_note`, `invariant`, `gotcha`) for 1..N symbols in one call. |
 | `trace_path` | Shortest execution/data-flow path between two codebase nodes across routes, calls, event dispatch (`emits "event"`), `sqlc` queries, ORM models, and shared state. |
 | `affected_tests` | Minimal set of test files, test functions, and ready-to-run test commands impacted by a file, symbol, or git diff. |

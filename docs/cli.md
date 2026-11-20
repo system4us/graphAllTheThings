@@ -8,6 +8,12 @@ gatt query "how many messages did each client send this month"
 gatt code-query "how does incremental refresh work"
                                           # context pack: functions (signature, file:line,
                                           # callers/callees, doc), types, docs
+gatt doc-query "how to configure Okta SSO"
+                                          # hybrid Q&A over PDF/DOCX/MD/TXT with section/page
+                                          # citations and Confidence: high|medium|low
+gatt doc-guide "configure Slack subscriber token"
+                                          # full canonical document pack (reading order, screenshots,
+                                          # centered window for large manuals, related variants)
 gatt impact saveSQLite --depth 3          # transitive callers: what breaks on a signature
                                           # change; test callers tagged [test]
 gatt blast shared/schemas/product.json    # blast radius of a file: callers + importers +
