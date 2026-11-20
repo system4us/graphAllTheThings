@@ -78,7 +78,12 @@ func (e *Engine) DocContextPackWithBudget(ctx context.Context, question string, 
 	// the top hit and that lack query-term overlap (prevents stray unrelated
 	// product docs from mixing into focused answers).
 	qTerms := docContentTerms(question)
-	hits := filterOffTopicDocHits(e.G, res.Hits, qTerms, method)
+	literals := extractLiteralTokens(question)
+	hits := res.Hits
+	if len(literals) > 0 {
+		hits = boostLiteralDocHits(e.G, hits, literals)
+	}
+	hits = filterOffTopicDocHits(e.G, hits, qTerms, method)
 
 	// Detect low-confidence results: require real multi-term whole-word
 	// coverage (filtering ES/EN stopwords so "las" never matches "class" and
@@ -151,14 +156,31 @@ func (e *Engine) DocContextPackWithBudget(ctx context.Context, question string, 
 		}
 
 		body := strings.TrimSpace(n.Attrs["text"])
+
+		// Backward graph expansion: if this chunk starts mid-sentence (lowercase
+		// first letter, e.g. "...the key and the certificate..."), prepend the
+		// preceding chunk in the same section so commands/steps aren't cut off.
+		if n.Type == graph.NodeChunk && startsMidSentence(body) {
+			if prev := e.prevSameSectionChunk(n); prev != nil && !seen[prev.ID] {
+				if prevTxt := strings.TrimSpace(prev.Attrs["text"]); prevTxt != "" {
+					seen[prev.ID] = true
+					tail := stripChunkOverlap(prevTxt, body)
+					if tail != "" {
+						body = prevTxt + "\n" + tail
+					} else {
+						body = prevTxt
+					}
+				}
+			}
+		}
+
 		if body != "" {
 			b.WriteString(body)
 			b.WriteByte('\n')
 		}
 
-		// Graph expansion: if this is a chunk, append the non-overlapping tail
-		// of its immediate NEXT neighbor in the same section so answers aren't
-		// clipped at a chunk boundary or repeated.
+		// Forward graph expansion: append the non-overlapping tail of the
+		// immediate NEXT neighbor in the same section.
 		if n.Type == graph.NodeChunk {
 			if next := e.nextSameSectionChunk(n); next != nil && !seen[next.ID] {
 				if nextTxt := strings.TrimSpace(next.Attrs["text"]); nextTxt != "" {
@@ -735,7 +757,12 @@ func (e *Engine) DocGuidePackWithBudget(ctx context.Context, topic string, maxDo
 	}
 
 	qTerms := docContentTerms(topic)
-	hits := filterOffTopicDocHits(e.G, res.Hits, qTerms, method)
+	literals := extractLiteralTokens(topic)
+	hits := res.Hits
+	if len(literals) > 0 {
+		hits = boostLiteralDocHits(e.G, hits, literals)
+	}
+	hits = filterOffTopicDocHits(e.G, hits, qTerms, method)
 	confidence, missing := analyzeDocConfidence(e.G, hits, qTerms, method, 8)
 
 	var b strings.Builder
@@ -757,10 +784,11 @@ func (e *Engine) DocGuidePackWithBudget(ctx context.Context, topic string, maxDo
 
 	// Score documents by aggregating their top chunk hits + filename/title match.
 	type docScore struct {
-		file  string
-		docID string
-		score float64
-		hits  int
+		file       string
+		docID      string
+		score      float64
+		hits       int
+		anchorIdx  int // chunk_index of the highest-ranked hit in this document
 	}
 	byFile := map[string]*docScore{}
 	for rank, h := range hits {
@@ -774,10 +802,14 @@ func (e *Engine) DocGuidePackWithBudget(ctx context.Context, topic string, maxDo
 		}
 		ds := byFile[f]
 		if ds == nil {
-			ds = &docScore{file: f, docID: "doc:" + f}
+			idx, _ := strconv.Atoi(n.Attrs["chunk_index"])
+			ds = &docScore{file: f, docID: "doc:" + f, anchorIdx: idx}
 			byFile[f] = ds
 		}
 		ds.score += 1.0 / float64(5+rank)
+		if len(literals) > 0 && chunkContainsAnyLiteral(n, literals) {
+			ds.score += 2.0
+		}
 		ds.hits++
 	}
 	var ranked []*docScore
@@ -833,7 +865,7 @@ func (e *Engine) DocGuidePackWithBudget(ctx context.Context, topic string, maxDo
 			fmt.Fprintf(&b, "Screenshots referenced: %s\n", docNode.Attrs["images"])
 		}
 		b.WriteByte('\n')
-		b.WriteString(e.reconstructDocumentText(ds.docID))
+		b.WriteString(e.reconstructDocumentForGuide(ds.docID, ds.anchorIdx))
 		b.WriteByte('\n')
 	}
 
@@ -849,6 +881,78 @@ func (e *Engine) DocGuidePackWithBudget(ctx context.Context, topic string, maxDo
 	}
 
 	return TrimToTokenBudget(b.String(), maxTokens), nil
+}
+
+// reconstructDocumentForGuide returns the full document in reading order for
+// normal-sized documents (<= 14 chunks). For large manuals (e.g. a 300-page
+// User Guide with hundreds of chunks), it returns a centered reading-order
+// window around anchorIdx (±4 chunks) so the relevant procedure is complete
+// without overflowing the token budget from page 1.
+func (e *Engine) reconstructDocumentForGuide(docID string, anchorIdx int) string {
+	var allChunks []*graph.Node
+	for _, ed := range e.G.EdgesOf(docID) {
+		if ed.Type == graph.EdgeHasSection && ed.From == docID {
+			for _, ced := range e.G.EdgesOf(ed.To) {
+				if ced.Type == graph.EdgeHasChunk && ced.From == ed.To {
+					if cn := e.G.Nodes[ced.To]; cn != nil {
+						allChunks = append(allChunks, cn)
+					}
+				}
+			}
+		}
+	}
+	if len(allChunks) <= 14 || anchorIdx <= 0 {
+		return e.reconstructDocumentText(docID)
+	}
+
+	sort.Slice(allChunks, func(i, j int) bool {
+		ci, _ := strconv.Atoi(allChunks[i].Attrs["chunk_index"])
+		cj, _ := strconv.Atoi(allChunks[j].Attrs["chunk_index"])
+		return ci < cj
+	})
+
+	pos := 0
+	for i, ch := range allChunks {
+		if ci, _ := strconv.Atoi(ch.Attrs["chunk_index"]); ci == anchorIdx {
+			pos = i
+			break
+		}
+	}
+	lo := max(0, pos-4)
+	hi := min(len(allChunks), pos+5)
+
+	var b strings.Builder
+	loIdx := allChunks[lo].Attrs["chunk_index"]
+	hiIdx := allChunks[hi-1].Attrs["chunk_index"]
+	fmt.Fprintf(&b, "*(Large document: showing reading-order window around matching section — chunks #%s–#%s of %d)*\n\n", loIdx, hiIdx, len(allChunks))
+
+	prevSec := ""
+	prevTxt := ""
+	for _, ch := range allChunks[lo:hi] {
+		sec := ch.Attrs["section"]
+		if sec != "" && sec != prevSec {
+			pageRef := formatPageRef(ch.Attrs["page_start"], ch.Attrs["page_end"])
+			if pageRef != "" {
+				fmt.Fprintf(&b, "### %s (%s)\n", sec, pageRef)
+			} else {
+				fmt.Fprintf(&b, "### %s\n", sec)
+			}
+			prevSec = sec
+		}
+		txt := strings.TrimSpace(ch.Attrs["text"])
+		if txt == "" {
+			continue
+		}
+		if prevTxt != "" {
+			txt = stripChunkOverlap(prevTxt, txt)
+		}
+		if txt != "" {
+			b.WriteString(txt)
+			b.WriteString("\n\n")
+		}
+		prevTxt = strings.TrimSpace(ch.Attrs["text"])
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // reconstructDocumentText walks document -> HAS_SECTION -> HAS_CHUNK in exact
@@ -990,6 +1094,111 @@ func (e *Engine) nextSameSectionChunk(n *graph.Node) *graph.Node {
 		}
 	}
 	return nil
+}
+
+func (e *Engine) prevSameSectionChunk(n *graph.Node) *graph.Node {
+	for _, ed := range e.G.EdgesOf(n.ID) {
+		if ed.Type == graph.EdgeNext && ed.To == n.ID {
+			other := e.G.Nodes[ed.From]
+			if other != nil && other.Type == graph.NodeChunk &&
+				other.Attrs["file"] == n.Attrs["file"] &&
+				other.Attrs["section"] == n.Attrs["section"] {
+				return other
+			}
+		}
+	}
+	return nil
+}
+
+func startsMidSentence(s string) bool {
+	for _, r := range strings.TrimSpace(s) {
+		return unicode.IsLower(r)
+	}
+	return false
+}
+
+// extractLiteralTokens pulls dotted technical filenames/identifiers from a
+// query (e.g. "appfirewall.pem", "proxy.pem", "config.yaml") so exact literal
+// chunk matches beat partial filename prefix matches like "AppFirewallCore".
+func extractLiteralTokens(query string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range strings.Fields(query) {
+		tok := strings.Trim(raw, "\"'`()[]{}<>,;:!?")
+		dot := strings.IndexByte(tok, '.')
+		if dot <= 0 || dot >= len(tok)-1 {
+			continue
+		}
+		// Require letters on both sides of the dot (avoids version numbers like "4.3").
+		left, right := tok[:dot], tok[dot+1:]
+		hasLeftLetter, hasRightLetter := false, false
+		for _, r := range left {
+			if unicode.IsLetter(r) {
+				hasLeftLetter = true
+				break
+			}
+		}
+		for _, r := range right {
+			if unicode.IsLetter(r) {
+				hasRightLetter = true
+				break
+			}
+		}
+		if !hasLeftLetter || !hasRightLetter {
+			continue
+		}
+		low := strings.ToLower(tok)
+		if !seen[low] {
+			seen[low] = true
+			out = append(out, low)
+		}
+	}
+	return out
+}
+
+func chunkContainsAnyLiteral(n *graph.Node, literals []string) bool {
+	if n == nil || len(literals) == 0 {
+		return false
+	}
+	low := strings.ToLower(n.Attrs["text"] + " " + n.Attrs["section"] + " " + n.Attrs["file"])
+	for _, lit := range literals {
+		if strings.Contains(low, lit) {
+			return true
+		}
+	}
+	return false
+}
+
+// boostLiteralDocHits ensures chunks that literally contain a dotted filename
+// from the query (e.g. "appfirewall.pem") are prioritized ahead of partial
+// matches (e.g. "AppFirewallCore").
+func boostLiteralDocHits(g *graph.Graph, hits []FindHit, literals []string) []FindHit {
+	var exact, rest []FindHit
+	seen := map[string]bool{}
+	for _, h := range hits {
+		seen[h.ID] = true
+		if chunkContainsAnyLiteral(g.Nodes[h.ID], literals) {
+			exact = append(exact, h)
+		} else {
+			rest = append(rest, h)
+		}
+	}
+	// Also scan chunk nodes for exact literal matches that may have missed top-N.
+	var extra []*graph.Node
+	for _, n := range g.NodesByType(graph.NodeChunk) {
+		if !seen[n.ID] && chunkContainsAnyLiteral(n, literals) {
+			extra = append(extra, n)
+		}
+	}
+	for _, n := range extra {
+		exact = append(exact, FindHit{
+			ID: n.ID, Type: n.Type, Name: n.Name, Score: 1.0, Text: g.NodeText(n.ID),
+		})
+	}
+	if len(exact) == 0 {
+		return hits
+	}
+	return append(exact, rest...)
 }
 
 func formatPageRef(start, end string) string {

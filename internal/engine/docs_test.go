@@ -214,6 +214,48 @@ Direct webhook setup for Slack.
 	}
 }
 
+func TestDocGuideLargeManualCenteredWindow(t *testing.T) {
+	dir := t.TempDir()
+	var sb strings.Builder
+	sb.WriteString("# Giant User Guide\n\n")
+	for i := 1; i <= 25; i++ {
+		if i == 18 {
+			sb.WriteString("Section 4.3.2 Creating a Private CA:\nopenssl genrsa -out datasunrise_gui.key 2048\nopenssl req -new -key datasunrise_gui.key -out datasunrise_gui.csr\n\n")
+		} else if i == 19 {
+			sb.WriteString("Copy the key and certificate to appfirewall.pem:\ncat datasunrise_gui.key > /opt/datasunrise/appfirewall.pem\nchmod 600 /opt/datasunrise/appfirewall.pem\n\n")
+		} else {
+			sb.WriteString(strings.Repeat("Generic filler chapter text about database monitoring and audit trails. ", 8) + "\n\n")
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manual.md"), []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AppFirewallCore_Params.md"), []byte("# AppFirewallCore Command Line Parameters\n\nAntlrTrace flag for debugging.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g, err := docs.New(dir).Extract(context.Background())
+	if err != nil {
+		t.Fatalf("Extract failed: %v", err)
+	}
+	e := New(g, nil, nil)
+	out, err := e.DocGuidePackWithBudget(context.Background(), "appfirewall.pem", 1, 4000)
+	if err != nil {
+		t.Fatalf("DocGuidePackWithBudget failed: %v", err)
+	}
+	if !strings.Contains(out, "Canonical Source 1: manual.md") {
+		t.Errorf("expected manual.md (containing exact literal appfirewall.pem) as Canonical Source 1:\n%s", out)
+	}
+	if !strings.Contains(out, "Large document: showing reading-order window") {
+		t.Errorf("expected centered window header for large document:\n%s", out)
+	}
+	if !strings.Contains(out, "openssl genrsa -out datasunrise_gui.key") {
+		t.Errorf("expected preceding OpenSSL command included in centered window:\n%s", out)
+	}
+	if !strings.Contains(out, "chmod 600 /opt/datasunrise/appfirewall.pem") {
+		t.Errorf("expected appfirewall.pem command included in centered window:\n%s", out)
+	}
+}
+
 func TestFilterOffTopicDocHits(t *testing.T) {
 	g := graph.New("docs:/tmp/corpus")
 	g.AddNode(&graph.Node{
