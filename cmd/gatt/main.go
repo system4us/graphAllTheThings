@@ -212,6 +212,7 @@ vectors live in-process (vectors.json next to the graph); --qdrant URL opts into
 }
 
 func cmdExtract(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 2)
 	if len(args) < 2 {
 		return fmt.Errorf("usage: gatt extract sqlite|postgres|openapi|codebase <source> [--out PATH] [--check]")
 	}
@@ -312,6 +313,7 @@ func cmdExtract(ctx context.Context, args []string) error {
 // the spec — the cheap "update" an agent runs after editing code. Operates on
 // the raw graph so curated annotations stay in their sidecar.
 func cmdEnrich(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf("usage: gatt enrich <repo-root> [--graph PATH]")
 	}
@@ -373,6 +375,44 @@ func warnOrphanAnnotations(graphPath string, removed []string, ng *graph.Graph) 
 			fmt.Fprintf(os.Stderr, "warning: annotation for removed node %q will be ignored (gatt annotate %s --clear to remove)\n", id, id)
 		}
 	}
+}
+
+// cliBoolFlags are the gatt flags that take no value — every other flag
+// consumes the next argument when written as "--name value".
+var cliBoolFlags = map[string]bool{
+	"all": true, "bind-any": true, "check": true, "clear": true, "f": true, "full": true,
+	"mcp": true, "no-embed": true, "no-semantic": true, "path": true, "pull": true,
+	"regex": true, "scan": true, "skill": true, "update": true, "v": true, "h": true, "help": true,
+}
+
+// hoistPositionals moves the first n positional arguments to the front, so
+// flags may come before, between or after them: `gatt trace --graph g.db a b`
+// and `gatt trace a b --graph g.db` both parse. Go's flag package stops at the
+// first positional, which made a leading --graph swallow the arguments.
+func hoistPositionals(args []string, n int) []string {
+	var pos, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if len(pos) >= n || a == "-" || !strings.HasPrefix(a, "-") {
+			if len(pos) < n && a != "--" {
+				pos = append(pos, a)
+				continue
+			}
+			rest = append(rest, a)
+			continue
+		}
+		if a == "--" {
+			rest = append(rest, args[i:]...)
+			break
+		}
+		rest = append(rest, a)
+		name := strings.TrimLeft(a, "-")
+		if !strings.Contains(name, "=") && !cliBoolFlags[name] && i+1 < len(args) {
+			i++
+			rest = append(rest, args[i])
+		}
+	}
+	return append(pos, rest...)
 }
 
 func indexFlags(fs *flag.FlagSet) (graphPath, qdURL, coll, embURL, embModel *string) {
@@ -627,6 +667,7 @@ func cmdIndex(ctx context.Context, args []string) error {
 }
 
 func cmdSearch(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf("usage: gatt search <query> [flags]")
 	}
@@ -657,6 +698,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 }
 
 func cmdQuery(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf(`usage: gatt query "<question>" [flags]`)
 	}
@@ -682,6 +724,7 @@ func cmdQuery(ctx context.Context, args []string) error {
 }
 
 func cmdPath(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 2)
 	if len(args) < 2 {
 		return fmt.Errorf("usage: gatt path <tableA> <tableB> [flags]")
 	}
@@ -713,6 +756,7 @@ func cmdPath(ctx context.Context, args []string) error {
 }
 
 func cmdExplain(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf("usage: gatt explain <table|column|view|index> [flags]")
 	}
@@ -752,6 +796,7 @@ func cmdExplain(ctx context.Context, args []string) error {
 // (what an entity canonically means, the default filter to apply) so the
 // agent writes the right query without asking. Re-running `extract` keeps them.
 func cmdAnnotate(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf(`usage: gatt annotate <node> key=value ... | <node> --clear [--graph PATH]
   common keys: entity_note (business definition), default_filter (canonical WHERE)
@@ -1256,6 +1301,7 @@ Your goal is to populate gatt.spec.json, definitions.json, and relations.json wi
 // cmdImpact prints the transitive callers of a function — what breaks if its
 // signature changes.
 func cmdImpact(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf("usage: gatt impact <function-name-or-id> [--depth N]")
 	}
@@ -1282,6 +1328,7 @@ func cmdImpact(ctx context.Context, args []string) error {
 // cmdBlast prints the blast radius of modifying any node — file, function or
 // type: transitive callers, importers, regenerated outputs and diverged copies.
 func cmdBlast(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf("usage: gatt blast <file-path|function-name|node-id> [--depth N]")
 	}
@@ -1419,6 +1466,7 @@ func cmdGrep(ctx context.Context, args []string) error {
 // annotated with its doc summary — a scan of repo structure without an
 // ls+Read round-trip per file.
 func cmdTree(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	var path string
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		path = args[0]
@@ -1492,6 +1540,7 @@ func cmdModels(ctx context.Context, args []string) error {
 // (default HEAD): added/removed/changed/renamed/moved functions and types,
 // plus the current callers of anything that changed.
 func cmdDiff(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	var ref string
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		ref = args[0]
@@ -1517,6 +1566,7 @@ func cmdDiff(ctx context.Context, args []string) error {
 }
 
 func cmdCodeQuery(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	if len(args) < 1 {
 		return fmt.Errorf(`usage: gatt code-query "<question>" [flags]`)
 	}
@@ -1544,6 +1594,7 @@ func cmdCodeQuery(ctx context.Context, args []string) error {
 }
 
 func cmdTrace(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 2)
 	if len(args) < 2 {
 		return fmt.Errorf("usage: gatt trace <from> <to> [--depth N] [--graph PATH]")
 	}
@@ -1568,6 +1619,7 @@ func cmdTrace(ctx context.Context, args []string) error {
 }
 
 func cmdAffectedTests(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	target := ""
 	flagArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -1614,6 +1666,7 @@ func cmdHotspots(ctx context.Context, args []string) error {
 }
 
 func cmdPreflight(ctx context.Context, args []string) error {
+	args = hoistPositionals(args, 1)
 	ref := "HEAD"
 	flagArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {

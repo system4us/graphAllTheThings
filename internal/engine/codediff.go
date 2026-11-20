@@ -17,8 +17,16 @@ import (
 // callers pulled from this engine's already-loaded graph ("who needs to
 // look at this"). Needs a git checkout.
 func (e *Engine) CodeDiff(ctx context.Context, ref string, limit int) (string, error) {
+	out, _, err := e.codeDiff(ctx, ref, limit)
+	return out, err
+}
+
+// codeDiff renders the structural diff and also returns it as data (nil when
+// there are no file changes or no structural change), so preflight can reuse
+// it without a second extraction of the old tree.
+func (e *Engine) codeDiff(ctx context.Context, ref string, limit int) (string, *graph.CodeDiff, error) {
 	if !e.IsCodebase() {
-		return "", fmt.Errorf("diff needs a codebase graph")
+		return "", nil, fmt.Errorf("diff needs a codebase graph")
 	}
 	if ref == "" {
 		ref = "HEAD"
@@ -30,10 +38,10 @@ func (e *Engine) CodeDiff(ctx context.Context, ref string, limit int) (string, e
 
 	pairs, err := codebase.GitChangedFiles(ctx, dir, ref)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if len(pairs) == 0 {
-		return fmt.Sprintf("no file changes since %s\n", ref), nil
+		return fmt.Sprintf("no file changes since %s\n", ref), nil, nil
 	}
 	renamed := map[string]string{}
 	for _, p := range pairs {
@@ -44,12 +52,12 @@ func (e *Engine) CodeDiff(ctx context.Context, ref string, limit int) (string, e
 
 	oldGraph, err := codebase.New(dir).ExtractAt(ctx, ref)
 	if err != nil {
-		return "", fmt.Errorf("extracting %s: %w", ref, err)
+		return "", nil, fmt.Errorf("extracting %s: %w", ref, err)
 	}
 
 	d := graph.DiffCode(oldGraph, e.G, pairs, renamed)
 	if d.Empty() {
-		return fmt.Sprintf("%d file(s) touched since %s, no function/type signature or doc changed\n", len(pairs), ref), nil
+		return fmt.Sprintf("%d file(s) touched since %s, no function/type signature or doc changed\n", len(pairs), ref), nil, nil
 	}
 
 	total := len(d.Changes)
@@ -84,7 +92,7 @@ func (e *Engine) CodeDiff(ctx context.Context, ref string, limit int) (string, e
 			fmt.Fprintf(&b, "    %d caller(s) may need review: %s\n", len(callers), strings.Join(callers, ", "))
 		}
 	}
-	return b.String(), nil
+	return b.String(), d, nil
 }
 
 func writeCodeChangeLine(b *strings.Builder, c graph.CodeChange) {

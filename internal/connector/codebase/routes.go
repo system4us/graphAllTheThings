@@ -26,6 +26,10 @@ var httpMethods = map[string]string{
 type routeArg struct {
 	raw        string
 	resolvedID string
+	// strict: drop the argument when it does not resolve to a function, never
+	// stub it — a wrapper's extra arguments (a privilege constant, a timeout)
+	// are not middleware.
+	strict bool
 }
 
 // routeInfo is one detected route registration, collected during parseFiles
@@ -517,6 +521,9 @@ func (c *Connector) wireRoutes(g *graph.Graph, funcsByName map[string][]string) 
 			}
 			if target := resolveCall(g, r.file, a.raw, funcsByName); target != "" {
 				resolved = append(resolved, target)
+				continue
+			}
+			if a.strict {
 				continue
 			}
 			if len(funcsByName[a.raw]) > 1 {

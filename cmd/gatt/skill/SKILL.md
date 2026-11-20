@@ -82,7 +82,10 @@ gatt grep <pattern> [--regex] [--limit N] [--include glob] [--exclude glob] [--a
                                     # pass `--limit 0` for unlimited results during audits.
                                     # Lockfiles are skipped by default (`--all` includes them).
 gatt tree [path] [--depth N]        # directory tree annotated with each file's doc summary
-gatt routes [--file substr]         # HTTP routes found in code (Express JS/TS/JSX):
+gatt routes [--file substr]         # HTTP routes found in code (Express, Spring/ASP.NET,
+                                    # Go gin/chi/echo/net/http, Flask/FastAPI, and any
+                                    # call passing a whole "METHOD /path" literal, so
+                                    # custom registration wrappers count):
                                     # method, path, handler (incl. controller.method
                                     # refs), middleware chain, plus per route: the ORM
                                     # models its handler chain touches and the frontend
@@ -104,7 +107,9 @@ gatt diff [ref] [--limit N]         # structural diff vs a git ref (default HEAD
                                     # plus current callers of anything that changed
 gatt trace <from> <to> [--depth N]  # shortest execution/data-flow path between two nodes
                                     # (HTTP routes, functions, event emitters/listeners,
-                                    # sqlc queries, ORM models, files)
+                                    # sqlc queries, ORM models, files); if none, the
+                                    # reversed path, else the common caller / shared
+                                    # dependency — labelled, never routed through tests
 gatt affected-tests [target]        # minimal test files + ready-to-run commands impacted
                                     # by a file, symbol, or current git diff (omit target)
 gatt hotspots [--limit N]           # rank files by recent git churn × graph connectivity

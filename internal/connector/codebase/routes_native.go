@@ -37,11 +37,83 @@ var (
 func (c *Connector) detectNativeRoute(g *graph.Graph, nameNode *sitter.Node, callName, relPath, fileID, ext string, data []byte) bool {
 	switch ext {
 	case ".go":
-		return c.detectGoRoute(g, nameNode, callName, relPath, fileID, data)
+		if c.detectGoRoute(g, nameNode, callName, relPath, fileID, data) {
+			return true
+		}
 	case ".py":
-		return c.detectPyRoute(g, nameNode, callName, relPath, fileID, data)
+		if c.detectPyRoute(g, nameNode, callName, relPath, fileID, data) {
+			return true
+		}
 	}
-	return false
+	return c.detectPatternRoute(g, nameNode, callName, relPath, fileID, data)
+}
+
+// methodPathRe matches a route pattern literal that carries its own method —
+// "GET /api/status", "POST /orders/{id}" (Go 1.22 ServeMux syntax, and what
+// in-house registration wrappers in any language pass along).
+var methodPathRe = regexp.MustCompile(`^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (/\S*)$`)
+
+// testCallNames are test-framework calls whose first argument is a test
+// title, which is often written like a route ("GET /users returns 200").
+var testCallNames = map[string]bool{
+	"it": true, "test": true, "describe": true, "context": true, "Run": true, "run": true,
+	"step": true, "scenario": true, "suite": true, "Describe": true, "It": true, "When": true,
+}
+
+// detectPatternRoute is the language-agnostic registration probe: any call
+// whose first argument is a whole "METHOD /path" literal registers a route,
+// whatever the call is named — mux.HandleFunc, a local handle(pattern, priv,
+// h) closure, router.add, register_route. The literal is the evidence; the
+// handler is the last later argument that resolves to a function (arguments
+// that don't — privilege constants, options — are dropped, not stubbed).
+func (c *Connector) detectPatternRoute(g *graph.Graph, nameNode *sitter.Node, callName, relPath, fileID string, data []byte) bool {
+	if isTestPath(relPath) {
+		return false
+	}
+	name := strings.TrimPrefix(callName, ".")
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	if testCallNames[name] {
+		return false
+	}
+	callNode := enclosingCallNode(nameNode)
+	if callNode == nil {
+		return false
+	}
+	argsNode := callArguments(callNode)
+	if argsNode == nil {
+		return false
+	}
+	argNodes := unwrapArgs(argsNode)
+	if len(argNodes) == 0 || !isStringNode(argNodes[0]) {
+		return false
+	}
+	m := methodPathRe.FindStringSubmatch(strings.Trim(argNodes[0].Content(data), "\"'`"))
+	if m == nil {
+		return false
+	}
+	path := normalizeClientPath(`"` + m[2] + `"`)
+	var rargs []routeArg
+	for _, n := range argNodes[1:] {
+		if ident := extractHandlerIdent(n, data); ident != "" {
+			rargs = append(rargs, routeArg{raw: ident, strict: true})
+		}
+	}
+	c.emitNativeRoute(g, m[1], path, relPath, fileID, int(callNode.StartPoint().Row)+1, rargs)
+	return true
+}
+
+// isTestPath reports a test file by the common naming conventions.
+func isTestPath(p string) bool {
+	base := p
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		base = p[i+1:]
+	}
+	return strings.Contains(base, "_test.") || strings.Contains(base, ".test.") || strings.Contains(base, ".spec.") ||
+		strings.HasPrefix(base, "test_") || strings.Contains(p, "__tests__/") || strings.HasPrefix(p, "test/") ||
+		strings.Contains(p, "/test/") || strings.HasPrefix(p, "tests/") || strings.Contains(p, "/tests/") ||
+		strings.Contains(p, "/e2e/") || strings.HasPrefix(p, "e2e/")
 }
 
 func (c *Connector) detectGoRoute(g *graph.Graph, nameNode *sitter.Node, callName, relPath, fileID string, data []byte) bool {

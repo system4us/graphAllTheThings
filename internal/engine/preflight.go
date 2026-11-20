@@ -98,7 +98,8 @@ func (e *Engine) PreflightCheck(ctx context.Context, ref string, maxTokens int) 
 	}
 
 	// 2. Structural code diff
-	if diffOut, err := e.CodeDiff(ctx, ref, 25); err == nil && strings.TrimSpace(diffOut) != "" {
+	diffOut, diff, err := e.codeDiff(ctx, ref, 25)
+	if err == nil && strings.TrimSpace(diffOut) != "" {
 		b.WriteString("## Structural Diff\n")
 		b.WriteString(strings.TrimSpace(diffOut))
 		b.WriteString("\n\n")
@@ -111,35 +112,64 @@ func (e *Engine) PreflightCheck(ctx context.Context, ref string, maxTokens int) 
 		b.WriteString("\n\n")
 	}
 
-	// 4. Docs referencing any changed file/symbol
-	var touchedDocs []string
-	docSeen := map[string]bool{}
+	// 4. Docs that mention what actually changed: a symbol whose signature or
+	// doc changed (or was renamed/moved), or a changed file by path. A doc
+	// that merely mentions some other symbol of an edited file is not affected
+	// by the edit — listing those made every README show up on every diff.
+	changedIDs := map[string]string{} // node id -> what to call it
+	if diff != nil {
+		for _, c := range diff.Changes {
+			if c.NewID != "" && c.Kind != graph.CodeAdded {
+				changedIDs[c.NewID] = "symbol " + c.NewName
+			}
+		}
+	}
+	reasons := map[string][]string{}
 	for _, ed := range e.G.Edges {
 		if ed.Type != graph.EdgeMentions {
 			continue
 		}
-		tn := e.G.Nodes[ed.To]
-		dn := e.G.Nodes[ed.From]
-		if tn == nil || dn == nil {
+		tn, dn := e.G.Nodes[ed.To], e.G.Nodes[ed.From]
+		if tn == nil || dn == nil || changedFiles[filepath.ToSlash(dn.Name)] || changedFiles[filepath.ToSlash(dn.Attrs["file"])] {
 			continue
 		}
-		tf := filepath.ToSlash(tn.Attrs["file"])
-		if tf == "" && tn.Type == graph.NodeFile {
-			tf = filepath.ToSlash(tn.Name)
+		why := changedIDs[tn.ID]
+		if why == "" && tn.Type == graph.NodeFile && changedFiles[filepath.ToSlash(tn.Name)] && !isProseDoc(tn.Name) {
+			why = "file " + tn.Name
 		}
-		if changedFiles[tf] && !changedFiles[filepath.ToSlash(dn.Name)] && !docSeen[dn.Name] {
-			docSeen[dn.Name] = true
-			touchedDocs = append(touchedDocs, dn.Name)
+		if why != "" {
+			reasons[dn.Name] = append(reasons[dn.Name], why)
 		}
 	}
-	sort.Strings(touchedDocs)
-	if len(touchedDocs) > 0 {
+	if len(reasons) > 0 {
+		docs := make([]string, 0, len(reasons))
+		for d := range reasons {
+			docs = append(docs, d)
+		}
+		sort.Strings(docs)
 		b.WriteString("## Docs Potentially Affected\n")
-		for _, d := range touchedDocs {
-			fmt.Fprintf(&b, "- %s (mentions symbols in changed files)\n", d)
+		for _, d := range docs {
+			why := dedupeStrings(reasons[d])
+			if len(why) > 3 {
+				why = append(why[:3], fmt.Sprintf("+%d more", len(why)-3))
+			}
+			fmt.Fprintf(&b, "- %s (mentions changed %s)\n", d, strings.Join(why, ", "))
 		}
 		b.WriteString("\n")
 	}
 
 	return TrimToTokenBudget(b.String(), maxTokens), nil
+}
+
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

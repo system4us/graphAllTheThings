@@ -206,7 +206,7 @@ func (e *Engine) Find(ctx context.Context, query, nodeType string, limit int) (F
 		method, hits, err := e.semanticSearch(ctx, query, nodeType, fetchLimit)
 		if err == nil {
 			kwRes := e.keywordFind(query, nodeType, fetchLimit)
-			terms := strings.Fields(strings.ToLower(query))
+			terms := graph.QueryTerms(query)
 
 			type fused struct {
 				hit   FindHit
@@ -350,7 +350,10 @@ func (e *Engine) semanticSearch(ctx context.Context, query, nodeType string, lim
 }
 
 func (e *Engine) keywordFind(query, typ string, limit int) FindResult {
-	terms := strings.Fields(strings.ToLower(query))
+	terms := graph.QueryTerms(query)
+	for i, t := range terms {
+		terms[i] = graph.Stem(t) // substring match: "verif" finds verify/verified
+	}
 
 	if e.FTS != nil {
 		if ids := e.FTS(query, typ, limit); len(ids) > 0 {

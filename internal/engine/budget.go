@@ -32,11 +32,13 @@ func TrimToTokenBudget(text string, maxTokens int) string {
 // CodeContextPackWithBudget is CodeContextPack with an optional approximate
 // token budget (0 = default unbudgeted pack).
 func (e *Engine) CodeContextPackWithBudget(ctx context.Context, question string, limit, maxTokens int) (string, error) {
-	out, err := e.CodeContextPack(ctx, question, limit)
+	out, err := e.codeContextPack(ctx, question, limit, maxTokens)
 	if err != nil {
 		return "", err
 	}
-	return TrimToTokenBudget(out, maxTokens), nil
+	// The pack already chose whole sections by priority; this only catches a
+	// single section larger than the whole budget.
+	return TrimToTokenBudget(out, maxTokens+maxTokens/10), nil
 }
 
 // ContextPackWithBudget is ContextPack with an optional approximate token

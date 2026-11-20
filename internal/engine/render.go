@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"graphallthethings/internal/graph"
 )
@@ -644,46 +646,151 @@ const coverageSampleCap = 400
 // Over-flagging is fine (a same-named identifier, a comment, a string that
 // happens to contain the word): the cost of a false alarm is one glance;
 // the cost of silence was two shipped false negatives.
-func (e *Engine) coverageNote(name string, directWired int) string {
-	hits, total, _, err := e.grepScan(name, GrepOptions{Limit: coverageSampleCap})
+//
+// A hit is accounted for — and never counted — when it sits inside a wired
+// direct caller's line range, inside the target's own declaration, on an
+// import line, on a comment-only line, or in a prose doc. Matching is on
+// whole words, so InsertEventParams is not a mention of InsertEvent. The
+// sample shows call-shaped lines (`Name(`) first and production files before
+// tests: the one line most likely to be the missed caller comes first.
+func (e *Engine) coverageNote(target *graph.Node, directCallers []*graph.Node) string {
+	name := target.Name
+	if name == "" {
+		return ""
+	}
+	opts := GrepOptions{Limit: coverageSampleCap}
+	pattern := name
+	if isWordName(name) {
+		pattern, opts.Regex = `\b`+regexp.QuoteMeta(name)+`\b`, true
+	}
+	hits, total, _, err := e.grepScan(pattern, opts)
 	if err != nil || total == 0 {
 		return ""
 	}
-	filesWithHit := map[string]bool{}
-	var sample []GrepHit
-	for _, h := range hits {
-		t := strings.TrimSpace(h.Text)
-		if strings.HasPrefix(t, "import ") || strings.HasPrefix(t, "import(") || strings.HasPrefix(t, "from ") {
-			continue // structural noise: every wired call site has one too
+	type span struct{ from, to int }
+	accounted := map[string][]span{}
+	wholeFile := map[string]bool{}
+	addSpan := func(n *graph.Node) {
+		if n == nil {
+			return
 		}
-		if !filesWithHit[h.Path] {
-			filesWithHit[h.Path] = true
-			sample = append(sample, h)
+		if n.Type == graph.NodeFile {
+			wholeFile[n.Name] = true
+			return
+		}
+		ls, _ := strconv.Atoi(n.Attrs["line_start"])
+		le, _ := strconv.Atoi(n.Attrs["line_end"])
+		if le < ls {
+			le = ls
+		}
+		if f := n.Attrs["file"]; f != "" && ls > 0 {
+			accounted[f] = append(accounted[f], span{ls, le})
 		}
 	}
-	fileCount := len(filesWithHit)
-	degraded := total >= coverageSampleCap // some occurrences were never fetched
-	extra := fileCount - directWired
-	if extra <= 0 {
+	addSpan(target)
+	for _, c := range directCallers {
+		addSpan(c)
+	}
+	isAccounted := func(h GrepHit) bool {
+		if wholeFile[h.Path] || isProseDoc(h.Path) {
+			return true
+		}
+		t := strings.TrimSpace(h.Text)
+		if strings.HasPrefix(t, "import ") || strings.HasPrefix(t, "import(") || strings.HasPrefix(t, "from ") || isCommentLine(t) {
+			return true
+		}
+		for _, sp := range accounted[h.Path] {
+			if h.Line >= sp.from && h.Line <= sp.to {
+				return true
+			}
+		}
+		return false
+	}
+	callShape := regexp.MustCompile(`(^|[^\w$])` + regexp.QuoteMeta(name) + `\s*\(`)
+	rank := func(h GrepHit) int {
+		r := 0
+		if !callShape.MatchString(h.Text) {
+			r += 2
+		}
+		if IsTestFilePath(h.Path) {
+			r++
+		}
+		return r
+	}
+	best := map[string]GrepHit{}
+	for _, h := range hits {
+		if isAccounted(h) {
+			continue
+		}
+		if cur, ok := best[h.Path]; !ok || rank(h) < rank(cur) {
+			best[h.Path] = h
+		}
+	}
+	if len(best) == 0 {
 		return ""
 	}
-	if len(sample) > 3 {
-		sample = sample[:3]
+	sample := make([]GrepHit, 0, len(best))
+	for _, h := range best {
+		sample = append(sample, h)
+	}
+	sort.Slice(sample, func(i, j int) bool {
+		ri, rj := rank(sample[i]), rank(sample[j])
+		if ri != rj {
+			return ri < rj
+		}
+		if sample[i].Path != sample[j].Path {
+			return sample[i].Path < sample[j].Path
+		}
+		return sample[i].Line < sample[j].Line
+	})
+	extra := len(sample)
+	if len(sample) > 5 {
+		sample = sample[:5]
 	}
 	truncNote := ""
-	if degraded {
+	if total >= coverageSampleCap {
 		truncNote = ", sample truncated — could be more"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n⚠ coverage: %q shows up in %d more file(s) (%d file(s) total, import lines excluded%s) than the %d edge(s) above account for",
-		name, extra, fileCount, truncNote, directWired)
-	b.WriteString(" — could be an indirect call this analysis can't see (computed member access, .bind()/.call()/.apply(), " +
-		"an unhandled dispatch pattern), or just a same-named identifier/comment/string with no relation to this one. " +
-		"Worth a quick look before treating this as complete:\n")
+	fmt.Fprintf(&b, "\n⚠ coverage: %q appears in %d file(s) with no wired edge above (whole-word matches; the definition, wired callers, imports, comments and docs excluded%s)",
+		name, extra, truncNote)
+	b.WriteString(" — could be an indirect call this analysis can't see (a value whose type it can't follow, computed member access, " +
+		".bind()/.call()/.apply(), an unhandled dispatch pattern), or just a same-named identifier or string. " +
+		"Call-shaped lines first; worth a quick look before treating this as complete:\n")
 	for _, h := range sample {
-		fmt.Fprintf(&b, "    %s:%d: %s\n", h.Path, h.Line, h.Text)
+		fmt.Fprintf(&b, "    %s:%d: %s\n", h.Path, h.Line, strings.TrimSpace(h.Text))
 	}
 	return b.String()
+}
+
+// isWordName reports whether name is made only of identifier characters, so
+// a \b-delimited regex finds it as a whole word.
+func isWordName(name string) bool {
+	for _, r := range name {
+		if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return name != ""
+}
+
+// isCommentLine reports a line that is only a comment in the common syntaxes.
+func isCommentLine(t string) bool {
+	for _, p := range []string{"//", "#", "/*", "* ", "*/", "--", "<!--", `"""`, "'''"} {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+	return t == "*"
+}
+
+// isProseDoc reports documentation files whose mentions are never calls.
+func isProseDoc(p string) bool {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".md", ".mdx", ".txt", ".rst", ".adoc":
+		return true
+	}
+	return false
 }
 
 // modelMatches returns the ids of every NodeModel node with the given name.
@@ -784,7 +891,7 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 	visited := map[string]bool{id: true}
 	level := []string{id}
 	total := 0
-	directCount := 0
+	var directCallerNodes []*graph.Node
 	for d := 1; d <= depth && len(level) > 0; d++ {
 		var next []string
 		for _, cur := range level {
@@ -807,13 +914,11 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 			// several files' worth of "coverage" — counting edges here
 			// would make well-covered targets look under-covered by the
 			// file-based comparison and mask real gaps in the noise.
-			directFiles := map[string]bool{}
 			for _, cid := range next {
 				if cn := e.G.Nodes[cid]; cn != nil {
-					directFiles[callerFileKey(cn)] = true
+					directCallerNodes = append(directCallerNodes, cn)
 				}
 			}
-			directCount = len(directFiles)
 		}
 		label := "direct callers"
 		if d > 1 {
@@ -865,7 +970,7 @@ func (e *Engine) Impact(id string, depth int) (string, error) {
 	} else {
 		fmt.Fprintf(&b, "\ntotal affected: %d function(s) within depth %d\n", total, depth)
 	}
-	b.WriteString(e.coverageNote(n.Name, directCount))
+	b.WriteString(e.coverageNote(n, directCallerNodes))
 	b.WriteString(e.sharedStateText(id))
 	return b.String(), nil
 }
@@ -1249,15 +1354,15 @@ func (e *Engine) Blast(target string, depth int) (string, error) {
 		// one file can legitimately source many direct edges (several
 		// routes in one routes.ts using the same middleware) without that
 		// being several files' worth of coverage.
-		directFiles := map[string]bool{}
+		var directCallers []*graph.Node
 		for _, edgeType := range [...]string{graph.EdgeCalls, graph.EdgeHandledBy, graph.EdgeUsesMiddleware} {
 			for _, h := range byEdge[edgeType] {
 				if h.depth == 1 {
-					directFiles[callerFileKey(h.node)] = true
+					directCallers = append(directCallers, h.node)
 				}
 			}
 		}
-		b.WriteString(e.coverageNote(n.Name, len(directFiles)))
+		b.WriteString(e.coverageNote(n, directCallers))
 		b.WriteString(e.sharedStateText(n.ID))
 	}
 	return b.String(), nil
@@ -1332,25 +1437,57 @@ func (e *Engine) RenderDefinition(id string) (string, error) {
 // them compactly, and gives a complete orientation in one tool call instead of
 // many round-trips through the graph.
 func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int) (string, error) {
+	return e.codeContextPack(ctx, question, limit, 0)
+}
+
+// packSection is one rendered entry of a code context pack. kind orders the
+// output (types, functions, comments, docs/files); prio orders what a token
+// budget keeps — the best functions and types first, test code and prose last.
+type packSection struct {
+	kind int
+	prio int
+	seq  int
+	text string
+}
+
+// codeContextPack builds the pack. Ranking rules on top of Find's order:
+//   - production code before tests: a test function or a type declared in a
+//     test file fills a slot only after every non-test hit (unless the
+//     question is about tests), so "how does X work" answers with X;
+//   - the best floating comments get their own short section: a file-header
+//     comment ("Per-event hash chain…") often names the right file when no
+//     single function does;
+//   - with maxTokens > 0 the budget keeps whole sections by priority (top
+//     functions and types, then the rest, then comments and docs) and still
+//     prints them in the usual order — instead of cutting the tail, which
+//     dropped the functions because types come first.
+func (e *Engine) codeContextPack(ctx context.Context, question string, limit, maxTokens int) (string, error) {
 	if limit <= 0 {
 		limit = 6
 	}
-	var b strings.Builder
+	var head strings.Builder
 	if fr := e.G.Freshness(time.Now()); fr != "" {
-		fmt.Fprintf(&b, "# source: %s\n", fr)
+		fmt.Fprintf(&head, "# source: %s\n", fr)
 		if e.VectorsStale {
-			b.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n")
+			head.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n")
 		}
-		b.WriteString("\n")
+		head.WriteString("\n")
 	} else if e.VectorsStale {
-		b.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n\n")
+		head.WriteString("# warning: semantic vectors are stale (graph updated since last index; run `gatt index` or keep `gatt serve` running)\n\n")
 	}
 
-	funcHits, err := e.Find(ctx, question, graph.NodeFunction, limit)
+	aboutTests := false
+	for _, t := range graph.QueryTerms(question) {
+		if strings.HasPrefix(t, "test") || t == "spec" || t == "prueba" || t == "pruebas" {
+			aboutTests = true
+		}
+	}
+	// Over-fetch so demoted test hits can be replaced by production ones.
+	funcHits, err := e.Find(ctx, question, graph.NodeFunction, limit*2)
 	if err != nil {
 		return "", err
 	}
-	defHits, err := e.Find(ctx, question, graph.NodeDefinition, limit/2+1)
+	defHits, err := e.Find(ctx, question, graph.NodeDefinition, limit+2)
 	if err != nil {
 		return "", err
 	}
@@ -1358,90 +1495,167 @@ func (e *Engine) CodeContextPack(ctx context.Context, question string, limit int
 	if err != nil {
 		return "", err
 	}
-
-	seen := map[string]bool{}
-	rendered := 0
-	const budget = 16 * 1024 // hard cap: keep the pack one cheap tool call
+	commentHits, err := e.Find(ctx, question, graph.NodeComment, 4)
+	if err != nil {
+		return "", err
+	}
 
 	// Generated code (ANTLR parsers, protobufs…) stays findable via
 	// find_entities but never earns context-pack space.
-	skipGenerated := func(id string) bool {
+	usable := func(id string) (*graph.Node, bool) {
 		n := e.G.Nodes[id]
-		return n != nil && n.Attrs["generated"] == "true"
+		return n, n != nil && n.Attrs["generated"] != "true" && n.Attrs["external"] != "true"
+	}
+	isTest := func(n *graph.Node) bool { return IsTestFilePath(n.Attrs["file"]) }
+	// pick keeps Find's order but moves test hits behind production ones.
+	pick := func(hits []FindHit, max int) []*graph.Node {
+		var prod, tests []*graph.Node
+		for _, h := range hits {
+			n, ok := usable(h.ID)
+			if !ok {
+				continue
+			}
+			if !aboutTests && isTest(n) {
+				tests = append(tests, n)
+			} else {
+				prod = append(prod, n)
+			}
+		}
+		out := append(prod, tests...)
+		if len(out) > max {
+			out = out[:max]
+		}
+		return out
 	}
 
-	// 1. Type definitions (orientation layer).
-	for _, h := range defHits.Hits {
-		if seen[h.ID] || b.Len() > budget || skipGenerated(h.ID) {
-			continue
+	const (
+		kindDef = iota
+		kindFunc
+		kindComment
+		kindFile
+	)
+	var sections []packSection
+	seen := map[string]bool{}
+	add := func(kind, prio int, id, text string) {
+		if seen[id] || text == "" {
+			return
 		}
-		seen[h.ID] = true
-		s, err := e.RenderDefinition(h.ID)
-		if err != nil {
-			continue
-		}
-		b.WriteString(s + "\n")
-		rendered++
+		seen[id] = true
+		sections = append(sections, packSection{kind: kind, prio: prio, seq: len(sections), text: text})
 	}
 
-	// 2. Relevant functions.
-	for _, h := range funcHits.Hits {
-		if seen[h.ID] || b.Len() > budget || skipGenerated(h.ID) {
-			continue
+	for i, n := range pick(defHits.Hits, limit/2+1) {
+		if s, err := e.RenderDefinition(n.ID); err == nil {
+			prio := 1
+			if i >= 2 {
+				prio = 3
+			}
+			if isTest(n) {
+				prio = 5
+			}
+			add(kindDef, prio, n.ID, s+"\n")
 		}
-		if n := e.G.Nodes[h.ID]; n != nil && n.Attrs["external"] == "true" {
-			continue
-		}
-		seen[h.ID] = true
-		s, err := e.RenderFunction(h.ID)
-		if err != nil {
-			continue
-		}
-		b.WriteString(s + "\n")
-		rendered++
 	}
-
-	// 3. Files (docs / README / plain source files).
+	for i, n := range pick(funcHits.Hits, limit) {
+		if s, err := e.RenderFunction(n.ID); err == nil {
+			prio := 0
+			if i >= 3 {
+				prio = 2
+			}
+			if isTest(n) && !aboutTests {
+				prio = 5
+			}
+			add(kindFunc, prio, n.ID, s+"\n")
+		}
+	}
+	shownComments := 0
+	for _, h := range commentHits.Hits {
+		n, ok := usable(h.ID)
+		if !ok || shownComments >= 2 || (isTest(n) && !aboutTests) {
+			continue
+		}
+		text := strings.Join(strings.Fields(n.Attrs["text"]), " ")
+		if text == "" {
+			continue
+		}
+		if len(text) > 240 {
+			text = text[:240] + "…"
+		}
+		add(kindComment, 4, n.ID, fmt.Sprintf("## comment: %s:%s\n%s\n\n", n.Attrs["file"], n.Attrs["line"], text))
+		shownComments++
+	}
 	for _, h := range fileHits.Hits {
-		if seen[h.ID] || rendered >= limit*2 || b.Len() > budget {
-			break
-		}
-		if skipGenerated(h.ID) {
+		n, ok := usable(h.ID)
+		if !ok {
 			continue
 		}
-		n := e.G.Nodes[h.ID]
-		if n == nil {
-			continue
-		}
-		seen[h.ID] = true
 		if body := n.Attrs["doc_body"]; body != "" {
 			if len(body) > 200 {
 				body = body[:200] + "…"
 			}
-			fmt.Fprintf(&b, "## doc: %s\n%s\n\n", n.Name, body)
-		} else {
-			var fileFuncs []string
-			for _, ed := range e.G.EdgesOf(h.ID) {
-				if ed.Type == "BELONGS_TO" && ed.To == h.ID {
-					if fn := e.G.Nodes[ed.From]; fn != nil && fn.Type == graph.NodeFunction {
-						sig := fn.Attrs["signature"]
-						if sig == "" {
-							sig = fn.Name
-						}
-						fileFuncs = append(fileFuncs, sig)
+			add(kindFile, 6, h.ID, fmt.Sprintf("## doc: %s\n%s\n\n", n.Name, body))
+			continue
+		}
+		var fileFuncs []string
+		for _, ed := range e.G.EdgesOf(h.ID) {
+			if ed.Type == "BELONGS_TO" && ed.To == h.ID {
+				if fn := e.G.Nodes[ed.From]; fn != nil && fn.Type == graph.NodeFunction {
+					sig := fn.Attrs["signature"]
+					if sig == "" {
+						sig = fn.Name
 					}
+					fileFuncs = append(fileFuncs, sig)
 				}
 			}
-			sort.Strings(fileFuncs)
-			if len(fileFuncs) > 0 {
-				fmt.Fprintf(&b, "## file: %s\nfunctions: %s\n\n", n.Name, strings.Join(fileFuncs, ", "))
-			}
 		}
-		rendered++
+		sort.Strings(fileFuncs)
+		if len(fileFuncs) > 0 {
+			add(kindFile, 6, h.ID, fmt.Sprintf("## file: %s\nfunctions: %s\n\n", n.Name, strings.Join(fileFuncs, ", ")))
+		}
 	}
 
-	if rendered == 0 {
+	if len(sections) == 0 {
 		return "no code entities matched the question; try find_entities with different wording or gatt grep for an exhaustive literal scan", nil
+	}
+
+	// Choose what to keep: everything up to the hard cap (one cheap tool
+	// call), or, under a token budget, the highest-priority sections that fit.
+	const hardCap = 16 * 1024
+	capChars := hardCap
+	if maxTokens > 0 && maxTokens*4 < capChars {
+		capChars = maxTokens * 4
+	}
+	byPrio := make([]int, len(sections))
+	for i := range byPrio {
+		byPrio[i] = i
+	}
+	sort.SliceStable(byPrio, func(a, b int) bool { return sections[byPrio[a]].prio < sections[byPrio[b]].prio })
+	keep := map[int]bool{}
+	used, dropped := head.Len(), 0
+	for _, i := range byPrio {
+		if used+len(sections[i].text) > capChars && len(keep) > 0 {
+			dropped++
+			continue
+		}
+		keep[i] = true
+		used += len(sections[i].text)
+	}
+	sort.SliceStable(sections, func(a, b int) bool {
+		if sections[a].kind != sections[b].kind {
+			return sections[a].kind < sections[b].kind
+		}
+		return sections[a].seq < sections[b].seq
+	})
+	var b strings.Builder
+	b.WriteString(head.String())
+	for i := range sections {
+		// keep is indexed by the pre-sort position, which seq records.
+		if keep[sections[i].seq] {
+			b.WriteString(sections[i].text)
+		}
+	}
+	if dropped > 0 && maxTokens > 0 {
+		fmt.Fprintf(&b, "# note: %d lower-ranked section(s) left out to fit ~%d tokens; raise max_tokens for more\n", dropped, maxTokens)
 	}
 	b.WriteString("# note: top-N ranked context pack (not exhaustive); use `gatt grep` for exhaustive literal/regex scans\n")
 	return b.String(), nil

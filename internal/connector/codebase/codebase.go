@@ -78,6 +78,10 @@ type Connector struct {
 	// so package-qualified calls like `localization.ParseDay(...)` or
 	// `database.InTenant(...)` resolve to the imported package's functions.
 	goPkgImports map[string][]goPkgImport
+	// goImportNames records, per Go file, every name an import binds (local,
+	// stdlib or third-party: "http", "url", "sitter") so `url.Parse(...)` is
+	// known to be a package call, never a value's method.
+	goImportNames map[string]map[string]bool
 	// jvmSourceRoots holds every conventional Maven/Gradle source directory
 	// found in the tree (the extraction root itself, plus any
 	// src/main/java, src/main/kotlin, src/test/java, src/test/kotlin at any
@@ -107,13 +111,22 @@ type Connector struct {
 	// .gatt/dispatch.json) for string-keyed dispatch resolution — see
 	// dispatch.go. Loaded lazily.
 	dispatchVerbs map[string]bool
+	// emitVerbs are the call names that clearly send a message/event
+	// (defaults + .gatt/dispatch.json "emit_verbs"); see dispatch.go.
+	emitVerbs map[string]bool
 	// pendingDispatchAssocs/pendingDispatchTriggers collect the two halves
 	// of string-keyed dispatch during the walk, resolved against the
 	// finished function index by wireDispatch (dispatch.go) after the whole
 	// tree is parsed.
 	pendingDispatchAssocs   []dispatchAssoc
 	pendingDispatchTriggers []dispatchTrigger
-	dispatchConstValues     map[string]string
+	// dispatchConsts holds string constants by the name they are referenced
+	// with ("EVT_PAID", "Events.PAID", Go "pkg.EvtPaid"), with the file that
+	// declares them so a reference resolves by scope, never by bare name alone.
+	dispatchConsts map[string][]dispatchConst
+	// dispatchGroup numbers each lookup-table literal so wireDispatch can
+	// judge the table as a whole (are its values really functions?).
+	dispatchGroup int
 	// namedImports maps file path -> imported local binding name -> resolved
 	// target file id ("file:...") — every `import { x } from '...'` binding
 	// in that file (JS/TS/JSX), not just the state-tracking subset (see
@@ -1782,7 +1795,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 		if doc := leadingFileDoc(tree.RootNode(), data, consumed); doc != "" {
 			fileAttrs["file_doc"] = doc
 		}
-		c.collectDispatchFile(tree.RootNode(), ext, data)
+		c.collectDispatchFile(tree.RootNode(), ext, relPath, data)
 
 		qc := sitter.NewQueryCursor()
 		qc.Exec(lc.query, tree.RootNode())
@@ -1892,7 +1905,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					// the string-keyed dispatch registry (dispatch.go) — the
 					// object itself is still indexed as a definition node below.
 					if valType == "object" {
-						c.collectDispatchTable(valNode, data)
+						c.collectDispatchTable(valNode, relPath, data)
 					}
 					if valType != "arrow_function" && valType != "function_expression" {
 						name := nameNode.Content(data)
@@ -1984,6 +1997,11 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 					"line_start": fmt.Sprint(lineStart),
 					"line_end":   fmt.Sprint(lineEnd),
 					"signature":  sig,
+				}
+				if ext == ".go" && pendingReceiver != "" {
+					// Methods are what a value.Method() call can reach; the
+					// Go method fallback (resolveGoValueMethods) only targets these.
+					attrs["receiver_type"] = pendingReceiver
 				}
 				if doc := docComment(funcNameNode, data, consumed); doc != "" {
 					attrs["doc"] = doc
@@ -2092,7 +2110,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				// bus.Subscribe("order.paid", handlePaid), etc.) across JS/TS, Go, Python, Java, C#.
 				switch ext {
 				case ".js", ".jsx", ".ts", ".tsx", ".go", ".py", ".java", ".cs":
-					c.detectDispatchCall(callNode, callName, callerFuncID, data)
+					c.detectDispatchCall(callNode, callName, callerFuncID, relPath, data)
 				}
 			}
 
@@ -2106,6 +2124,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 				resolved := ""
 				switch ext {
 				case ".go":
+					c.recordGoImportName(relPath, importNode, importStr, data)
 					resolved = c.resolveGoPackageImport(g, importStr)
 					if resolved != "" {
 						alias := ""
@@ -3645,6 +3664,12 @@ func (c *Connector) resolveAndWire(g *graph.Graph, funcs []funcInfo, funcsByName
 // in exactly the same sense a function's body does.
 func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string, calls []string, funcsByName map[string][]string) {
 	seen := map[string]bool{}
+	var goValueMethods []string // Go .Method calls left unresolved, see resolveGoValueMethods
+	defer func() {
+		if len(goValueMethods) > 0 {
+			c.resolveGoValueMethods(g, callerID, callerFile, calls, goValueMethods, funcsByName)
+		}
+	}()
 	for _, calledName := range calls {
 		if seen[calledName] {
 			continue
@@ -3684,6 +3709,9 @@ func (c *Connector) resolveCallsFrom(g *graph.Graph, callerID, callerFile string
 		}
 		bareName := strings.TrimPrefix(calledName, ".")
 		if strings.HasPrefix(calledName, ".") || builtinNames[bareName] {
+			if strings.HasPrefix(calledName, ".") && strings.HasSuffix(callerFile, ".go") {
+				goValueMethods = append(goValueMethods, bareName)
+			}
 			// External selector (stdlib/method) or language builtin:
 			// stubs for these are pure noise in the graph.
 			continue

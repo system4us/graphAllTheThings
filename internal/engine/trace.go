@@ -112,8 +112,16 @@ func normalizeRouteParam(s string) string {
 
 // TracePath finds the shortest execution/data-flow path between two nodes in a
 // codebase graph (e.g. route -> handler -> sqlc query -> model, or emitter ->
-// event listener -> handler). Tries directed edges first, falling back to
-// undirected traversal if no directed path exists.
+// event listener -> handler).
+//
+// Order of answers, each labelled as such:
+//  1. a directed path from -> to;
+//  2. a directed path to -> from (the second argument reaches the first);
+//  3. no flow either way: the nearest common caller both are reached from, or
+//     the nearest thing both lead to (a shared callee, model, sqlc query) —
+//     printed as two chains, never as one path stitched through reversed
+//     edges. Test code is never used as a hop or a meeting point: a test
+//     calling both says nothing about how production code connects them.
 func (e *Engine) TracePath(fromRef, toRef string, maxDepth int) (string, error) {
 	if !e.IsCodebase() {
 		return "", fmt.Errorf("trace_path requires a codebase graph (use join_path for DB/API graphs)")
@@ -136,32 +144,149 @@ func (e *Engine) TracePath(fromRef, toRef string, maxDepth int) (string, error) 
 		return fmt.Sprintf("same node: %s\n", formatTraceNode(src)), nil
 	}
 
-	steps := e.bfsTrace(src.ID, dst.ID, maxDepth, true)
-	directed := true
-	if len(steps) == 0 {
-		steps = e.bfsTrace(src.ID, dst.ID, maxDepth, false)
-		directed = false
-	}
-	if len(steps) == 0 {
-		return fmt.Sprintf("no path found within %d hops between %s and %s\n",
-			maxDepth, formatTraceNode(src), formatTraceNode(dst)), nil
-	}
-
 	var b strings.Builder
-	mode := "directed"
-	if !directed {
-		mode = "undirected fallback"
+	if steps := e.bfsTrace(src.ID, dst.ID, maxDepth, true); len(steps) > 0 {
+		fmt.Fprintf(&b, "trace_path (%d hop(s), directed):\n", len(steps))
+		e.writeChain(&b, src, steps)
+		return b.String(), nil
 	}
-	fmt.Fprintf(&b, "trace_path (%d hop(s), %s):\n", len(steps), mode)
-	fmt.Fprintf(&b, "  %s\n", formatTraceNode(src))
+	if steps := e.bfsTrace(dst.ID, src.ID, maxDepth, true); len(steps) > 0 {
+		fmt.Fprintf(&b, "trace_path (%d hop(s), directed, reversed — the second node reaches the first):\n", len(steps))
+		e.writeChain(&b, dst, steps)
+		return b.String(), nil
+	}
+	if out := e.commonFlow(src, dst, maxDepth); out != "" {
+		return out, nil
+	}
+	return fmt.Sprintf("no path found within %d hops between %s and %s (no flow either way, no common caller or shared dependency outside tests)\n",
+		maxDepth, formatTraceNode(src), formatTraceNode(dst)), nil
+}
+
+func (e *Engine) writeChain(b *strings.Builder, start *graph.Node, steps []traceStep) {
+	fmt.Fprintf(b, "  %s\n", formatTraceNode(start))
 	for _, st := range steps {
 		arrow := "-->"
 		if st.reverse {
 			arrow = "<--"
 		}
-		fmt.Fprintf(&b, "    --[%s]%s %s\n", describeTraceEdge(st.edge), arrow, formatTraceNode(e.G.Nodes[st.nextID]))
+		fmt.Fprintf(b, "    --[%s]%s %s\n", describeTraceEdge(st.edge), arrow, formatTraceNode(e.G.Nodes[st.nextID]))
 	}
-	return b.String(), nil
+}
+
+// isTestNode reports a node declared in a test file.
+func isTestNode(n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	f := n.Attrs["file"]
+	if n.Type == graph.NodeFile {
+		f = n.Name
+	}
+	return f != "" && IsTestFilePath(f)
+}
+
+// flowReach walks flow edges from start — forward (towards callees/models)
+// or backward (towards callers) — and returns each reached node's distance
+// plus the edge that reached it (edge.From/To in graph direction). Test,
+// external and UI-component nodes are not entered.
+func (e *Engine) flowReach(start string, forward bool, maxDepth int) (map[string]int, map[string]graph.Edge, map[string]string) {
+	dist := map[string]int{start: 0}
+	via := map[string]graph.Edge{}
+	parent := map[string]string{}
+	queue := []string{start}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if dist[cur] >= maxDepth {
+			continue
+		}
+		for _, ed := range e.G.EdgesOf(cur) {
+			if !flowEdgeTypes[ed.Type] {
+				continue
+			}
+			next := ""
+			switch {
+			case forward && ed.From == cur:
+				next = ed.To
+			case !forward && ed.To == cur:
+				next = ed.From
+			default:
+				continue
+			}
+			if _, ok := dist[next]; ok {
+				continue
+			}
+			nn := e.G.Nodes[next]
+			if nn == nil || nn.Attrs["external"] == "true" || nn.Type == graph.NodeComponent || isTestNode(nn) {
+				continue
+			}
+			dist[next] = dist[cur] + 1
+			via[next] = ed
+			parent[next] = cur
+			queue = append(queue, next)
+		}
+	}
+	return dist, via, parent
+}
+
+// commonFlow explains how two nodes with no flow between them still meet:
+// the nearest common caller, or the nearest shared dependency.
+func (e *Engine) commonFlow(src, dst *graph.Node, maxDepth int) string {
+	type meet struct {
+		id    string
+		total int
+		up    bool // true: common caller; false: shared dependency
+	}
+	var best *meet
+	for _, up := range []bool{true, false} {
+		ds, _, _ := e.flowReach(src.ID, !up, maxDepth)
+		dd, _, _ := e.flowReach(dst.ID, !up, maxDepth)
+		for id, a := range ds {
+			c, ok := dd[id]
+			if !ok || id == src.ID || id == dst.ID {
+				continue
+			}
+			if best == nil || a+c < best.total || (a+c == best.total && id < best.id) {
+				best = &meet{id, a + c, up}
+			}
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	meetNode := e.G.Nodes[best.id]
+	var b strings.Builder
+	if best.up {
+		fmt.Fprintf(&b, "trace_path: no flow between the two either way; both are reached from a common caller, %s:\n", formatTraceNode(meetNode))
+	} else {
+		fmt.Fprintf(&b, "trace_path: no flow between the two either way; both lead to %s:\n", formatTraceNode(meetNode))
+	}
+	for _, end := range []*graph.Node{src, dst} {
+		_, via, parent := e.flowReach(end.ID, !best.up, maxDepth)
+		// Walk from the meeting point back to this end.
+		var chain []string
+		for cur := best.id; cur != end.ID; cur = parent[cur] {
+			chain = append(chain, cur)
+		}
+		chain = append(chain, end.ID)
+		b.WriteString("\n")
+		if best.up {
+			// caller ... -> end, in call direction.
+			fmt.Fprintf(&b, "  %s\n", formatTraceNode(meetNode))
+			for i := 1; i < len(chain); i++ {
+				ed := via[chain[i-1]]
+				fmt.Fprintf(&b, "    --[%s]--> %s\n", describeTraceEdge(ed), formatTraceNode(e.G.Nodes[chain[i]]))
+			}
+		} else {
+			// end -> ... -> shared dependency, in call direction.
+			fmt.Fprintf(&b, "  %s\n", formatTraceNode(end))
+			for i := len(chain) - 2; i >= 0; i-- {
+				ed := via[chain[i]]
+				fmt.Fprintf(&b, "    --[%s]--> %s\n", describeTraceEdge(ed), formatTraceNode(e.G.Nodes[chain[i]]))
+			}
+		}
+	}
+	return b.String()
 }
 
 func (e *Engine) bfsTrace(srcID, dstID string, maxDepth int, directedOnly bool) []traceStep {
@@ -202,7 +327,7 @@ func (e *Engine) bfsTrace(srcID, dstID string, maxDepth int, directedOnly bool) 
 			if nn == nil {
 				continue
 			}
-			if nextID != dstID && (nn.Attrs["external"] == "true" || nn.Type == graph.NodeComponent) {
+			if nextID != dstID && (nn.Attrs["external"] == "true" || nn.Type == graph.NodeComponent || isTestNode(nn)) {
 				continue
 			}
 			visited[nextID] = true

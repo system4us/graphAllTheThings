@@ -17,6 +17,7 @@ name but have no edge).
 | `this.foo()`, `self.foo()` | a function `foo` in the same file | plain |
 | `X.foo()`, `util.Foo()`, `svc.foo()`, `this.svc.foo()` | see below | `inferred=true`, `via=receiver`, `receiver=<name>` |
 | `ns.foo()` after `import * as ns` (JS/TS) | the export `foo` of that module | `inferred=true`, `via=namespace-export` |
+| Go `v.Foo()` whose receiver type can't be followed (`s.q.WithTx(tx).InsertEvent()`, `cfg := s.cfg.Load(); cfg.Foo()`) | the only *method* named `Foo` in the caller's package or a package the caller file imports — see "Go value methods" | `inferred=true`, `via=go-method` |
 | anything else (`a.b().c()`, `list.add(x)`, `getFoo().bar()`) | nothing | none |
 
 Outside Go, a call whose receiver is not `this`/`self` is **never** matched to a
@@ -61,11 +62,32 @@ more means the name is too ambiguous to be informative).
   is not found on the derived type; a call through an interface links to the
   interface's declared method, not to an implementation.
 - **No inference.** `var x = new Foo()`, `x := NewFoo()`, `let x = Foo::new()` have
-  no declared type, so `x.bar()` is not linked.
+  no declared type, so `x.bar()` is not linked by the receiver index. Go is the
+  exception, through the value-method fallback below.
 - **Same-name types in several visible places** (two imported packages that both
   define `Helper`) are ambiguous and linked to neither.
 - **Other files of the same type** (C# partial classes, Kotlin extension functions,
   Rust `impl` blocks elsewhere) are missed.
+
+### Go value methods
+
+A value produced by a call hides its type: sqlc's `q := s.q.WithTx(tx)`, an
+`atomic.Pointer[T]`'s `Load()`, `fl.engine(s).Evaluate()`. Without help every
+sqlc query call and many production callers were missing, and a signature
+change listed only the tests as affected. Go itself bounds where such a method
+can live: the caller's own package or a package the caller file imports. When
+exactly **one method** (a function with a receiver) of that name exists in that
+set, the call is wired with `via=go-method`. It stays silent when:
+
+- the call is package-qualified (`url.Parse`, `sitter.NewParser`): every import
+  name of the file is known, stdlib and third-party included;
+- the name is one stdlib types carry (`Close`, `Write`, `Load`, `Parse`, `Get`,
+  … — a local type with a unique `Close` says nothing about `os.File.Close`);
+- the only candidate lives in another package's `_test.go`;
+- two visible packages declare it.
+
+On a 290-file Go service this added 252 edges; every sampled one was right, and
+callers found for exported functions rose from 89% to 95% of `grep` call sites.
 
 ### Per language
 

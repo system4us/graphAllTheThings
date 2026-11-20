@@ -273,10 +273,16 @@ func FTSQuery(path, query, nodeType string, limit int) []string {
 	}
 	defer db.Close()
 
+	// Stopwords dropped, each remaining word as a stem prefix ("verif"*
+	// matches verify, verified, verifyEvents' single token verifyevents).
 	var quoted []string
-	for _, t := range strings.Fields(query) {
+	for _, t := range QueryTerms(query) {
 		if t = strings.ReplaceAll(t, `"`, ""); t != "" {
-			quoted = append(quoted, `"`+t+`"`)
+			if st := Stem(t); len([]rune(st)) >= 4 {
+				quoted = append(quoted, `"`+st+`"*`)
+			} else {
+				quoted = append(quoted, `"`+t+`"`)
+			}
 		}
 	}
 	if len(quoted) == 0 {

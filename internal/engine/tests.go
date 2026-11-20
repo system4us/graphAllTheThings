@@ -101,7 +101,10 @@ func (e *Engine) AffectedTests(ctx context.Context, target string, depth int) (A
 			if f == "" && n.Type == graph.NodeFile {
 				f = filepath.ToSlash(n.Name)
 			}
-			if changedSet[f] {
+			// A prose doc edit runs no tests: seeding it pulled in whatever
+			// tests the doc historically co-changed with (docs/CONFIG.md →
+			// the config package's tests).
+			if changedSet[f] && !isProseDoc(f) {
 				seedIDs[n.ID] = true
 				seedFiles[f] = true
 			}
@@ -129,6 +132,25 @@ func (e *Engine) AffectedTests(ctx context.Context, target string, depth int) (A
 						seedFiles[filepath.ToSlash(n.Name)] = true
 					}
 				}
+			}
+		}
+	}
+
+	// A file target means everything declared in it, as in diff mode: its
+	// functions' callers in other packages are affected too, not only the
+	// file's own directory.
+	fileTargets := map[string]bool{}
+	if target != "" && !strings.HasPrefix(target, "diff:") {
+		for id := range seedIDs {
+			if n := e.G.Nodes[id]; n != nil && n.Type == graph.NodeFile && n.Attrs["path"] != "" {
+				fileTargets[filepath.ToSlash(n.Name)] = true
+			}
+		}
+	}
+	for f := range fileTargets {
+		for _, n := range e.G.Nodes {
+			if n.Attrs["external"] != "true" && filepath.ToSlash(n.Attrs["file"]) == f {
+				seedIDs[n.ID] = true
 			}
 		}
 	}

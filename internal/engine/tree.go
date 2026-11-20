@@ -62,6 +62,37 @@ func (e *Engine) Tree(pathPrefix string, depth int) (string, error) {
 		}
 	}
 
+	// A header comment above every declaration — Go's "// Per-event hash
+	// chain…" after the package clause, a license-free module banner — says
+	// what the file is about better than its first function's doc does.
+	firstDecl := map[string]int{}
+	for _, typ := range []string{graph.NodeFunction, graph.NodeDefinition} {
+		for _, n := range e.G.NodesByType(typ) {
+			var line int
+			fmt.Sscanf(n.Attrs["line_start"], "%d", &line)
+			if f := n.Attrs["file"]; f != "" && line > 0 {
+				if cur, ok := firstDecl[f]; !ok || line < cur {
+					firstDecl[f] = line
+				}
+			}
+		}
+	}
+	headerComment := map[string]funcDoc{}
+	for _, n := range e.G.NodesByType(graph.NodeComment) {
+		f, text := n.Attrs["file"], strings.Join(strings.Fields(n.Attrs["text"]), " ")
+		var line int
+		fmt.Sscanf(n.Attrs["line"], "%d", &line)
+		if f == "" || text == "" || line <= 0 {
+			continue
+		}
+		if decl, ok := firstDecl[f]; ok && line > decl {
+			continue
+		}
+		if cur, ok := headerComment[f]; !ok || line < cur.line {
+			headerComment[f] = funcDoc{text, line}
+		}
+	}
+
 	var entries []treeEntry
 	for _, n := range e.G.NodesByType(graph.NodeFile) {
 		if n.Attrs["path"] == "" {
@@ -74,6 +105,11 @@ func (e *Engine) Tree(pathPrefix string, depth int) (string, error) {
 		summary := n.Attrs["file_doc"]
 		if summary == "" {
 			summary = docTitles[rel]
+		}
+		if summary == "" {
+			if d, ok := headerComment[rel]; ok {
+				summary = d.doc
+			}
 		}
 		if summary == "" {
 			if d, ok := firstFuncDoc[rel]; ok {
@@ -92,6 +128,7 @@ func (e *Engine) Tree(pathPrefix string, depth int) (string, error) {
 
 	var b strings.Builder
 	truncatedDirs := map[string]bool{}
+	printedDirs := map[string]bool{}
 	for _, en := range entries {
 		rel := strings.TrimPrefix(strings.TrimPrefix(en.relPath, pathPrefix), "/")
 		segs := strings.Split(rel, "/")
@@ -105,6 +142,14 @@ func (e *Engine) Tree(pathPrefix string, depth int) (string, error) {
 				fmt.Fprintf(&b, "%s/...\n", dir)
 			}
 			continue
+		}
+		// Print each directory once, as its own line, before its first file.
+		for d := 1; d < len(segs); d++ {
+			dir := strings.Join(segs[:d], "/")
+			if !printedDirs[dir] {
+				printedDirs[dir] = true
+				fmt.Fprintf(&b, "%s%s/\n", strings.Repeat("  ", d-1), segs[d-1])
+			}
 		}
 		indent := strings.Repeat("  ", len(segs)-1)
 		line := indent + segs[len(segs)-1]
