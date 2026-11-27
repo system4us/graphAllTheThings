@@ -8,8 +8,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/mcpserver"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/internal/mcpserver"
 )
 
 func mcpText(t string) *mcp.CallToolResult {

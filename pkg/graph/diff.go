@@ -6,11 +6,9 @@ import (
 	"strings"
 )
 
-// Diff is the structural change between two extractions of the same source:
+// Diff is the structural change between two snapshots of a graph:
 // which nodes appeared, disappeared, or had their attributes change, plus a
-// per-type tally of added/removed edges (FKs, references, ...). It powers
-// `gatt extract --check` (is the graph stale?) and the change summary printed
-// on re-extraction.
+// per-type tally of added/removed edges.
 type Diff struct {
 	AddedNodes   []string     // node ids only in the new graph
 	RemovedNodes []string     // node ids only in the old graph
@@ -33,8 +31,8 @@ func (d *Diff) Empty() bool {
 		len(d.AddedEdges) == 0 && len(d.RemovedEdges) == 0
 }
 
-// ShortID strips the type prefix (and public. schema) from a node id for
-// display, e.g. "table:public.users" -> "users", "schema:User" -> "User".
+// ShortID strips well-known type prefixes (and public. schema) from a node id
+// for display, e.g. "table:public.users" -> "users", "schema:User" -> "User".
 func ShortID(id string) string {
 	for _, p := range []string{"table:", "view:", "column:", "index:", "schema:", "property:", "endpoint:", "api:"} {
 		id = strings.TrimPrefix(id, p)
@@ -42,9 +40,8 @@ func ShortID(id string) string {
 	return strings.TrimPrefix(id, "public.")
 }
 
-// Text renders the drift as a compact multi-line summary (added/removed/changed
-// nodes and per-type edge deltas), or "" when the graphs are identical. Shared
-// by `gatt extract` output and the MCP check_drift/refresh tools.
+// Text renders the diff as a compact, deterministic multi-line summary, or ""
+// when the graphs are identical.
 func (d *Diff) Text() string {
 	if d.Empty() {
 		return ""
@@ -60,11 +57,21 @@ func (d *Diff) Text() string {
 	for _, c := range d.ChangedNodes {
 		fmt.Fprintf(&b, "  ~ %s: %s\n", ShortID(c.ID), strings.Join(c.Changes, "; "))
 	}
-	for t, n := range d.AddedEdges {
-		fmt.Fprintf(&b, "  + %d %s edge(s)\n", n, t)
+	addedTypes := make([]string, 0, len(d.AddedEdges))
+	for t := range d.AddedEdges {
+		addedTypes = append(addedTypes, t)
 	}
-	for t, n := range d.RemovedEdges {
-		fmt.Fprintf(&b, "  - %d %s edge(s)\n", n, t)
+	sort.Strings(addedTypes)
+	for _, t := range addedTypes {
+		fmt.Fprintf(&b, "  + %d %s edge(s)\n", d.AddedEdges[t], t)
+	}
+	removedTypes := make([]string, 0, len(d.RemovedEdges))
+	for t := range d.RemovedEdges {
+		removedTypes = append(removedTypes, t)
+	}
+	sort.Strings(removedTypes)
+	for _, t := range removedTypes {
+		fmt.Fprintf(&b, "  - %d %s edge(s)\n", d.RemovedEdges[t], t)
 	}
 	return b.String()
 }
@@ -93,7 +100,6 @@ func DiffGraphs(old, new *Graph) *Diff {
 	sort.Strings(d.RemovedNodes)
 	sort.Slice(d.ChangedNodes, func(i, j int) bool { return d.ChangedNodes[i].ID < d.ChangedNodes[j].ID })
 
-	// Edges have no identity, so compare multisets keyed by content.
 	oldEdges := edgeCounts(old.Edges)
 	newEdges := edgeCounts(new.Edges)
 	for key, n := range newEdges {
@@ -109,9 +115,6 @@ func DiffGraphs(old, new *Graph) *Diff {
 	return d
 }
 
-// attrChanges returns per-key change lines between two attribute maps.
-// Values are truncated and DDL/SQL blobs are compared but rendered as a bare
-// "changed" so the summary stays a few characters wide.
 func attrChanges(oldA, newA map[string]string) []string {
 	keys := map[string]bool{}
 	for k := range oldA {
@@ -141,8 +144,6 @@ func attrChanges(oldA, newA map[string]string) []string {
 	return out
 }
 
-// edgeCounts builds a multiset of edges keyed by a canonical string so
-// re-ordering between extractions doesn't register as a change.
 func edgeCounts(edges []Edge) map[string]int {
 	m := map[string]int{}
 	for _, e := range edges {

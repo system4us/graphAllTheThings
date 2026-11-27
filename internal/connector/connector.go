@@ -7,12 +7,12 @@ import (
 	"context"
 	"fmt"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/connector/docs"
-	"graphallthethings/internal/connector/openapi"
-	"graphallthethings/internal/connector/postgres"
-	"graphallthethings/internal/connector/sqlite"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/internal/connector/docs"
+	"github.com/system4us/graphAllTheThings/internal/connector/openapi"
+	"github.com/system4us/graphAllTheThings/internal/connector/postgres"
+	"github.com/system4us/graphAllTheThings/internal/connector/sqlite"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 type Connector interface {

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // trace answers, in order: forward path, reversed path, common caller /

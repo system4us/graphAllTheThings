@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"graphallthethings/internal/store"
-	"graphallthethings/internal/store/qdrant/qdranttest"
+	"github.com/system4us/graphAllTheThings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/store/qdrant/qdranttest"
 )
 
 func pt(id, hash string) store.Point {

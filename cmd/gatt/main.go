@@ -19,18 +19,19 @@ import (
 	"strings"
 	"time"
 
-	"graphallthethings/internal/connector"
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/embed"
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/enrich"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/indexer"
-	"graphallthethings/internal/lock"
-	"graphallthethings/internal/mcpserver"
-	"graphallthethings/internal/store"
-	"graphallthethings/internal/store/local"
-	"graphallthethings/internal/store/qdrant"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/pkg/embed"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/internal/enrich"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/indexer"
+	"github.com/system4us/graphAllTheThings/internal/lock"
+	"github.com/system4us/graphAllTheThings/internal/mcpserver"
+	"github.com/system4us/graphAllTheThings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/store/local"
+	"github.com/system4us/graphAllTheThings/internal/store/qdrant"
 )
 
 // skillMD is the Claude Code skill that teaches agents graph-first navigation.
@@ -236,7 +237,7 @@ func cmdExtract(ctx context.Context, args []string) error {
 		if kind != "codebase" {
 			return fmt.Errorf("--update only supports the codebase connector")
 		}
-		_, mts, err := graph.LoadCodebaseState(*out)
+		_, mts, err := codeutil.LoadCodebaseState(*out)
 		if err != nil {
 			return fmt.Errorf("--update needs an existing graph at %s — run a full extract first", *out)
 		}
@@ -533,7 +534,7 @@ type refreshResult struct {
 func refreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, embModel string, embedNow bool) (refreshResult, error) {
 	// Cheap precheck first (stat walk + light metadata read): the common
 	// no-drift case never materializes the graph.
-	source, mts, err := graph.LoadCodebaseState(graphPath)
+	source, mts, err := codeutil.LoadCodebaseState(graphPath)
 	if err != nil || !strings.HasPrefix(source, "codebase:") {
 		return refreshResult{}, nil
 	}
@@ -550,7 +551,7 @@ func refreshCodebase(ctx context.Context, graphPath, qdURL, coll, embURL, embMod
 	}
 	ng, summary, added, err := func() (*graph.Graph, string, []string, error) {
 		defer release()
-		if _, mts, err := graph.LoadCodebaseState(graphPath); err != nil || !conn.HasDrift(mts) {
+		if _, mts, err := codeutil.LoadCodebaseState(graphPath); err != nil || !conn.HasDrift(mts) {
 			return nil, "", nil, nil
 		}
 		raw, err := graph.LoadRaw(graphPath)

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // maxSnippetLines caps on-demand disk reads so a single caller/blast list

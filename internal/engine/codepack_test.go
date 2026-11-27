@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // A "how does X get verified" question must answer with the production code

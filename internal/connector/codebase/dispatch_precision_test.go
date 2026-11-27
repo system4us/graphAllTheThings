@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // Regressions from a real Go+TS repo where 75% of dispatch edges were wrong:

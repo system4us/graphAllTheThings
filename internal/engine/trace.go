@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // flowEdgeTypes are the semantic execution/data-flow edges traversed by

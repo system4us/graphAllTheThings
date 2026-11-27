@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // Models lists every ORM model detected in the codebase (Sequelize-style

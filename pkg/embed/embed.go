@@ -32,9 +32,10 @@ const (
 )
 
 type Client struct {
-	URL   string
-	Model string
-	http  *http.Client
+	URL    string
+	Model  string
+	APIKey string // optional Bearer token for OpenAI-compatible servers (falls back to GATT_EMBED_API_KEY)
+	http   *http.Client
 
 	mu          sync.Mutex
 	actualModel string // model reported by an OpenAI-compatible server (/health or /v1/embeddings)
@@ -157,7 +158,11 @@ func (c *Client) embedOpenAI(ctx context.Context, texts []string) ([][]float32, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := os.Getenv("GATT_EMBED_API_KEY"); key != "" {
+	key := c.APIKey
+	if key == "" {
+		key = os.Getenv("GATT_EMBED_API_KEY")
+	}
+	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := c.http.Do(req)

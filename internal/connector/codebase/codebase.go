@@ -18,7 +18,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/csharp"
@@ -336,7 +337,7 @@ func (c *Connector) scanFiles() map[string]string {
 			return nil
 		}
 		if d.IsDir() {
-			if graph.SkipDir(d.Name(), path == c.dir) {
+			if codeutil.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -405,7 +406,7 @@ func (c *Connector) HasDrift(prevM map[string]string) bool {
 // a full extract remains the ground truth.
 func (c *Connector) Update(ctx context.Context, prev *graph.Graph) (*graph.Graph, string, error) {
 	cur := c.scanFiles()
-	prevM := graph.FileMtimes(prev) // relPath → mtime as recorded at extract time
+	prevM := codeutil.FileMtimes(prev) // relPath → mtime as recorded at extract time
 
 	var changed, added, deleted []string
 	for rel, mt := range cur {
@@ -741,7 +742,7 @@ func (c *Connector) detectProjects(g *graph.Graph) {
 			return nil
 		}
 		if d.IsDir() {
-			if graph.SkipDir(d.Name(), path == c.dir) {
+			if codeutil.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			if _, e := os.Stat(filepath.Join(path, "go.mod")); e == nil && tracked(path, "go.mod") {
@@ -1621,7 +1622,7 @@ func (c *Connector) parseFiles(ctx context.Context, g *graph.Graph) ([]funcInfo,
 
 	filepath.WalkDir(c.dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
-			if d != nil && d.IsDir() && graph.SkipDir(d.Name(), path == c.dir) {
+			if d != nil && d.IsDir() && codeutil.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -2919,7 +2920,7 @@ func (c *Connector) loadGoModule() {
 			return nil
 		}
 		if d.IsDir() {
-			if p != rootAbs && graph.SkipDir(d.Name(), false) {
+			if p != rootAbs && codeutil.SkipDir(d.Name(), false) {
 				return filepath.SkipDir
 			}
 			rel, rerr := filepath.Rel(rootAbs, p)
@@ -3171,7 +3172,7 @@ func (c *Connector) loadJVMRoots() {
 		if err != nil || !d.IsDir() {
 			return nil
 		}
-		if graph.SkipDir(d.Name(), path == c.dir) {
+		if codeutil.SkipDir(d.Name(), path == c.dir) {
 			return filepath.SkipDir
 		}
 		slash := filepath.ToSlash(path)
@@ -3191,7 +3192,7 @@ func (c *Connector) loadJVMRoots() {
 			if err != nil || !d.IsDir() {
 				return nil
 			}
-			if graph.SkipDir(d.Name(), path == root) {
+			if codeutil.SkipDir(d.Name(), path == root) {
 				return filepath.SkipDir
 			}
 			rel, err := filepath.Rel(root, path)
@@ -3263,7 +3264,7 @@ func (c *Connector) loadCSharpRoots() {
 			return nil
 		}
 		if d.IsDir() {
-			if graph.SkipDir(d.Name(), path == c.dir) {
+			if codeutil.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -3341,7 +3342,7 @@ func (c *Connector) loadRustCrates() {
 			return nil
 		}
 		if d.IsDir() {
-			if graph.SkipDir(d.Name(), path == c.dir) {
+			if codeutil.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -3460,7 +3461,7 @@ func (c *Connector) loadTSConfigs() {
 			return nil
 		}
 		if d.IsDir() {
-			if graph.SkipDir(d.Name(), path == c.dir) {
+			if codeutil.SkipDir(d.Name(), path == c.dir) {
 				return filepath.SkipDir
 			}
 			return nil

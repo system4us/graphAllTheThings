@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// AddEdge must keep an already-built adjacency index in sync: EdgesOf after
-// incremental AddEdge calls has to equal EdgesOf after a from-scratch rebuild.
 func TestAddEdgeKeepsAdjacencyInSync(t *testing.T) {
 	g := New("test")
 	for _, id := range []string{"a", "b", "c"} {
@@ -17,7 +15,7 @@ func TestAddEdgeKeepsAdjacencyInSync(t *testing.T) {
 	_ = g.EdgesOf("a") // builds the index
 	g.AddEdge("b", "c", "CALLS", nil)
 	g.AddEdge("c", "c", "CALLS", nil) // self-loop: recorded once
-	g.AddNode(&Node{ID: "d"})         // must not invalidate or corrupt it
+	g.AddNode(&Node{ID: "d"})
 	g.AddEdge("d", "a", "CALLS", nil)
 
 	for _, id := range []string{"a", "b", "c", "d"} {
@@ -33,7 +31,6 @@ func TestAddEdgeKeepsAdjacencyInSync(t *testing.T) {
 	}
 }
 
-// Mirrors resolveAndWire: one EdgesOf then one AddEdge per function.
 func BenchmarkEdgesOfThenAddEdge(b *testing.B) {
 	for _, n := range []int{2000, 8000} {
 		b.Run(fmt.Sprint(n), func(b *testing.B) {

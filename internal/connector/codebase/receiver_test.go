@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // extractFiles writes files into a temp dir, extracts it and returns the

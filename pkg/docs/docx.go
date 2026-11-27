@@ -2,6 +2,7 @@ package docs
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -10,14 +11,13 @@ import (
 	"strings"
 )
 
-// parseDOCX extracts structured sections (headings, paragraphs, and tables)
-// from a .docx file using only Go's standard library (archive/zip + encoding/xml).
-func parseDOCX(path string) (*ParsedDoc, error) {
-	zr, err := zip.OpenReader(path)
+// parseDOCXBytes extracts structured sections (headings, paragraphs, and tables)
+// from raw .docx bytes in memory using only Go's standard library.
+func parseDOCXBytes(filename string, data []byte) (*ParsedDoc, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, fmt.Errorf("open docx zip: %w", err)
 	}
-	defer zr.Close()
 
 	var docFile, coreFile *zip.File
 	for _, f := range zr.File {
@@ -51,7 +51,7 @@ func parseDOCX(path string) (*ParsedDoc, error) {
 		title = inferredTitle
 	}
 	if title == "" {
-		title = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		title = strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 	}
 
 	return &ParsedDoc{
@@ -149,7 +149,6 @@ func decodeDOCXBody(r io.Reader) ([]ParsedSection, string, error) {
 		}
 	}
 
-	// Filter out empty trailing headings only if they have neither title nor body.
 	var out []ParsedSection
 	for _, s := range sections {
 		if strings.TrimSpace(s.Title) == "" && strings.TrimSpace(s.Body) == "" {
@@ -201,7 +200,7 @@ func readDOCXParagraph(dec *xml.Decoder) (text string, headingLevel int, isTitle
 				if err := dec.DecodeElement(&s, &t); err != nil {
 					return "", 0, false, err
 				}
-				depth-- // DecodeElement consumed the matching EndElement
+				depth--
 				b.WriteString(s)
 			}
 		case xml.EndElement:

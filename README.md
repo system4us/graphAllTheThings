@@ -90,6 +90,17 @@ Optional agent hook to trigger immediate background refresh on edits (silent; ex
 
 Only nodes whose text changed are re-embedded: on a 21,830-node graph the first index takes ~5 min, then an edit costs ~1.6 s. Details, backends and tuning: [docs/embeddings.md](docs/embeddings.md).
 
+## Using as a Go library (`pkg/`, MIT-licensed, `CGO_ENABLED=0`)
+
+The core packages under [`pkg/`](pkg/) are pure Go (no CGO required) and licensed under [MIT](pkg/LICENSE) so other Go projects can import them directly:
+
+| Package | What it provides |
+|---------|------------------|
+| `github.com/system4us/graphAllTheThings/pkg/graph` | Typed `Graph`/`Node`/`Edge` model, SQLite (FTS5) + JSON persistence, incremental journaled saves, `DiffGraphs`, directed/undirected traversal (`OutEdges`, `InEdges`, `FindPath`, `Subgraph`, `Reachable`) with RBAC `AllowNode` predicates, and extensible `NodeText` |
+| `github.com/system4us/graphAllTheThings/pkg/docs` | Pure-Go in-memory document parser (`ParseBytes` / `ParseFile` for PDF, DOCX with headings/tables, Markdown, Textile, TXT) and composable `AddToGraph` (`document -> section -> chunk` + `NEXT`) with inherited metadata for RBAC |
+| `github.com/system4us/graphAllTheThings/pkg/search` | Hybrid search (FTS5 / accent-insensitive keyword + pluggable semantic `Embedder` & `VectorStore` fused via RRF), RBAC `AllowNode` filtering, and optional N-hop graph context expansion |
+| `github.com/system4us/graphAllTheThings/pkg/embed` | HTTP embedding client for Ollama and OpenAI-compatible (`/v1`, ONNX worker) servers |
+
 ## Documentation
 
 | | |
@@ -109,4 +120,4 @@ Only nodes whose text changed are re-embedded: on a 21,830-node graph the first 
 
 Copyright (C) 2026 Leandro Fusco <leandrofusdev@gmail.com>
 
-Licensed under the [GNU AGPL v3 or later](LICENSE). You may use, modify and redistribute it, including commercially; if you distribute a modified version or let users interact with one over a network (AGPL §13), you must offer them its source under the same license. Dependencies and downloaded embedding models keep their own licenses.
+Licensed under the [GNU AGPL v3 or later](LICENSE) for the application (`cmd/`, `internal/`, `web/`, `tools/`). The reusable Go library packages under [`pkg/`](pkg/) are separately licensed under the [MIT License](pkg/LICENSE). Dependencies and downloaded embedding models keep their own licenses.

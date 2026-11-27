@@ -1,8 +1,9 @@
-module graphallthethings
+module github.com/system4us/graphAllTheThings
 
 go 1.25.0
 
 require (
+	github.com/dslipak/pdf v0.0.2
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
@@ -12,7 +13,6 @@ require (
 )
 
 require (
-	github.com/dslipak/pdf v0.0.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect

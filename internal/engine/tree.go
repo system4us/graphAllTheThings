@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // treeEntry is one file under the synthesized tree, with the one-line

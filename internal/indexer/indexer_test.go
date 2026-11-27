@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"graphallthethings/internal/embed"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/store"
-	"graphallthethings/internal/store/local"
-	"graphallthethings/internal/store/qdrant"
-	"graphallthethings/internal/store/qdrant/qdranttest"
+	"github.com/system4us/graphAllTheThings/pkg/embed"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/store/local"
+	"github.com/system4us/graphAllTheThings/internal/store/qdrant"
+	"github.com/system4us/graphAllTheThings/internal/store/qdrant/qdranttest"
 )
 
 // fakeEmbedder counts how many texts reach the embedding server.

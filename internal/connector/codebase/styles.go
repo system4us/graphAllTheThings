@@ -31,7 +31,7 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 const maxCSSSelectorAttr = 6 * 1024 // cap on the css_selectors attr

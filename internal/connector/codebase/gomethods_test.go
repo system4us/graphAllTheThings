@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // A value produced by a call (sqlc's s.q.WithTx(tx), atomic.Pointer.Load())

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/connector/docs"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/connector/docs"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 func TestDocContextPackWithSQLiteFTS(t *testing.T) {

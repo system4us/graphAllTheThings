@@ -1,24 +1,18 @@
 package docs
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 )
 
-// parseMarkdown parses .md, .markdown, and .txt files into heading-delimited sections.
-func parseMarkdown(path string) (*ParsedDoc, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
-	if ext == "markdown" {
-		ext = "md"
-	}
-
+func parseMarkdownBytes(filename, format string, data []byte) (*ParsedDoc, error) {
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
+
+	baseTitle := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	if baseTitle == "" {
+		baseTitle = "document"
+	}
 
 	var sections []ParsedSection
 	var cur *ParsedSection
@@ -30,7 +24,7 @@ func parseMarkdown(path string) (*ParsedDoc, error) {
 		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
 			inFence = !inFence
 		}
-		if !inFence && ext == "md" {
+		if !inFence && format == "md" {
 			if lvl, heading, ok := parseMarkdownOrTextileHeading(trimmed); ok {
 				if docTitle == "" && lvl == 1 {
 					docTitle = heading
@@ -45,7 +39,7 @@ func parseMarkdown(path string) (*ParsedDoc, error) {
 				continue
 			}
 			sections = append(sections, ParsedSection{
-				Title: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+				Title: baseTitle,
 				Level: 1,
 			})
 			cur = &sections[len(sections)-1]
@@ -57,18 +51,15 @@ func parseMarkdown(path string) (*ParsedDoc, error) {
 	}
 
 	if docTitle == "" {
-		docTitle = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		docTitle = baseTitle
 	}
 	return &ParsedDoc{
 		Title:    docTitle,
-		Format:   ext,
+		Format:   format,
 		Sections: sections,
 	}, nil
 }
 
-// parseMarkdownOrTextileHeading recognizes ATX Markdown headings ("# Title" ..
-// "###### Title") as well as Textile headings ("h1. Title" .. "h6. Title"),
-// commonly produced by Redmine/Confluence wiki exports.
 func parseMarkdownOrTextileHeading(trimmed string) (int, string, bool) {
 	if strings.HasPrefix(trimmed, "#") {
 		lvl := 0

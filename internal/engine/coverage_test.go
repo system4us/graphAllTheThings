@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // The coverage note must point at the missed caller, not at lookalikes:

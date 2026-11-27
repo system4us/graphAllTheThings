@@ -45,7 +45,7 @@ import (
 	"strings"
 	"unicode"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 
 	sitter "github.com/smacker/go-tree-sitter"
 )

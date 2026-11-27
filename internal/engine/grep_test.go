@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 func TestGrepOptionsLimitLockfilesAndGlobs(t *testing.T) {

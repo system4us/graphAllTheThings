@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"graphallthethings/internal/lock"
-	"graphallthethings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/lock"
+	"github.com/system4us/graphAllTheThings/internal/store"
 )
 
 type entry struct {

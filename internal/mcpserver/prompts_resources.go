@@ -8,7 +8,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"graphallthethings/internal/engine"
+	"github.com/system4us/graphAllTheThings/internal/engine"
 )
 
 // RegisterPrompts registers guided agentic workflow prompts on any MCP server

@@ -20,15 +20,16 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"graphallthethings/internal/connector"
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/embed"
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/enrich"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/indexer"
-	"graphallthethings/internal/lock"
-	"graphallthethings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/pkg/embed"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/internal/enrich"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/indexer"
+	"github.com/system4us/graphAllTheThings/internal/lock"
+	"github.com/system4us/graphAllTheThings/internal/store"
 )
 
 // Config is everything the server needs to load the graph and, when a source
@@ -723,7 +724,7 @@ func (s *Server) autoRefreshCodebase(ctx context.Context) string {
 	defer s.refreshMu.Unlock()
 	// Cheap precheck first (stat walk + light metadata read): the common
 	// no-drift case never materializes the graph.
-	source, mts, err := graph.LoadCodebaseState(s.cfg.GraphPath)
+	source, mts, err := codeutil.LoadCodebaseState(s.cfg.GraphPath)
 	if err != nil || !strings.HasPrefix(source, "codebase:") {
 		return ""
 	}
@@ -737,7 +738,7 @@ func (s *Server) autoRefreshCodebase(ctx context.Context) string {
 	}
 	ng, summary, added, err := func() (*graph.Graph, string, []string, error) {
 		defer release()
-		if _, mts, err := graph.LoadCodebaseState(s.cfg.GraphPath); err != nil || !conn.HasDrift(mts) {
+		if _, mts, err := codeutil.LoadCodebaseState(s.cfg.GraphPath); err != nil || !conn.HasDrift(mts) {
 			return nil, "", nil, nil
 		}
 		raw, err := graph.LoadRaw(s.cfg.GraphPath)

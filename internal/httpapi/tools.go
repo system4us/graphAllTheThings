@@ -8,9 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -189,7 +190,7 @@ func (h *Handler) handleDiff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "extracting "+ref+": "+err.Error())
 		return
 	}
-	d := graph.DiffCode(oldGraph, e.G, pairs, renamed)
+	d := codeutil.DiffCode(oldGraph, e.G, pairs, renamed)
 
 	type callerOut struct {
 		ID    string `json:"id"`
@@ -231,9 +232,9 @@ func (h *Handler) handleDiff(w http.ResponseWriter, r *http.Request) {
 
 		status := "modified"
 		switch c.Kind {
-		case graph.CodeAdded:
+		case codeutil.CodeAdded:
 			status = "added"
-		case graph.CodeRemoved:
+		case codeutil.CodeRemoved:
 			status = "removed"
 		}
 

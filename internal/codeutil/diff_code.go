@@ -1,6 +1,10 @@
-package graph
+package codeutil
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+)
 
 // FilePair is one file touched between two extractions of the same repo:
 // Old=="" for an added file, New=="" for a deleted one, both set (equal
@@ -30,7 +34,7 @@ type CodeChange struct {
 	NewName string // == OldName unless Kind == renamed
 	OldFile string // set for removed/renamed/moved
 	NewFile string // set for added/changed/renamed/moved
-	NewID   string // the entity's id in the NEW graph; "" for removed (used to look up its current callers)
+	NewID   string // the entity's id in the NEW graph; "" for removed
 }
 
 // CodeDiff is the result of DiffCode: git-detected whole-file renames plus
@@ -48,9 +52,7 @@ type codeEntry struct {
 	name, signature, doc, id string
 }
 
-// entriesFor collects one file's functions or definitions from g. External
-// stubs and generated entries carry no meaningful diff and are excluded.
-func entriesFor(g *Graph, file, nodeType string) []codeEntry {
+func entriesFor(g *graph.Graph, file, nodeType string) []codeEntry {
 	var out []codeEntry
 	for id, n := range g.Nodes {
 		if n.Type != nodeType || n.Attrs["file"] != file {
@@ -64,47 +66,34 @@ func entriesFor(g *Graph, file, nodeType string) []codeEntry {
 	return out
 }
 
-// sigModuloName replaces the entity's own name in its signature with a
-// placeholder so two signatures differing only by name compare equal — the
-// rename-detection key.
 func sigModuloName(e codeEntry) string {
 	return strings.Replace(e.signature, e.name, "\x00NAME\x00", 1)
 }
 
 func entityLabel(nodeType string) string {
-	if nodeType == NodeDefinition {
+	if nodeType == graph.NodeDefinition {
 		return "definition"
 	}
 	return "function"
 }
 
-func findSignature(g *Graph, file, name string) string {
+func findSignature(g *graph.Graph, file, name string) string {
 	for _, n := range g.Nodes {
-		if n.Type == NodeFunction && n.Attrs["file"] == file && n.Name == name {
+		if n.Type == graph.NodeFunction && n.Attrs["file"] == file && n.Name == name {
 			return n.Attrs["signature"]
 		}
 	}
 	return ""
 }
 
-// DiffCode compares old -> new across pairs (typically from
-// codebase.GitChangedFiles), matching functions/definitions by (file, name)
-// — deliberately not by full node id, since a function's id embeds its
-// line_start and an unrelated edit earlier in the file would otherwise make
-// every later function look removed+added.
-//
-// Within one file pair: a same-name match with a changed signature/doc is
-// "changed"; an unmatched old/new pair whose signature is identical modulo
-// the name itself is "renamed" (functions only — the heuristic stays out of
-// scope for definitions to keep it conservative). Leftover functions are
-// then matched across ALL touched files by exact signature equality,
-// uniquely, into "moved"; anything still unmatched is a plain added/removed.
-func DiffCode(old, new *Graph, pairs []FilePair, renamed map[string]string) *CodeDiff {
+// DiffCode compares old -> new across pairs, matching functions/definitions by
+// (file, name) and detecting renames and cross-file moves by signature.
+func DiffCode(old, new *graph.Graph, pairs []FilePair, renamed map[string]string) *CodeDiff {
 	d := &CodeDiff{FileRenames: renamed}
 	var leftoverRemoved, leftoverAdded []CodeChange
 
 	for _, p := range pairs {
-		for _, nodeType := range []string{NodeFunction, NodeDefinition} {
+		for _, nodeType := range []string{graph.NodeFunction, graph.NodeDefinition} {
 			var oldEntries, newEntries []codeEntry
 			if p.Old != "" {
 				oldEntries = entriesFor(old, p.Old, nodeType)
@@ -132,7 +121,7 @@ func DiffCode(old, new *Graph, pairs []FilePair, renamed map[string]string) *Cod
 				}
 			}
 
-			if nodeType == NodeFunction {
+			if nodeType == graph.NodeFunction {
 				for ni, ne := range newEntries {
 					if matchedNew[ni] {
 						continue
@@ -157,7 +146,7 @@ func DiffCode(old, new *Graph, pairs []FilePair, renamed map[string]string) *Cod
 					continue
 				}
 				ch := CodeChange{Kind: CodeRemoved, Type: entityLabel(nodeType), OldName: oe.name, OldFile: p.Old}
-				if nodeType == NodeFunction {
+				if nodeType == graph.NodeFunction {
 					leftoverRemoved = append(leftoverRemoved, ch)
 				} else {
 					d.Changes = append(d.Changes, ch)
@@ -168,7 +157,7 @@ func DiffCode(old, new *Graph, pairs []FilePair, renamed map[string]string) *Cod
 					continue
 				}
 				ch := CodeChange{Kind: CodeAdded, Type: entityLabel(nodeType), NewName: ne.name, NewFile: p.New, NewID: ne.id}
-				if nodeType == NodeFunction {
+				if nodeType == graph.NodeFunction {
 					leftoverAdded = append(leftoverAdded, ch)
 				} else {
 					d.Changes = append(d.Changes, ch)
@@ -177,9 +166,6 @@ func DiffCode(old, new *Graph, pairs []FilePair, renamed map[string]string) *Cod
 		}
 	}
 
-	// Cross-file move pass: pair remaining removed/added functions by exact
-	// signature equality, uniquely on both sides — an ambiguous match is
-	// worse than none.
 	sigCountOld, sigCountNew := map[string]int{}, map[string]int{}
 	oldSig := func(ch CodeChange) string { return findSignature(old, ch.OldFile, ch.OldName) }
 	newSig := func(ch CodeChange) string { return findSignature(new, ch.NewFile, ch.NewName) }

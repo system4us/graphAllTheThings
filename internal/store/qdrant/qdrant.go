@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"graphallthethings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/store"
 )
 
 const DefaultURL = "http://localhost:6333"

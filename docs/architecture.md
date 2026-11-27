@@ -37,19 +37,22 @@ Emit nodes/edges with the model in `internal/graph/model.go`, wire into `cmd/gat
 ## Layout
 
 ```
+pkg/graph/                MIT pure-Go graph model, traversal (RBAC/directed/subgraphs), diff, persistence (JSON + SQLite/FTS5)
+pkg/docs/                 MIT pure-Go in-memory document parser (PDF/DOCX/MD/TXT) + composable graph builder
+pkg/search/               MIT pure-Go hybrid search (FTS5 + pluggable vectors/RRF + RBAC + graph expansion)
+pkg/embed/                MIT pure-Go embedding client: Ollama and OpenAI-compatible (/v1) servers
 cmd/gatt/                 CLI: init | extract | enrich | index | query | code-query | impact |
                           blast | doc-drift | search | grep | tree | routes | models | diff |
                           path | explain | annotate | overview | serve | notify | mcp | install
 internal/engine/          query operations shared by CLI and MCP
-internal/graph/           graph model, traversal, persistence (JSON + SQLite/FTS5)
-internal/connector/       Connector interface + sqlite/, postgres/, openapi/, codebase/
-internal/embed/           embedding client: Ollama and OpenAI-compatible (/v1) servers
+internal/codeutil/        codebase-specific helpers (SkipDir, file mtime state, code diff)
+internal/connector/       Connector interface + sqlite/, postgres/, openapi/, codebase/, docs/
 internal/indexer/         incremental (hash-based) indexing into any VectorStore
 internal/lock/            cross-process lock files
 internal/store/           VectorStore interface
 internal/store/local/     default in-process cosine index (vectors.json + vectors.bin)
 internal/store/qdrant/    opt-in Qdrant REST backend (+ qdranttest, an in-memory fake for tests)
-internal/mcpserver/       MCP stdio server (official go-sdk)
+internal/mcpserver/       MCP stdio/HTTP server (official go-sdk)
 tools/mkdemo/             generates a demo SQLite DB for testing
 tools/gatt-embed/         local ONNX embedding worker (Node), used by `gatt serve --onnx`
 docs/                     graph model reference, roadmap

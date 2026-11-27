@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // CommitEntry is a compact git commit record associated with a file.

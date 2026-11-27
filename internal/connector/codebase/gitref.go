@@ -8,7 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // GitChangedFiles runs `git diff --name-status -M` between ref and the
@@ -18,13 +19,13 @@ import (
 // Reusing git's own -M rename detection here means DiffCode never has to
 // reinvent file-level rename heuristics — only within-file function/type
 // matching is its job.
-func GitChangedFiles(ctx context.Context, dir, ref string) ([]graph.FilePair, error) {
+func GitChangedFiles(ctx context.Context, dir, ref string) ([]codeutil.FilePair, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "diff", "--name-status", "-M", "--diff-filter=ACDMR", ref, "--", ".")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git diff --name-status %s: %w", ref, err)
 	}
-	var pairs []graph.FilePair
+	var pairs []codeutil.FilePair
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
 		if line == "" {
 			continue
@@ -36,22 +37,22 @@ func GitChangedFiles(ctx context.Context, dir, ref string) ([]graph.FilePair, er
 			if len(cols) < 3 || !indexableExt(cols[2]) {
 				continue
 			}
-			pairs = append(pairs, graph.FilePair{Old: cols[1], New: cols[2]})
+			pairs = append(pairs, codeutil.FilePair{Old: cols[1], New: cols[2]})
 		case status == "A":
 			if !indexableExt(cols[1]) {
 				continue
 			}
-			pairs = append(pairs, graph.FilePair{New: cols[1]})
+			pairs = append(pairs, codeutil.FilePair{New: cols[1]})
 		case status == "D":
 			if !indexableExt(cols[1]) {
 				continue
 			}
-			pairs = append(pairs, graph.FilePair{Old: cols[1]})
+			pairs = append(pairs, codeutil.FilePair{Old: cols[1]})
 		default: // M
 			if len(cols) < 2 || !indexableExt(cols[1]) {
 				continue
 			}
-			pairs = append(pairs, graph.FilePair{Old: cols[1], New: cols[1]})
+			pairs = append(pairs, codeutil.FilePair{Old: cols[1], New: cols[1]})
 		}
 	}
 	return pairs, nil

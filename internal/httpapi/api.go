@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // RepoInfo describes a repository known to the server.

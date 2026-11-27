@@ -22,15 +22,16 @@ import (
 	"syscall"
 	"time"
 
-	"graphallthethings/internal/connector/docs"
-	"graphallthethings/internal/embed"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/httpapi"
-	"graphallthethings/internal/indexer"
-	"graphallthethings/internal/mcpserver"
-	"graphallthethings/internal/store"
-	"graphallthethings/internal/store/local"
-	"graphallthethings/internal/webui"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector/docs"
+	"github.com/system4us/graphAllTheThings/pkg/embed"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/httpapi"
+	"github.com/system4us/graphAllTheThings/internal/indexer"
+	"github.com/system4us/graphAllTheThings/internal/mcpserver"
+	"github.com/system4us/graphAllTheThings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/store/local"
+	"github.com/system4us/graphAllTheThings/internal/webui"
 )
 
 const defaultServeAddr = "127.0.0.1:7788"
@@ -503,7 +504,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		}
 		c.Trigger() // bring everything current once at startup
 		go watchGitCommits(passCtx, *watchInterval, func() []string {
-			if src, _, err := graph.LoadCodebaseState(*graphPath); err == nil && strings.HasPrefix(src, "codebase:") {
+			if src, _, err := codeutil.LoadCodebaseState(*graphPath); err == nil && strings.HasPrefix(src, "codebase:") {
 				return []string{strings.TrimPrefix(src, "codebase:")}
 			}
 			return nil
@@ -622,7 +623,7 @@ func refreshDocs(ctx context.Context, root, graphPath string) (refreshResult, er
 				return nil
 			}
 			if d.IsDir() {
-				if path != root && graph.SkipDir(d.Name(), false) {
+				if path != root && codeutil.SkipDir(d.Name(), false) {
 					return filepath.SkipDir
 				}
 				return nil

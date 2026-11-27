@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // read_symbols must say "cut" only when it cut, and never drop a requested

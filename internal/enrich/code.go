@@ -24,7 +24,7 @@ import (
 	"strings"
 	"sync"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // Result reports how many nodes the pass linked.

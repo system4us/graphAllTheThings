@@ -7,8 +7,7 @@ import (
 
 // queryStopwords are question words that carry no search signal in English
 // or Spanish ("how does X get verified", "dónde se bloquea X"). Matching on
-// them ranks every node that happens to say "get" or "the" — including a
-// const literally named get.
+// them ranks every node that happens to say "get" or "the".
 var queryStopwords = map[string]bool{
 	// English
 	"a": true, "an": true, "the": true, "and": true, "or": true, "of": true, "to": true,
@@ -33,8 +32,7 @@ var queryStopwords = map[string]bool{
 
 // QueryTerms splits a natural-language query into lower-cased search terms:
 // split on anything that is not a letter or digit, stopwords dropped. When
-// every word is a stopword (a query like "get"), the words are kept: the
-// user meant them.
+// every word is a stopword (a query like "get"), the words are kept.
 func QueryTerms(query string) []string {
 	fields := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'

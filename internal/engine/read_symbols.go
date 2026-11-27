@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 const (

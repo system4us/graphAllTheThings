@@ -20,6 +20,7 @@ RUN go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
+COPY pkg ./pkg
 COPY --from=web-builder /web/dist ./internal/webui/dist
 
 RUN CGO_ENABLED=1 go build -trimpath \

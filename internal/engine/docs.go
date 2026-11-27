@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // DocContextPack answers a natural-language question over a document graph

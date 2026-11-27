@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"graphallthethings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/store"
 )
 
 func point(id string, v ...float32) store.Point {

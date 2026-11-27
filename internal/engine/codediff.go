@@ -6,8 +6,9 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // CodeDiff reports the structural diff between the working tree and a git
@@ -24,7 +25,7 @@ func (e *Engine) CodeDiff(ctx context.Context, ref string, limit int) (string, e
 // codeDiff renders the structural diff and also returns it as data (nil when
 // there are no file changes or no structural change), so preflight can reuse
 // it without a second extraction of the old tree.
-func (e *Engine) codeDiff(ctx context.Context, ref string, limit int) (string, *graph.CodeDiff, error) {
+func (e *Engine) codeDiff(ctx context.Context, ref string, limit int) (string, *codeutil.CodeDiff, error) {
 	if !e.IsCodebase() {
 		return "", nil, fmt.Errorf("diff needs a codebase graph")
 	}
@@ -55,7 +56,7 @@ func (e *Engine) codeDiff(ctx context.Context, ref string, limit int) (string, *
 		return "", nil, fmt.Errorf("extracting %s: %w", ref, err)
 	}
 
-	d := graph.DiffCode(oldGraph, e.G, pairs, renamed)
+	d := codeutil.DiffCode(oldGraph, e.G, pairs, renamed)
 	if d.Empty() {
 		return fmt.Sprintf("%d file(s) touched since %s, no function/type signature or doc changed\n", len(pairs), ref), nil, nil
 	}
@@ -95,17 +96,17 @@ func (e *Engine) codeDiff(ctx context.Context, ref string, limit int) (string, *
 	return b.String(), d, nil
 }
 
-func writeCodeChangeLine(b *strings.Builder, c graph.CodeChange) {
+func writeCodeChangeLine(b *strings.Builder, c codeutil.CodeChange) {
 	switch c.Kind {
-	case graph.CodeAdded:
+	case codeutil.CodeAdded:
 		fmt.Fprintf(b, "+ %s %s (%s)\n", c.Type, c.NewName, c.NewFile)
-	case graph.CodeRemoved:
+	case codeutil.CodeRemoved:
 		fmt.Fprintf(b, "- %s %s (%s)\n", c.Type, c.OldName, c.OldFile)
-	case graph.CodeChanged:
+	case codeutil.CodeChanged:
 		fmt.Fprintf(b, "~ %s %s (%s)\n", c.Type, c.NewName, c.NewFile)
-	case graph.CodeRenamed:
+	case codeutil.CodeRenamed:
 		fmt.Fprintf(b, "-> %s renamed %s to %s (%s)\n", c.Type, c.OldName, c.NewName, c.NewFile)
-	case graph.CodeMoved:
+	case codeutil.CodeMoved:
 		fmt.Fprintf(b, "-> %s %s moved %s to %s\n", c.Type, c.NewName, c.OldFile, c.NewFile)
 	}
 }

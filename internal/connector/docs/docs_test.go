@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // writeTestDOCX builds a valid minimal .docx archive with headings, paragraphs, and a table.

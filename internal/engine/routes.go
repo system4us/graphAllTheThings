@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // Routes lists every HTTP route detected in the codebase: statically-detected

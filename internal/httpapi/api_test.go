@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 type stubProvider struct {

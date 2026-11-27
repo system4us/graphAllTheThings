@@ -15,13 +15,14 @@ import (
 	"sync"
 	"time"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/connector/docs"
-	"graphallthethings/internal/embed"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/lock"
-	"graphallthethings/internal/mcpserver"
-	"graphallthethings/internal/store"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/internal/connector/docs"
+	"github.com/system4us/graphAllTheThings/pkg/embed"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/lock"
+	"github.com/system4us/graphAllTheThings/internal/mcpserver"
+	"github.com/system4us/graphAllTheThings/internal/store"
 )
 
 var (
@@ -323,7 +324,7 @@ func hasDocFiles(dir string, maxDepth int) bool {
 			return nil
 		}
 		if d.IsDir() {
-			if path != dir && graph.SkipDir(d.Name(), false) {
+			if path != dir && codeutil.SkipDir(d.Name(), false) {
 				return filepath.SkipDir
 			}
 			if rel, relErr := filepath.Rel(dir, path); relErr == nil && rel != "." {
@@ -477,7 +478,7 @@ func discoverGitRepos(dirs []string, maxDepth int) []string {
 				return nil
 			}
 			isRoot := path == root
-			if !isRoot && graph.SkipDir(d.Name(), false) {
+			if !isRoot && codeutil.SkipDir(d.Name(), false) {
 				return filepath.SkipDir
 			}
 			// Check if this directory is a git repo or worktree (.git dir or file).

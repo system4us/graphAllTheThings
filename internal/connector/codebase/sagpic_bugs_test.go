@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 func TestIssue13GoMonorepoCallsChiRoutesAndOpenAPIFetch(t *testing.T) {

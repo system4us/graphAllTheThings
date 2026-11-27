@@ -17,7 +17,7 @@ import (
 	"time"
 	"unicode"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 var timestampCols = map[string]bool{

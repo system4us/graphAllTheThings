@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
 )
 
 // scanFiles (drift detection) and parseFiles (extraction) must agree on which
@@ -40,7 +40,7 @@ func TestDriftScanAgreesWithExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 	cur := c.scanFiles()
-	prev := graph.FileMtimes(g)
+	prev := codeutil.FileMtimes(g)
 	for rel := range cur {
 		if _, ok := prev[rel]; !ok {
 			t.Errorf("scanFiles counts %q but extraction recorded no node for it (perpetual false drift)", rel)

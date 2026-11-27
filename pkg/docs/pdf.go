@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -14,24 +13,25 @@ import (
 	"github.com/dslipak/pdf"
 )
 
-// parsePDF extracts page-indexed text from a PDF. When Poppler's `pdftotext`
-// is installed on PATH it is preferred (better layout/column/encoding handling);
-// otherwise it falls back seamlessly to the pure-Go parser (github.com/dslipak/pdf).
-func parsePDF(ctx context.Context, path string) (*ParsedDoc, error) {
+// parsePDFBytes extracts page-indexed text from raw PDF bytes in memory.
+// When Poppler's `pdftotext` is installed on PATH it is preferred (piped via
+// stdin so no temp file is needed); otherwise it falls back seamlessly to the
+// pure-Go parser (github.com/dslipak/pdf).
+func parsePDFBytes(ctx context.Context, filename string, data []byte) (*ParsedDoc, error) {
 	var pages []string
 	var err error
 
 	if bin, lookErr := exec.LookPath("pdftotext"); lookErr == nil {
-		pages, err = extractPDFWithPoppler(ctx, bin, path)
+		pages, err = extractPDFWithPoppler(ctx, bin, data)
 	}
 	if len(pages) == 0 {
-		pages, err = extractPDFPureGo(path)
+		pages, err = extractPDFPureGo(data)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	title := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 	sections := buildPDFSections(pages)
 
 	return &ParsedDoc{
@@ -42,8 +42,9 @@ func parsePDF(ctx context.Context, path string) (*ParsedDoc, error) {
 	}, nil
 }
 
-func extractPDFWithPoppler(ctx context.Context, bin, path string) ([]string, error) {
-	cmd := exec.CommandContext(ctx, bin, "-layout", "-enc", "UTF-8", path, "-")
+func extractPDFWithPoppler(ctx context.Context, bin string, data []byte) ([]string, error) {
+	cmd := exec.CommandContext(ctx, bin, "-layout", "-enc", "UTF-8", "-", "-")
+	cmd.Stdin = bytes.NewReader(data)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -51,24 +52,14 @@ func extractPDFWithPoppler(ctx context.Context, bin, path string) ([]string, err
 		return nil, fmt.Errorf("pdftotext: %w (%s)", err, strings.TrimSpace(stderr.String()))
 	}
 	raw := strings.Split(stdout.String(), "\f")
-	// pdftotext appends a trailing form-feed after the last page.
 	if len(raw) > 0 && strings.TrimSpace(raw[len(raw)-1]) == "" {
 		raw = raw[:len(raw)-1]
 	}
 	return raw, nil
 }
 
-func extractPDFPureGo(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open pdf: %w", err)
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat pdf: %w", err)
-	}
-	r, err := pdf.NewReader(f, st.Size())
+func extractPDFPureGo(data []byte) ([]string, error) {
+	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, fmt.Errorf("read pdf: %w", err)
 	}
@@ -93,15 +84,12 @@ func extractPDFPureGo(path string) ([]string, error) {
 
 var pdfNumberedHeadingRe = regexp.MustCompile(`^(?:(?:\d+\.)+\d*|\d+\)|(?:CAP[IÍ]TULO|SECCI[OÓ]N|ART[IÍ]CULO|CHAPTER|SECTION|ARTICLE)\s+[\dIVXLCM]+)\s+\S+`)
 
-// looksLikePDFHeading detects short, standalone heading lines in PDF text
-// (numbered headings, chapter/article headers, or short ALL-CAPS titles).
 func looksLikePDFHeading(line string) bool {
 	s := strings.TrimSpace(line)
 	runes := []rune(s)
 	if len(runes) < 3 || len(runes) > 90 {
 		return false
 	}
-	// Reject lines ending like normal prose sentences.
 	last := runes[len(runes)-1]
 	if last == '.' || last == ',' || last == ';' {
 		return false
@@ -109,7 +97,6 @@ func looksLikePDFHeading(line string) bool {
 	if pdfNumberedHeadingRe.MatchString(s) {
 		return true
 	}
-	// Short ALL-CAPS heading with at least 4 letters and no lowercase letters.
 	letters, upper := 0, 0
 	for _, r := range runes {
 		if unicode.IsLetter(r) {
@@ -160,8 +147,6 @@ func buildPDFSections(pages []string) []ParsedSection {
 				})
 				cur = &sections[len(sections)-1]
 			} else if pageNum > cur.PageEnd {
-				// If no headings were detected at all, start a fresh section per page
-				// so page citations stay tight and accurate.
 				if strings.HasPrefix(cur.Title, "Page ") {
 					sections = append(sections, ParsedSection{
 						Title:     fmt.Sprintf("Page %d", pageNum),

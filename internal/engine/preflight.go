@@ -7,8 +7,9 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // PreflightCheck runs a single composite post-edit verification pack against
@@ -119,7 +120,7 @@ func (e *Engine) PreflightCheck(ctx context.Context, ref string, maxTokens int) 
 	changedIDs := map[string]string{} // node id -> what to call it
 	if diff != nil {
 		for _, c := range diff.Changes {
-			if c.NewID != "" && c.Kind != graph.CodeAdded {
+			if c.NewID != "" && c.Kind != codeutil.CodeAdded {
 				changedIDs[c.NewID] = "symbol " + c.NewName
 			}
 		}

@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
 )
 
 // maxGrepFileSize skips files larger than this — matches the connector's own
@@ -217,7 +217,7 @@ func (e *Engine) grepScan(pattern string, opts GrepOptions) ([]GrepHit, int, int
 			return nil
 		}
 		if d.IsDir() {
-			if graph.SkipDir(d.Name(), path == dir) {
+			if codeutil.SkipDir(d.Name(), path == dir) {
 				return filepath.SkipDir
 			}
 			return nil

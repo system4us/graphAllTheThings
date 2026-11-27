@@ -1,9 +1,8 @@
 package graph
 
-// SQLite persistence for the graph. Selected by file extension (.db/.sqlite):
+// SQLite persistence for the graph. Selected by file extension (.db/.sqlite/.sqlite3):
 // a full save rewrites all rows in one transaction; a journaled save (see
-// StartJournal) writes only the delta, which keeps incremental refresh of a
-// big repo at milliseconds instead of re-serializing the whole graph.
+// StartJournal) writes only the delta, keeping incremental refreshes fast.
 
 import (
 	"database/sql"
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,8 +75,6 @@ func marshalAttrs(attrs map[string]string) string {
 	return string(b)
 }
 
-// saveSQLite persists the graph. With an active journal and an existing
-// database it applies only the delta; otherwise it rewrites everything.
 func (g *Graph) saveSQLite(path string) error {
 	_, statErr := os.Stat(path)
 	db, err := openGraphDB(path)
@@ -120,7 +118,7 @@ func (g *Graph) saveSQLite(path string) error {
 		return err
 	}
 	if j != nil {
-		g.StartJournal() // reset: the delta is on disk now
+		g.StartJournal()
 	}
 	return nil
 }
@@ -187,7 +185,7 @@ func applyDelta(tx *sql.Tx, g *Graph, j *journal) error {
 	for id := range j.addedNodes {
 		n := g.Nodes[id]
 		if n == nil {
-			continue // added then removed within the same session
+			continue
 		}
 		if _, err := ns.Exec(n.ID, n.Type, n.Name, marshalAttrs(n.Attrs)); err != nil {
 			return err
@@ -201,7 +199,6 @@ func applyDelta(tx *sql.Tx, g *Graph, j *journal) error {
 	defer es.Close()
 	for _, e := range j.addedEdges {
 		if j.removedNodes[e.From] || j.removedNodes[e.To] {
-			// Endpoint later evicted; the edge died with it.
 			if g.Nodes[e.From] == nil || g.Nodes[e.To] == nil {
 				continue
 			}
@@ -211,9 +208,6 @@ func applyDelta(tx *sql.Tx, g *Graph, j *journal) error {
 		}
 	}
 
-	// fts.id is UNINDEXED, so `DELETE FROM fts WHERE id = ?` scans the whole
-	// table. One per changed node is quadratic on a large refresh; delete the
-	// whole set in a single statement (one scan) instead.
 	if _, err := tx.Exec(`CREATE TEMP TABLE IF NOT EXISTS fts_stale(id TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return err
 	}
@@ -263,21 +257,28 @@ func applyDelta(tx *sql.Tx, g *Graph, j *journal) error {
 }
 
 // FTSQuery runs an indexed full-text search over a SQLite graph's fts table.
-// Terms are OR-quoted so free-form phrasing can't break MATCH syntax. Returns
-// node ids best-first (bm25); empty on any error or when the table has no
-// rows yet (pre-FTS graphs), so callers fall back to the in-memory scan.
+// Terms are OR-quoted so free-form phrasing cannot break MATCH syntax. Returns
+// node ids best-first (bm25); empty on any error or when the table has no rows.
 func FTSQuery(path, query, nodeType string, limit int) []string {
+	return FTSQueryTerms(path, QueryTerms(query), nodeType, limit)
+}
+
+// FTSQueryTerms runs an indexed full-text search over a SQLite graph's fts
+// table using pre-tokenized search terms (e.g. from a domain-aware tokenizer
+// that preserves short acronyms like "it" or "hr").
+func FTSQueryTerms(path string, terms []string, nodeType string, limit int) []string {
+	if len(terms) == 0 || limit <= 0 {
+		return nil
+	}
 	db, err := openGraphDB(path)
 	if err != nil {
 		return nil
 	}
 	defer db.Close()
 
-	// Stopwords dropped, each remaining word as a stem prefix ("verif"*
-	// matches verify, verified, verifyEvents' single token verifyevents).
 	var quoted []string
-	for _, t := range QueryTerms(query) {
-		if t = strings.ReplaceAll(t, `"`, ""); t != "" {
+	for _, t := range terms {
+		if t = strings.ReplaceAll(strings.TrimSpace(t), `"`, ""); t != "" {
 			if st := Stem(t); len([]rune(st)) >= 4 {
 				quoted = append(quoted, `"`+st+`"*`)
 			} else {
@@ -288,82 +289,142 @@ func FTSQuery(path, query, nodeType string, limit int) []string {
 	if len(quoted) == 0 {
 		return nil
 	}
-	match := strings.Join(quoted, " OR ")
+	runMatch := func(match string, capLimit int) []string {
+		q := `SELECT id FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?`
+		args := []any{match, capLimit}
+		if nodeType != "" {
+			q = `SELECT id FROM fts WHERE fts MATCH ? AND type = ? ORDER BY bm25(fts) LIMIT ?`
+			args = []any{match, nodeType, capLimit}
+		}
+		rows, err := db.Query(q, args...)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
 
-	q := `SELECT id FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?`
-	args := []any{match, limit}
-	if nodeType != "" {
-		q = `SELECT id FROM fts WHERE fts MATCH ? AND type = ? ORDER BY bm25(fts) LIMIT ?`
-		args = []any{match, nodeType, limit}
-	}
-	rows, err := db.Query(q, args...)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
 	var ids []string
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
+	seen := map[string]bool{}
+	if len(quoted) > 1 {
+		for _, id := range runMatch(strings.Join(quoted, " AND "), limit) {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) < limit {
+		for _, id := range runMatch(strings.Join(quoted, " OR "), limit) {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+				if len(ids) >= limit {
+					break
+				}
+			}
 		}
 	}
 	return ids
 }
 
-// FileMtimes returns relPath → mtime for every physical file node — the
-// recorded disk state a drift check compares against.
-func FileMtimes(g *Graph) map[string]string {
-	m := map[string]string{}
-	for _, n := range g.Nodes {
-		if n.Type == NodeFile && n.Attrs["path"] != "" {
-			m[n.Name] = n.Attrs["mtime"]
-		}
-	}
-	return m
-}
-
-// LoadCodebaseState reads just the source string and the file-node mtimes —
-// the inputs of a drift check — without materializing the whole graph.
-// Cheap for SQLite; falls back to a full load for JSON graphs.
-func LoadCodebaseState(path string) (string, map[string]string, error) {
+// LoadMeta reads the graph metadata key/value pairs (such as "source" and
+// "extracted_at") without materializing nodes or edges for SQLite graphs.
+// Falls back to LoadRaw for JSON graphs.
+func LoadMeta(path string) (map[string]string, error) {
 	if !IsSQLitePath(path) {
 		g, err := LoadRaw(path)
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
-		return g.Source, FileMtimes(g), nil
+		meta := map[string]string{"source": g.Source}
+		if !g.ExtractedAt.IsZero() {
+			meta["extracted_at"] = g.ExtractedAt.Format(time.RFC3339Nano)
+		}
+		return meta, nil
 	}
 	if _, err := os.Stat(path); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	db, err := openGraphDB(path)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	defer db.Close()
 
-	var source string
-	if err := db.QueryRow(`SELECT value FROM meta WHERE key='source'`).Scan(&source); err != nil {
-		return "", nil, err
-	}
-	rows, err := db.Query(`SELECT name, attrs FROM nodes WHERE type = ?`, NodeFile)
+	rows, err := db.Query(`SELECT key, value FROM meta`)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	defer rows.Close()
-	m := map[string]string{}
+	meta := map[string]string{}
 	for rows.Next() {
-		var name, attrsJSON string
-		if err := rows.Scan(&name, &attrsJSON); err != nil {
-			return "", nil, err
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
 		}
-		attrs := map[string]string{}
-		if json.Unmarshal([]byte(attrsJSON), &attrs) == nil && attrs["path"] != "" {
-			m[name] = attrs["mtime"]
-		}
+		meta[k] = v
 	}
-	return source, m, rows.Err()
+	return meta, rows.Err()
+}
+
+// QueryNodesByType reads only nodes of the given type from a SQLite graph
+// without materializing the rest of the graph (useful for tools that only need
+// one entity kind, such as route facts or file mtimes). Falls back to LoadRaw
+// for JSON graphs. Results are sorted by Name then ID.
+func QueryNodesByType(path, nodeType string) ([]*Node, error) {
+	if !IsSQLitePath(path) {
+		g, err := LoadRaw(path)
+		if err != nil {
+			return nil, err
+		}
+		return g.NodesByType(nodeType), nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	db, err := openGraphDB(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT id, type, name, attrs FROM nodes WHERE type = ?`, nodeType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Node
+	for rows.Next() {
+		var n Node
+		var attrsJSON string
+		if err := rows.Scan(&n.ID, &n.Type, &n.Name, &attrsJSON); err != nil {
+			return nil, err
+		}
+		n.Attrs = map[string]string{}
+		if err := json.Unmarshal([]byte(attrsJSON), &n.Attrs); err != nil {
+			return nil, fmt.Errorf("node %s attrs: %w", n.ID, err)
+		}
+		out = append(out, &n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
 }
 
 func loadSQLite(path string) (*Graph, error) {

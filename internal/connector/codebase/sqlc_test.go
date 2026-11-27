@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 func TestSqlcSupportEndToEnd(t *testing.T) {

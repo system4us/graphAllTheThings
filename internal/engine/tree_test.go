@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // tree prints every directory as its own line, and summarizes a file by its

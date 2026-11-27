@@ -22,7 +22,7 @@ import (
 
 	sitter "github.com/smacker/go-tree-sitter"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // retrofitAnns: verb annotations that mark a *client* call declaration.

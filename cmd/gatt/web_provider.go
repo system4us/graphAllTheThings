@@ -8,10 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"graphallthethings/internal/engine"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/httpapi"
-	"graphallthethings/internal/mcpserver"
+	"github.com/system4us/graphAllTheThings/internal/codeutil"
+	"github.com/system4us/graphAllTheThings/internal/engine"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/httpapi"
+	"github.com/system4us/graphAllTheThings/internal/mcpserver"
 )
 
 // singleRepoProvider backs the web UI in single-repo `gatt serve` mode.
@@ -36,7 +37,7 @@ func (p *singleRepoProvider) ListRepos() []httpapi.RepoInfo {
 		if e, _, err := p.mcpSrv.Engine(context.Background(), false); err == nil && e != nil && e.G != nil {
 			root = strings.TrimPrefix(e.G.Source, "codebase:")
 		}
-	} else if src, _, err := graph.LoadCodebaseState(p.graphPath); err == nil && src != "" {
+	} else if src, _, err := codeutil.LoadCodebaseState(p.graphPath); err == nil && src != "" {
 		root = strings.TrimPrefix(src, "codebase:")
 	}
 	return []httpapi.RepoInfo{{

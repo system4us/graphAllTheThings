@@ -9,9 +9,9 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/embed"
-	"graphallthethings/internal/graph"
-	"graphallthethings/internal/store"
+	"github.com/system4us/graphAllTheThings/pkg/embed"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
+	"github.com/system4us/graphAllTheThings/internal/store"
 )
 
 type Engine struct {

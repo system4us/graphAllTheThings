@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 func TestTracePathAcrossRouteDispatchAndSqlc(t *testing.T) {

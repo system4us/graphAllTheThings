@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // Routes registered through a wrapper — a local closure taking

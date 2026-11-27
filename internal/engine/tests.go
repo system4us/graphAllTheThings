@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"graphallthethings/internal/connector/codebase"
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/internal/connector/codebase"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // TestRef identifies a test function affected by a change.

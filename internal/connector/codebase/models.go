@@ -19,7 +19,7 @@ import (
 
 	sitter "github.com/smacker/go-tree-sitter"
 
-	"graphallthethings/internal/graph"
+	"github.com/system4us/graphAllTheThings/pkg/graph"
 )
 
 // assocKinds maps the Sequelize association methods to the edge attr value.
