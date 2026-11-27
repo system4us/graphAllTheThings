@@ -15,6 +15,13 @@ const opt = (name, dflt) => {
 };
 const MODEL = opt('model', process.env.GATT_EMBED_MODEL || 'Xenova/paraphrase-multilingual-MiniLM-L12-v2');
 const PORT = Number(opt('port', process.env.GATT_EMBED_PORT || 0));
+const BIND_HOST = opt('host', process.env.GATT_EMBED_HOST || '127.0.0.1');
+const EXTRA_HOSTS = new Set(
+  (process.env.GATT_EMBED_ALLOW_HOSTS || '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean)
+);
 const MAX_BODY = 8 * 1024 * 1024;
 // Padding dominates cost: a batch is padded to its longest text, so one long
 // text slows all its neighbours (64 x 400 chars: 1.3s; plus one 4500-char text: 8.8s).
@@ -33,7 +40,10 @@ const load = () => (loading ??= pipeline('feature-extraction', MODEL, { dtype: '
     extractor = p; })
   .catch((e) => { loadError = String(e?.message || e); loading = null; throw e; }));
 
-const loopback = (host) => ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host);
+const allowedHost = (host) => {
+  const h = (host || '').toLowerCase();
+  return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(h) || EXTRA_HOSTS.has(h);
+};
 const json = (res, code, body) => {
   res.writeHead(code, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -48,7 +58,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 const server = http.createServer(async (req, res) => {
   // Same posture as `gatt serve`: refuse DNS rebinding and browser-originated requests.
   const host = (req.headers.host || '').replace(/:\d+$/, '');
-  if (!loopback(host) || req.headers.origin) return json(res, 403, { error: 'forbidden' });
+  if (!allowedHost(host) || req.headers.origin) return json(res, 403, { error: 'forbidden' });
 
   if (req.method === 'GET' && req.url === '/health') {
     return json(res, 200, { ok: true, model: MODEL, ready: extractor !== null, error: loadError });
@@ -79,9 +89,10 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { error: 'not found' });
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  // The parent (`gatt serve --onnx`) parses this line to learn the port.
-  console.log(`gatt-embed listening on http://127.0.0.1:${server.address().port} model=${MODEL}`);
+server.listen(PORT, BIND_HOST, () => {
+  // The parent (`gatt serve --onnx` or `agentcron serve --onnx`) parses this line to learn the port.
+  const displayHost = BIND_HOST === '0.0.0.0' ? '127.0.0.1' : BIND_HOST;
+  console.log(`gatt-embed listening on http://${displayHost}:${server.address().port} model=${MODEL}`);
   load().catch((e) => console.error('model load failed:', e?.message || e));
 });
 
